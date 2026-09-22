@@ -1,0 +1,50 @@
+{
+  "family": "tradeflow-fetch",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "4096",
+  "memory": "8192",
+  "executionRoleArn": "REPLACE_EXECUTION_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "tradeflow-api",
+      "image": "390346501537.dkr.ecr.ap-south-1.amazonaws.com/tradeflow-fetch:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 4100,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "PORT", "value": "4100" },
+        { "name": "HEADLESS", "value": "true" },
+        { "name": "SLOW_MO_MS", "value": "0" },
+        { "name": "KEEP_BROWSER_OPEN_MS", "value": "0" },
+        { "name": "FETCH_WINDOW_CONCURRENCY", "value": "3" },
+        { "name": "WORKER_CONCURRENCY", "value": "1" },
+        { "name": "REDIS_URL", "value": "" }
+      ],
+      "secrets": [
+        { "name": "API_KEY", "valueFrom": "REPLACE_SECRET_ARN:API_KEY::" },
+        { "name": "MONGO_URI", "valueFrom": "REPLACE_SECRET_ARN:MONGO_URI::" },
+        { "name": "TRADE_FLOW_USER_ID", "valueFrom": "REPLACE_SECRET_ARN:TRADE_FLOW_USER_ID::" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/tradeflow-fetch",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "api"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4100/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}

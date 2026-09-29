@@ -1,6 +1,6 @@
 import type { Page } from "playwright";
 import { CheckoutJob } from "../models/CheckoutJob.js";
-import { FlipkartCheckout2, OutOfStockPincodeError } from "../automation/FlipkartCheckout2.js";
+import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
 import {
   readBatchProgress,
   releaseBatchReservation,
@@ -305,14 +305,14 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     "session"
   );
 
-  let checkout: FlipkartCheckout2 | undefined;
+  let checkout: FlipkartCheckout | undefined;
   try {
     log("info", `Restoring Flipkart session for ${session.email}`, "session");
     await restoreFlipkartSession(page, session.cookies);
 
-    checkout = new FlipkartCheckout2(page, data.productUrl, log);
+    checkout = new FlipkartCheckout(page, data.productUrl, log);
     checkout.setCheckoutFlags(jobPincode, data.gstMandatory ?? job.request?.gstMandatory ?? true);
-    log("info", "Using FlipkartCheckout2 (Buying-bot add-to-cart / place-order strategies)", "session");
+    log("info", "Using FlipkartCheckout (Buying-bot add-to-cart / place-order strategies)", "session");
 
     log("info", "Opening viewcart to empty existing items", "cart");
     await checkout.emptyCart();

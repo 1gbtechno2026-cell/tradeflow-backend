@@ -25,6 +25,10 @@ export interface ICheckoutJob {
   failedStep: string;
   error: string;
   failureMessage?: string;
+  errorCode?: string;
+  errorCodeDisplay?: string;
+  errorSource?: string;
+  errorDetails?: string;
   filterReason?: string;
   failedAt?: Date | null;
   batchStatus?: string;
@@ -63,6 +67,8 @@ const AddressSchema = new Schema<AddressDetails>(
     gstNumber: { type: String, default: "" },
     companyName: { type: String, default: "" },
     checkoutPincode: { type: String, default: "" },
+    label: { type: String, default: "" },
+    gstLabel: { type: String, default: "" },
   },
   { _id: false }
 );
@@ -101,6 +107,10 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
     failedStep: { type: String, default: "" },
     error: { type: String, default: "" },
     failureMessage: { type: String, default: "" },
+    errorCode: { type: String, default: "" },
+    errorCodeDisplay: { type: String, default: "" },
+    errorSource: { type: String, default: "" },
+    errorDetails: { type: String, default: "" },
     filterReason: { type: String, default: "" },
     failedAt: { type: Date, default: null },
     batchStatus: { type: String, default: "" },
@@ -119,6 +129,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       deliverySlaDays: { type: Number },
       finalAmountLimit: { type: Number },
       dryRun: { type: Boolean, default: false },
+      gstMandatory: { type: Boolean, default: true },
       cards: {
         type: [
           new Schema<MaskedCard>(

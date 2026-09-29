@@ -36,12 +36,16 @@ function isNavDestroyed(err: unknown): boolean {
 }
 
 const DELAYS = {
-  short: 50,
-  medium: 80,
-  long: 120,
+  short: 100,
+  medium: 200,
+  long: 300,
 };
 
-export class FlipkartCheckout {
+/**
+ * FlipkartCheckout2 — isolated A/B of Buying-bot FlipkartPlatform checkout steps
+ * on Playwright. FlipkartCheckout.ts is untouched. Login/OTP omitted (session restore).
+ */
+export class FlipkartCheckout2 {
   summaryQty = 0;
   private jobPincode = "";
   private gstMandatory = true;
@@ -726,57 +730,211 @@ export class FlipkartCheckout {
     throw new Error("Add to cart not found (no cart icon next to Buy now and no Add to cart text)");
   }
 
+  /**
+   * Buying-bot FlipkartPlatform.addToCart — SVG clipPath / path / text / gradient
+   * + mouse → touch → DOM events → React fiber. Then TF-style blocker checks.
+   */
   async clickAddToCart(pincode = ""): Promise<void> {
-    console.log("Waiting for Add to cart, or Go to cart if already added ...");
-    const ready = await this.waitUntil(async () => {
-      const block = await this.detectCheckoutBlocker(pincode);
-      if (block) throw block;
-      if (await this.pdpShowsGoToCart()) return true;
-      const hasText = await this.page.getByText("Add to cart", { exact: true }).first().isVisible().catch(() => false);
-      if (hasText) return true;
-      return this.evaluate(() =>
-        Array.from(document.querySelectorAll("svg")).some(
-          (s) => /AddToCart|AddedToCart/i.test(s.innerHTML) && /Buy now/i.test(document.body?.innerText || "")
-        )
-      );
-    }, 12000, 120, "Add to cart, Go to cart, or cart icon");
-    if (!ready) throw new Error("Add to cart not found (no cart+ icon and no text button)");
+    console.log("[Checkout2/Buying-bot] Waiting for Add to Cart button...");
+    const block = await this.detectCheckoutBlocker(pincode);
+    if (block) throw block;
     if (await this.pdpShowsGoToCart()) {
       console.log("[Cart] PDP shows Go to cart — product already in cart, skipping add click");
       return;
     }
+
+    await waitWithRetry(
+      this.page,
+      async () => {
+        await this.waitForFunction(
+          () => {
+            if (document.querySelector('clipPath[id*="AddToCart"]')) return true;
+            const allPaths = document.querySelectorAll("path");
+            for (const p of allPaths) {
+              if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) return true;
+            }
+            const labels = document.querySelectorAll("div.css-146c3p1, div, span, button");
+            for (const label of labels) {
+              const text = label.textContent?.trim().toLowerCase();
+              if (text === "add to cart" || text === "add to bag") return true;
+            }
+            // Buying-bot: white gradient Add-to-Cart shell
+            if (document.querySelectorAll('div.css-g5y9jx[style*="border-radius: 12px"]').length > 0) {
+              return true;
+            }
+            return false;
+          },
+          { timeout: 10000 }
+        );
+      },
+      { label: "Add to Cart button (Buying-bot)", timeoutMs: 10000, maxRetries: 5 }
+    );
+
     const beforeAdd = await this.scanFlipkartPdp();
     if (beforeAdd.notDeliverable || beforeAdd.locationSliderOpen) {
       throw this.notAvailableOnPin(pincode || beforeAdd.selectedPincode);
     }
     const before = await this.headerCartCount();
-    await this.pressAddToCartControl();
+
+    const btnCoords = await this.evaluate(() => {
+      const logs: string[] = [];
+      const addToCartClip = document.querySelector('clipPath[id*="AddToCart"]');
+      if (addToCartClip) {
+        logs.push("Found SVG with AddToCart clipPath id");
+        let best: HTMLElement =
+          (addToCartClip.closest("svg") as unknown as HTMLElement) ||
+          (addToCartClip as unknown as HTMLElement);
+        let el: HTMLElement | null = best;
+        while (el && el !== document.body) {
+          const style = el.getAttribute("style") || "";
+          if ((style.includes("width: 44px") || style.includes("width:44px")) && style.includes("border-radius")) {
+            best = el;
+            break;
+          }
+          if (style.includes("cursor") || el.getAttribute("role") === "button") {
+            best = el;
+            break;
+          }
+          el = el.parentElement;
+        }
+        best.scrollIntoView({ block: "center" });
+        const rect = best.getBoundingClientRect();
+        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "svg-clip", logs };
+      }
+      const allPaths = document.querySelectorAll("path");
+      for (const p of allPaths) {
+        if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) {
+          logs.push("Found SVG cart icon by path d");
+          let best: HTMLElement = p as unknown as HTMLElement;
+          let el: HTMLElement | null = p as unknown as HTMLElement;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            if ((style.includes("width: 44px") || style.includes("width:44px")) && style.includes("border-radius")) {
+              best = el;
+              break;
+            }
+            if (style.includes("cursor") || el.getAttribute("role") === "button") {
+              best = el;
+              break;
+            }
+            el = el.parentElement;
+          }
+          best.scrollIntoView({ block: "center" });
+          const rect = best.getBoundingClientRect();
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "svg", logs };
+        }
+      }
+      const labels = document.querySelectorAll("div, span, button");
+      for (const label of labels) {
+        const text = label.textContent?.trim().toLowerCase();
+        if (text === "add to cart" || text === "add to bag") {
+          logs.push(`Found text button: "${label.textContent?.trim()}"`);
+          let best: HTMLElement = label as HTMLElement;
+          let el: HTMLElement | null = label as HTMLElement;
+          while (el && el !== document.body) {
+            const style = el.getAttribute("style") || "";
+            if (style.includes("cursor") || el.getAttribute("role") === "button") best = el;
+            if (el.getBoundingClientRect().width > 300) break;
+            el = el.parentElement;
+          }
+          best.scrollIntoView({ block: "center" });
+          const rect = best.getBoundingClientRect();
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, variant: "text", logs };
+        }
+      }
+      logs.push("No Add to Cart button found");
+      return { x: 0, y: 0, variant: "none", logs };
+    });
+
+    console.log(`[Checkout2/Buying-bot] === Add to Cart (variant: ${btnCoords.variant}) ===`);
+    for (const line of btnCoords.logs) console.log(line);
+    if (btnCoords.variant === "none") {
+      throw new Error("Add to Cart button not found (Buying-bot strategies)");
+    }
+
+    await sleep(300);
+    try {
+      await this.page.mouse.click(btnCoords.x, btnCoords.y);
+      console.log(`Mouse clicked Add to Cart at (${btnCoords.x.toFixed(0)}, ${btnCoords.y.toFixed(0)})`);
+    } catch (err) {
+      console.log(`Mouse click failed: ${(err as Error).message}`);
+    }
+    await sleep(800);
+
     await this.waitUntil(async () => {
       return (
         (await this.detectSelectLocationSlider()) ||
         (await this.headerCartCount()) > before ||
-        (await this.productLooksAddedToCart())
+        (await this.productLooksAddedToCart()) ||
+        (await this.pdpShowsGoToCart())
       );
-    }, 4000, 100, "cart add result or Select location slider");
+    }, 4000, 100, "Buying-bot cart add result");
+
     await this.failIfLocationSlider(pincode);
     let added = (await this.headerCartCount()) > before || (await this.productLooksAddedToCart());
     if (!added) {
-      console.log("[Cart] first add did not stick — clicking cart icon again");
-      await this.pressAddToCartControl().catch((err) => {
-        console.log(`[Cart] retry click failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
-      await this.waitUntil(async () => {
-        return (
-          (await this.detectSelectLocationSlider()) ||
-          (await this.headerCartCount()) > before ||
-          (await this.productLooksAddedToCart())
-        );
-      }, 4000, 100, "retry cart add result or Select location slider");
+      console.log("[Checkout2/Buying-bot] mouse may not have worked — touchscreen.tap");
+      try {
+        await this.page.touchscreen.tap(btnCoords.x, btnCoords.y);
+      } catch (err) {
+        console.log(`Tap failed: ${(err as Error).message}`);
+      }
+      await sleep(800);
       await this.failIfLocationSlider(pincode);
       added = (await this.headerCartCount()) > before || (await this.productLooksAddedToCart());
     }
+    if (!added) {
+      console.log("[Checkout2/Buying-bot] trying React fiber handler...");
+      await this.evaluate(() => {
+        const invokeHandler = (startEl: HTMLElement): string | null => {
+          let el: HTMLElement | null = startEl;
+          while (el && el !== document.body) {
+            const fiberKey = Object.keys(el).find(
+              (k) => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")
+            );
+            if (fiberKey) {
+              let fiber = (el as any)[fiberKey];
+              let depth = 0;
+              while (fiber && depth < 30) {
+                const props = fiber.memoizedProps || fiber.pendingProps;
+                if (props) {
+                  const h = props.onPress || props.onClick || props.onPressIn;
+                  if (typeof h === "function") {
+                    try {
+                      h({ nativeEvent: {}, preventDefault: () => {}, stopPropagation: () => {} });
+                      return "handler invoked";
+                    } catch {}
+                  }
+                }
+                fiber = fiber.return;
+                depth++;
+              }
+            }
+            el = el.parentElement;
+          }
+          return null;
+        };
+        const allPaths = document.querySelectorAll("path");
+        for (const p of allPaths) {
+          if ((p.getAttribute("d") || "").startsWith("M17 18.375H7.35116")) {
+            if (invokeHandler(p as unknown as HTMLElement)) return "svg";
+          }
+        }
+        for (const label of Array.from(document.querySelectorAll("div, span, button"))) {
+          const text = label.textContent?.trim().toLowerCase();
+          if (text === "add to cart" || text === "add to bag") {
+            if (invokeHandler(label as HTMLElement)) return "text";
+          }
+        }
+        return "none";
+      });
+      await sleep(DELAYS.medium);
+      await this.failIfLocationSlider(pincode);
+      added = (await this.headerCartCount()) > before || (await this.productLooksAddedToCart());
+    }
+
     const count = await this.headerCartCount();
-    console.log(`[Cart] after add, header cart count=${count} added=${added}`);
+    console.log(`[Checkout2/Buying-bot] after add, header cart count=${count} added=${added}`);
     if (!added && count < 1) {
       await this.failIfLocationSlider(pincode);
       const why = await this.detectCheckoutBlocker(pincode);
@@ -786,38 +944,110 @@ export class FlipkartCheckout {
   }
 
   async gotoViewCart(): Promise<void> {
+    // Buying-bot goToCart URL + TF remembered query params
     if (!/viewcart/i.test(this.page.url() || "")) {
-      console.log(`Jumping to ${VIEWCART_URL}`);
+      console.log(`[Checkout2/Buying-bot] Navigating to Flipkart cart → ${VIEWCART_URL}`);
       await navigateWithRetry(this.page, VIEWCART_URL, { timeoutMs: 12000, maxRetries: 2 });
     }
+    await sleep(DELAYS.long);
     const ready = await this.waitUntil(async () => {
       return this.evaluate(() => {
-        const t = document.body?.innerText || "";
+        const t = (document.body?.innerText || "").toLowerCase();
         return (
-          /Place Order/i.test(t) ||
-          /Price Details/i.test(t) ||
-          /Missing Cart items/i.test(t) ||
-          /Your cart is empty/i.test(t) ||
-          /Save for later/i.test(t)
+          t.includes("shopping cart") ||
+          t.includes("my cart") ||
+          t.includes("place order") ||
+          t.includes("price details") ||
+          t.includes("your cart is empty") ||
+          t.includes("missing cart items") ||
+          t.includes("save for later")
         );
       });
-    }, 15000, 120, "viewcart page to finish loading");
+    }, 15000, 120, "Buying-bot cart page");
     if (!ready) console.log("WARNING: viewcart UI did not look ready within 15s");
-    const badge = await this.headerCartCount();
-    const empty = await this.cartIsEmpty();
-    if (empty && badge >= 1) {
-      console.log(`[Cart] viewcart says empty but header Cart=${badge} — waiting up to 6.0s for items`);
-      const filled = await this.waitUntil(async () => !(await this.cartIsEmpty()), 6000, 120, "viewcart items (header already Cart=1)");
-      if (!filled) {
-        console.log("[Cart] still empty after wait — reloading viewcart");
-        await navigateWithRetry(this.page, VIEWCART_URL, { timeoutMs: 12000, maxRetries: 2 });
-        await this.waitUntil(async () => {
-          const t = await this.evaluate(() => document.body?.innerText || "");
-          return /Place Order|Price Details|Save for later|Your cart is empty/i.test(t);
-        }, 10000, 120, "viewcart after reload");
-      }
-    }
     console.log(`On viewcart ${this.page.url()}`);
+  }
+  
+
+  async clickPlaceOrder(): Promise<void> {
+    if (/viewcheckout/i.test(this.page.url() || "")) {
+      console.log("Already on viewcheckout — skipping Place Order");
+      await this.gotoViewCheckout();
+      return;
+    }
+    if (!/viewcart/i.test(this.page.url() || "")) {
+      console.log("Not on viewcart — opening remembered viewcart before Place Order");
+      await this.gotoViewCart();
+    }
+    // Buying-bot placeOrder: div.css-146c3p1 "Place order" → yellow css-g5y9jx, touchscreen.tap
+    console.log("[Checkout2/Buying-bot] Waiting for Place Order button...");
+    let placeBox: { x: number; y: number } | null = null;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      placeBox = await this.evaluate(() => {
+        const labels = document.querySelectorAll("div.css-146c3p1, div, span, button");
+        for (const label of labels) {
+          const text = (label.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+          if (text === "place order") {
+            let el: HTMLElement | null = label as HTMLElement;
+            while (el) {
+              const style = el.getAttribute("style") || "";
+              if (
+                (el.classList.contains("css-g5y9jx") && style.includes("background-color")) ||
+                style.includes("background-color") ||
+                style.includes("cursor: pointer") ||
+                style.includes("cursor:pointer")
+              ) {
+                el.scrollIntoView({ block: "center" });
+                const rect = el.getBoundingClientRect();
+                if (rect.width >= 40 && rect.height >= 20) {
+                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+                }
+              }
+              el = el.parentElement;
+            }
+            (label as HTMLElement).scrollIntoView({ block: "center" });
+            const rect = label.getBoundingClientRect();
+            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+          }
+        }
+        return null;
+      });
+      if (placeBox) break;
+      if (attempt % 5 === 4) {
+        console.log(`Still looking for Place Order button (attempt ${attempt + 1}/20)...`);
+      }
+      await sleep(500);
+    }
+
+    if (!placeBox) {
+      console.log("Place Order button not found after 10s — using remembered viewcheckout URL");
+      await this.gotoViewCheckout();
+      return;
+    }
+
+    await sleep(300);
+    try {
+      await this.page.touchscreen.tap(placeBox.x, placeBox.y);
+      console.log(`Tapped Place Order at (${placeBox.x.toFixed(0)}, ${placeBox.y.toFixed(0)})`);
+    } catch {
+      await this.page.mouse.click(placeBox.x, placeBox.y);
+      console.log(`Mouse clicked Place Order at (${placeBox.x.toFixed(0)}, ${placeBox.y.toFixed(0)})`);
+    }
+    await sleep(DELAYS.long);
+    const moved = await this.waitUntil(
+      async () => /viewcheckout|\/payments|checkout|rv\/pay/i.test(this.page.url() || ""),
+      8000,
+      120,
+      "viewcheckout after Place Order"
+    );
+    if (moved) {
+      console.log(`Place Order opened ${this.page.url()}`);
+      if (/\/payments/i.test(this.page.url() || "")) return;
+      await this.gotoViewCheckout();
+      return;
+    }
+    console.log("Place Order did not navigate — using remembered viewcheckout URL");
+    await this.gotoViewCheckout();
   }
 
   private async cartIsEmpty(): Promise<boolean> {
@@ -992,6 +1222,7 @@ export class FlipkartCheckout {
     const beforeRetry = await this.detectCheckoutBlocker(pincode);
     if (beforeRetry) throw beforeRetry;
     await this.clickAddToCart(pincode);
+    await this.setDeliveryPincode(pincode);
     await this.failIfLocationSlider(pincode);
     const afterRetry = await this.detectCheckoutBlocker(pincode);
     if (afterRetry) throw afterRetry;
@@ -1014,6 +1245,44 @@ export class FlipkartCheckout {
         : `Product not in viewcart after Add to cart (${details.model || this.productUrl})`
     );
   }
+
+  async setDeliveryPincode(pincode: string): Promise<"serviceable" | "not_serviceable" | "unknown"> {
+  const found = await this.evaluate((pin: string) => {
+    const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
+    const pinInput = inputs.find((i) =>
+      /pincode|delivery pincode/i.test(
+        i.placeholder || i.getAttribute("aria-label") || i.name || ""
+      )
+    );
+    if (!pinInput) return false;
+    pinInput.scrollIntoView({ block: "center" });
+    pinInput.focus();
+    pinInput.value = pin;
+    pinInput.dispatchEvent(new Event("input",  { bubbles: true }));
+    pinInput.dispatchEvent(new Event("change", { bubbles: true }));
+    const btn = Array.from(document.querySelectorAll("button, div[role=button]"))
+      .find((b) => /^\s*(check|submit)\s*$/i.test((b.textContent || "").trim()));
+    if (btn) (btn as HTMLElement).click();
+    return true;
+  }, pincode);
+
+  if (!found) return "unknown"; // no widget → treat as already-serviceable page
+
+  await this.waitUntil(async () => this.evaluate(() => {
+    const t = document.body.innerText.toLowerCase();
+    return t.includes("delivery by") || t.includes("arriving by") ||
+           t.includes("not deliverable") || t.includes("coming soon") ||
+           t.includes("currently unavailable");
+  }), 8000, 200, "pincode serviceability result");
+
+  return await this.evaluate(() => {
+    const t = document.body.innerText.toLowerCase();
+    if (t.includes("delivery by") || t.includes("arriving by")) return "serviceable";
+    if (t.includes("not deliverable") || t.includes("coming soon") ||
+        t.includes("currently unavailable"))                    return "not_serviceable";
+    return "unknown";
+  });
+}
 
   private async cartHasProduct(details: { model: string; colour: string }): Promise<string | null> {
     return this.evaluate(
@@ -1288,47 +1557,6 @@ export class FlipkartCheckout {
     if (nDays) return { days: Number(nDays[1]), via: `${nDays[1]} days` };
 
     return null;
-  }
-
-  async clickPlaceOrder(): Promise<void> {
-    if (/viewcheckout/i.test(this.page.url() || "")) {
-      console.log("Already on viewcheckout — skipping Place Order");
-      await this.gotoViewCheckout();
-      return;
-    }
-    if (!/viewcart/i.test(this.page.url() || "")) {
-      console.log("Not on viewcart — opening remembered viewcart before Place Order");
-      await this.gotoViewCart();
-    }
-    console.log("Waiting for Place Order on viewcart ...");
-    const shown = await this.waitUntil(async () => {
-      return this.evaluate(() =>
-        Array.from(document.querySelectorAll("div,span,button")).some((el) =>
-          /^Place Order$/i.test((el.textContent || "").replace(/\s+/g, " ").trim())
-        )
-      );
-    }, 8000, 120, "Place Order on viewcart");
-    if (shown) {
-      const box = await this.findLabelPressable(/^Place Order$/);
-      if (box) {
-        console.log(`=== Place Order ${box.w.toFixed(0)}x${box.h.toFixed(0)} ===`);
-        await this.tapPoint(box.x, box.y, "Place Order");
-      }
-      const moved = await this.waitUntil(
-        async () => /viewcheckout|\/payments|checkout|rv\/pay/i.test(this.page.url() || ""),
-        8000,
-        120,
-        "viewcheckout after Place Order"
-      );
-      if (moved) {
-        console.log(`Place Order opened ${this.page.url()}`);
-        if (/\/payments/i.test(this.page.url() || "")) return;
-        await this.gotoViewCheckout();
-        return;
-      }
-    }
-    console.log("Place Order missing or did not navigate — using remembered viewcheckout URL");
-    await this.gotoViewCheckout();
   }
 
   async clickBuyNow(): Promise<void> {
@@ -2776,6 +3004,9 @@ export class FlipkartCheckout {
     await this.tapPoint(box.x, box.y, "GST Invoice Change");
   }
 
+
+
+  
   private async readGstDrawer(): Promise<{ gstins: string[]; hasEdit: boolean; hasAddNew: boolean; hasConfirm: boolean }> {
     return this.evaluate(() => {
       const compact = (s: string) => (s || "").replace(/\s+/g, " ").trim();

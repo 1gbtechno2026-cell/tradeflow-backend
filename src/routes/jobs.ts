@@ -17,6 +17,7 @@ function publicJob(job: {
   _id: unknown;
   batchId: string;
   email: string;
+  userId?: string;
   status: string;
   step: string;
   failedStep: string;
@@ -33,6 +34,10 @@ function publicJob(job: {
   request?: JobRequestSnapshot;
   result?: JobResultSnapshot;
   failureMessage?: string;
+  errorCode?: string;
+  errorCodeDisplay?: string;
+  errorSource?: string;
+  errorDetails?: string;
   filterReason?: string;
   failedAt?: Date | null;
   batchStatus?: string;
@@ -47,6 +52,7 @@ function publicJob(job: {
     tradeflowId: String(job._id),
     batchId: job.batchId,
     email: job.email,
+    userId: job.userId,
     platform: job.request?.platform || "FLIPKART",
     status: job.status,
     step: job.step,
@@ -64,6 +70,10 @@ function publicJob(job: {
     request: job.request,
     result: job.result,
     failureMessage: job.failureMessage || undefined,
+    errorCode: job.errorCode || undefined,
+    errorCodeDisplay: job.errorCodeDisplay || undefined,
+    errorSource: job.errorSource || undefined,
+    errorDetails: job.errorDetails || undefined,
     filterReason: job.filterReason || undefined,
     failedAt: job.failedAt,
     batchStatus: job.batchStatus || undefined,
@@ -239,6 +249,7 @@ jobsRouter.post("/", async (req, res) => {
         totalAttempts: effectiveAttempts,
         cartAmountLimit: data.cartAmountLimit,
         deliverySlaDays: data.deliverySlaDays,
+        gstMandatory: data.gstMandatory,
         address,
         request,
         dryRun: data.dryRun,
@@ -289,7 +300,12 @@ jobsRouter.get("/", async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 80));
   const filter: Record<string, unknown> = { userId };
   if (status) filter.status = status;
-  const rows = await CheckoutJob.find(filter).sort({ createdAt: -1 }).limit(limit);
+  // Omit logs on list — unbounded log arrays OOM the API under jobs-proxy polling.
+  const rows = await CheckoutJob.find(filter)
+    .select("-logs")
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .lean();
   const grouped = await CheckoutJob.aggregate([
     { $match: { userId } },
     { $group: { _id: "$status", n: { $sum: 1 } } },
@@ -300,7 +316,10 @@ jobsRouter.get("/", async (req, res) => {
 });
 
 jobsRouter.get("/batch/:batchId", async (req, res) => {
-  const rows = await CheckoutJob.find({ batchId: req.params.batchId }).sort({ createdAt: 1 });
+  const rows = await CheckoutJob.find({ batchId: req.params.batchId })
+    .select("-logs")
+    .sort({ createdAt: 1 })
+    .lean();
   const first = rows[0];
   const totalQuantity = first?.totalQuantity || 0;
   const totalAttempts = first?.totalAttempts || 0;

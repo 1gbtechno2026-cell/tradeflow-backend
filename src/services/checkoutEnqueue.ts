@@ -13,6 +13,7 @@ export async function enqueueCheckoutJob(input: {
   totalAttempts: number;
   cartAmountLimit?: number;
   deliverySlaDays?: number;
+  gstMandatory?: boolean;
   address: AddressDetails;
   request?: JobRequestSnapshot;
   dryRun?: boolean;
@@ -64,6 +65,7 @@ export async function enqueueCheckoutJob(input: {
     totalAttempts: input.totalAttempts,
     cartAmountLimit: input.cartAmountLimit,
     deliverySlaDays: input.deliverySlaDays,
+    gstMandatory: input.gstMandatory,
     address: input.address,
     isRetry: input.isRetry,
   };

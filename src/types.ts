@@ -26,6 +26,8 @@ export interface AddressDetails {
   gstNumber: string;
   companyName: string;
   checkoutPincode?: string;
+  label?: string;
+  gstLabel?: string;
 }
 
 export interface JobLog {
@@ -60,6 +62,7 @@ export interface JobRequestSnapshot {
   deliverySlaDays?: number;
   finalAmountLimit?: number;
   dryRun: boolean;
+  gstMandatory?: boolean;
   cards: MaskedCard[];
   totalQuantity?: number;
   quantityPerOrder?: number;
@@ -96,6 +99,7 @@ export interface CheckoutJobData {
   totalAttempts: number;
   cartAmountLimit?: number;
   deliverySlaDays?: number;
+  gstMandatory?: boolean;
   address: AddressDetails;
   isRetry?: boolean;
 }

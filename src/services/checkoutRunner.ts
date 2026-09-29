@@ -1,6 +1,6 @@
 import type { Page } from "playwright";
 import { CheckoutJob } from "../models/CheckoutJob.js";
-import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
+import { FlipkartCheckout2, OutOfStockPincodeError } from "../automation/FlipkartCheckout2.js";
 import {
   readBatchProgress,
   releaseBatchReservation,
@@ -19,6 +19,13 @@ import {
 import { config } from "../config.js";
 import { enqueueCheckoutJob } from "./checkoutEnqueue.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
+import { FlipkartNetworkObserver } from "../automation/FlipkartNetworkObserver.js";
+import {
+  CheckoutFailure,
+  classifyPageText,
+  classifyThrownMessage,
+  failureFields,
+} from "./checkoutErrors.js";
 import type { CheckoutJobData, JobRequestSnapshot, JobResultSnapshot, JobStatus, LogLevel } from "../types.js";
 
 async function appendLog(jobId: string, level: LogLevel, message: string, step?: string) {
@@ -52,17 +59,19 @@ async function finishWithoutChrome(
   step: string,
   message: string,
   level: LogLevel = "info",
-  extra?: { failedStep?: string; filterReason?: string; batchStatus?: string }
+  extra?: { failedStep?: string; filterReason?: string; batchStatus?: string; failure?: CheckoutFailure }
 ) {
+  const mapped = extra?.failure;
   await CheckoutJob.updateOne(
     { _id: jobId, status: { $ne: "cancelled" } },
     {
       $set: {
         status,
         step,
-        failedStep: extra?.failedStep || (status.startsWith("failed") ? step : ""),
+        failedStep: extra?.failedStep || mapped?.failedStep || (status.startsWith("failed") ? step : ""),
         error: status === "skipped" || status.startsWith("failed") || status === "filtered" ? message : "",
-        failureMessage: extra?.failedStep === "out_of_stock_pincode" || extra?.failedStep === "batch_filtered" ? message : "",
+        failureMessage: extra?.failedStep === "out_of_stock_pincode" || extra?.failedStep === "batch_filtered" || mapped ? message : "",
+        ...(mapped ? failureFields(mapped) : {}),
         filterReason: extra?.filterReason || "",
         batchStatus: extra?.batchStatus || "",
         completedAt: new Date(),
@@ -111,6 +120,7 @@ async function maybeEnqueueRetry(
     totalAttempts,
     cartAmountLimit: data.cartAmountLimit,
     deliverySlaDays: data.deliverySlaDays,
+    gstMandatory: data.gstMandatory ?? request?.gstMandatory,
     address: data.address,
     request,
     isRetry: true,
@@ -214,9 +224,16 @@ export async function runCheckoutJob(data: CheckoutJobData) {
 
   const session = await resolveLoggedInSession(data.email);
   if (!session.ok) {
+    const sessionFail = new CheckoutFailure("SESSION_EXPIRED", session.reason);
+    const fields = failureFields(sessionFail);
     job.status = "failed";
-    job.failedStep = "session";
-    job.error = session.reason;
+    job.failedStep = fields.failedStep;
+    job.error = fields.error;
+    job.failureMessage = fields.failureMessage;
+    job.errorCode = fields.errorCode;
+    job.errorCodeDisplay = fields.errorCodeDisplay;
+    job.errorSource = fields.errorSource;
+    job.errorDetails = fields.errorDetails;
     job.completedAt = new Date();
     job.logs.push({ at: new Date(), level: "error", step: "session", message: session.reason });
     await job.save();
@@ -225,9 +242,10 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     return;
   }
 
-  const launched = await launchStealthContext({ headless: false });
+  const launched = await launchStealthContext({ headless: config.headless });
   const page: Page = await launched.context.newPage();
   await blockFlipkartLogout(page);
+  const netObserver = FlipkartNetworkObserver.attach(page);
   const address = { ...data.address };
 
   const log = (level: LogLevel, message: string, step?: string) => {
@@ -236,11 +254,15 @@ export async function runCheckoutJob(data: CheckoutJobData) {
 
   const jobPincode = (address.checkoutPincode || address.pincode || "").replace(/\D/g, "").slice(-6);
 
-  const applyOutOfStockFilter = async (rawMessage: string) => {
+  const applyOutOfStockFilter = async (rawMessage: string, failure?: CheckoutFailure) => {
+    const mapped =
+      failure ||
+      classifyPageText(rawMessage, jobPincode) ||
+      new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", rawMessage);
     console.log(
-      `[${data.jobId}] [info] [batch] filtered: out of stock for pincode ${jobPincode} — batch stopped, no retry`
+      `[${data.jobId}] [info] [batch] filtered: ${mapped.code} for pincode ${jobPincode} — batch stopped, no retry`
     );
-    log("error", rawMessage, "out_of_stock_pincode");
+    log("error", rawMessage, mapped.failedStep);
     await releaseReservation();
     const filteredCount = await markBatchFiltered(data.batchId, "out_of_stock_pincode");
     const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
@@ -262,14 +284,12 @@ export async function runCheckoutJob(data: CheckoutJobData) {
       {
         $set: {
           status: "filtered",
-          step: "out_of_stock_pincode",
-          failedStep: "out_of_stock_pincode",
-          failureMessage: rawMessage,
+          step: mapped.failedStep,
           filterReason: "out_of_stock_pincode",
           failedAt: now,
           batchStatus: "filtered",
-          error: rawMessage,
           completedAt: now,
+          ...failureFields(mapped),
         },
       }
     );
@@ -279,14 +299,26 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     );
   };
 
-  log("info", "Opened headed Chrome. Session cookies are copied into this window only — Mongo login is not modified, Logout is blocked.", "session");
+  log(
+    "info",
+    `${config.headless ? "Opened headless Chromium" : "Opened headed Chrome"}. Session cookies are copied into this window only — Mongo login is not modified, Logout is blocked.`,
+    "session"
+  );
 
-  let checkout: FlipkartCheckout | undefined;
+  let checkout: FlipkartCheckout2 | undefined;
   try {
     log("info", `Restoring Flipkart session for ${session.email}`, "session");
     await restoreFlipkartSession(page, session.cookies);
 
-    checkout = new FlipkartCheckout(page, data.productUrl, log);
+    checkout = new FlipkartCheckout2(page, data.productUrl, log);
+    checkout.setCheckoutFlags(jobPincode, data.gstMandatory ?? job.request?.gstMandatory ?? true);
+    log("info", "Using FlipkartCheckout2 (Buying-bot add-to-cart / place-order strategies)", "session");
+
+    log("info", "Opening viewcart to empty existing items", "cart");
+    await checkout.emptyCart();
+    if (flipkartLoginUrl(page.url())) {
+      throw new Error("Session expired: Flipkart showed the login page on viewcart");
+    }
 
     log("info", "Pre-flight: fetch account mobile", "preflight");
     const mobile = await checkout.fetchAccountMobile();
@@ -320,15 +352,17 @@ export async function runCheckoutJob(data: CheckoutJobData) {
       "product"
     );
 
+    const productBlock = await checkout.detectCheckoutBlocker(jobPincode);
+    if (productBlock) throw productBlock;
+
     log("info", "Add to cart, then jump straight to viewcart", "product");
     try {
-      await checkout.clickAddToCart();
+      await checkout.clickAddToCart(jobPincode);
     } catch (err) {
-      log(
-        "warn",
-        `Add to cart control not found (${err instanceof Error ? err.message : String(err)}) — jumping to viewcart`,
-        "product"
-      );
+      if (err instanceof CheckoutFailure) throw err;
+      const again = await checkout.detectCheckoutBlocker(jobPincode);
+      if (again) throw again;
+      throw classifyThrownMessage(err instanceof Error ? err.message : String(err));
     }
     const oosOnProduct = await checkout.detectOutOfStockForPincode(jobPincode);
     if (oosOnProduct.matched) {
@@ -339,7 +373,15 @@ export async function runCheckoutJob(data: CheckoutJobData) {
       return;
     }
     await checkout.gotoViewCart();
-    await checkout.ensureProductInCart(details);
+    try {
+      await checkout.ensureProductInCart(details, jobPincode);
+    } catch (err) {
+      if (err instanceof CheckoutFailure) throw err;
+      await checkout.navigateToProduct().catch(() => undefined);
+      const why = await checkout.detectCheckoutBlocker(jobPincode);
+      if (why) throw why;
+      throw classifyThrownMessage(err instanceof Error ? err.message : String(err));
+    }
     log("info", "Product is in viewcart", "product");
 
     const oosOnCart = await checkout.detectOutOfStockForPincode(jobPincode);
@@ -386,7 +428,11 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     await checkout.clickPlaceOrder();
 
     log("info", "viewcheckout: qty / address / GST then Continue", "order-summary");
-    await checkout.verifyAddressOnOrderSummary(address, data.quantity);
+    await checkout.verifyAddressOnOrderSummary(
+      address,
+      data.quantity,
+      data.gstMandatory ?? job.request?.gstMandatory ?? true
+    );
     await patchResult(data.jobId, {
       quantityPlaced: checkout.summaryQty || data.quantity,
       gstNumber: address.gstNumber,
@@ -421,14 +467,22 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     );
     await sleep(config.keepBrowserOpenMs);
   } catch (err) {
+    for (const s of netObserver.getBlocks().slice(-3)) {
+      log("warn", `[net] ${s.kind}: ${s.text} — ${s.url}`, "net");
+    }
     if (err instanceof OutOfStockPincodeError) {
       await applyOutOfStockFilter(err.rawMessage);
       await sleep(Math.min(config.keepBrowserOpenMs, 15000));
       return;
     }
-    const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof CheckoutFailure && err.filterBatch) {
+      await applyOutOfStockFilter(err.details, err);
+      await sleep(Math.min(config.keepBrowserOpenMs, 15000));
+      return;
+    }
+    const rawMessage = err instanceof Error ? err.message : String(err);
     if (
-      /Execution context was destroyed|most likely because of a navigation/i.test(message) &&
+      /Execution context was destroyed|most likely because of a navigation/i.test(rawMessage) &&
       checkout
     ) {
       const oos = await checkout.detectOutOfStockForPincode(jobPincode).catch(() => ({ matched: false as const }));
@@ -438,25 +492,21 @@ export async function runCheckoutJob(data: CheckoutJobData) {
         return;
       }
     }
-    const failedStep =
-      /pre-flight|account/i.test(message) ? "preflight"
-      : /add to cart|go to cart|buy now|product|viewcart|delivery sla|delivery_sla/i.test(message) ? "product"
-      : /place order|cart amount|payable/i.test(message) ? "product"
-      : /quantity/i.test(message) ? "quantity"
-      : /address|mobile/i.test(message) ? "address"
-      : /gst/i.test(message) ? "GST"
-      : /continue/i.test(message) ? "Continue"
-      : job.step || "unknown";
-    log("error", message, failedStep);
+    let failure = err instanceof CheckoutFailure ? err : null;
+    if (!failure && checkout) {
+      failure = await checkout.detectCheckoutBlocker(jobPincode).catch(() => null);
+    }
+    if (!failure) failure = classifyThrownMessage(rawMessage);
+    const failedStep = failure.failedStep;
+    log("error", `${failure.display}: ${failure.details}`, failedStep);
     await CheckoutJob.updateOne(
       { _id: data.jobId, status: { $ne: "cancelled" } },
       {
         $set: {
           status: "failed",
-          failedStep,
-          error: message,
           completedAt: new Date(),
           step: failedStep,
+          ...failureFields(failure),
         },
       }
     );
@@ -464,6 +514,7 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     await maybeEnqueueRetry(data, job.userId, failedStep, job.request);
     await sleep(Math.min(config.keepBrowserOpenMs, 15000));
   } finally {
+    netObserver.dispose();
     await closeBrowser(launched.browser, launched.context);
     const latest = await CheckoutJob.findById(data.jobId).select("status");
     if (latest?.status === "cancelled") await releaseReservation();

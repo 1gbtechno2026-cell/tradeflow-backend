@@ -4,6 +4,7 @@ import { config } from "./config.js";
 import { connectDb } from "./db.js";
 import { jobsRouter } from "./routes/jobs.js";
 import { orderFetchRouter } from "./routes/orderFetch.js";
+import { smsRouter } from "./routes/sms.js";
 
 function stamp() {
   return new Date().toISOString();
@@ -40,6 +41,7 @@ async function main() {
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true });
   });
+  app.use("/api/sms", smsRouter);
   app.use(requireApiKey);
 
   app.use("/api/jobs", jobsRouter);

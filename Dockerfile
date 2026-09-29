@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.62.1-noble
+FROM mcr.microsoft.com/playwright:v1.63.0-noble
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ ENV NODE_ENV=production \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm install --no-save tsx@4.20.3
+RUN npm ci --omit=dev
 
 COPY tsconfig.json ./
 COPY src ./src

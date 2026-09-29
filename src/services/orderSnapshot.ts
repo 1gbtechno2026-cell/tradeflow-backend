@@ -40,6 +40,7 @@ export function requestSnapshot(data: NormalizedCreateJob): JobRequestSnapshot {
     deliverySlaDays: data.deliverySlaDays,
     finalAmountLimit: data.finalAmountLimit,
     dryRun: data.dryRun,
+    gstMandatory: data.gstMandatory,
     cards: maskCards(data.cards),
     totalQuantity: data.totalQuantity,
     quantityPerOrder: data.quantityPerOrder,

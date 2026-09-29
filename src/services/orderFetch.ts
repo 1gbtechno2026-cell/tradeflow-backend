@@ -3,9 +3,12 @@ import type { Browser, BrowserContext, Page } from "playwright";
 import type { Types } from "mongoose";
 import { PlatformId } from "../models/PlatformId.js";
 import { Order, type ITrackingStage, type ITrackingStep } from "../models/Order.js";
+import { OrderIndex } from "../models/OrderIndex.js";
 import { nextSeq } from "../models/Counter.js";
 import { config } from "../config.js";
 import { evalOnPage, isDestroyedContext } from "../lib/evalOnPage.js";
+import type { IndexScrapeStatus } from "./orderLifecycle.js";
+import { assertIdleForFetch, markFetchRunning } from "./orderSyncLock.js";
 import {
   blockFlipkartLogout,
   clearLocalThrowawayFlipkartCookies,
@@ -29,7 +32,11 @@ export interface FetchReport {
   accountsQueued: number;
   accountsDone: number;
   idsFound: number;
+  idsDiscovered: number;
+  idsNew: number;
+  idsDuplicate: number;
   idsOpened: number;
+  enrichQueued: number;
   idsScraped: number;
   idsSkippedClosed: number;
   idsSkippedOld: number;
@@ -44,6 +51,7 @@ export interface FetchReport {
 interface FetchJobState {
   running: boolean;
   cancelled: boolean;
+  phase: "discover" | "enrich" | "";
   currentEmail: string | null;
   logs: FetchLog[];
   total: number;
@@ -288,6 +296,32 @@ const CLOSE_TRACKING = `() => {
   return "escape";
 }`;
 
+const EXPAND_ORDER_SECTIONS = `() => {
+  const clickToggle = (label) => {
+    const nodes = Array.from(document.querySelectorAll("div,span,button,h2,h3,section"));
+    for (const n of nodes) {
+      const t = (n.textContent || "").replace(/\\s+/g, " ").trim();
+      if (t !== label) continue;
+      let el = n;
+      for (let i = 0; i < 6 && el; i++) {
+        el.click();
+        el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        if (el.parentElement && (el.parentElement.tagName === "BUTTON" || el.parentElement.getAttribute("role") === "button")) {
+          el.parentElement.click();
+        }
+        el = el.parentElement;
+      }
+      return true;
+    }
+    return false;
+  };
+  const text = document.body && document.body.innerText ? document.body.innerText : "";
+  const deliveryOpen = /Delivery details[\\s\\S]{0,500}(?:Cabin|UDYOG|PHASE)[\\s\\S]{0,200}[6-9]\\d{9}/i.test(text);
+  if (!deliveryOpen) clickToggle("Delivery details");
+  if (!/Total amount/i.test(text)) clickToggle("Price details");
+  return true;
+}`;
+
 const SCROLL_GST = `() => {
   const nodes = Array.from(document.querySelectorAll("div, h2, h3, span, p"));
   const gst = nodes.find((el) => {
@@ -335,11 +369,40 @@ const READ_PAGE = `() => {
     (compact.match(/delivery\\s*OTP[:\\s]+([0-9]{3,8})/i) || [])[1] ||
     (compact.match(/\\bOTP[:\\s]+([0-9]{4,8})\\b/i) || [])[1] ||
     "";
+  const deliveryBlock = (() => {
+    const headings = Array.from(document.querySelectorAll("div,span,h2,h3,section,button"));
+    for (const heading of headings) {
+      const label = (heading.textContent || "").replace(/\\s+/g, " ").trim();
+      if (label !== "Delivery details") continue;
+      let cur = heading.parentElement;
+      for (let i = 0; i < 8 && cur; i++) {
+        const txt = (cur.innerText || "").replace(/\\s+/g, " ").trim();
+        if (txt.length > 20 && txt.length < 1200 && /PRIVATE LIMITED|[6-9]\\d{9}|Cabin|UDYOG/i.test(txt)) {
+          return cur.innerText || txt;
+        }
+        cur = cur.parentElement;
+      }
+    }
+    const raw = document.body && document.body.innerText ? document.body.innerText : "";
+    const cut = raw.match(/Delivery details\\s*([\\s\\S]*?)(?:Price details|GST\\s*&\\s*EWB)/i);
+    return cut ? cut[1] : "";
+  })();
+  const cleanCompany = (s) => String(s || "")
+    .replace(/^Order\\s+/i, "")
+    .replace(/\\s+Order\\b/gi, "")
+    .replace(/\\s+/g, " ")
+    .trim();
   const phone =
-    (compact.match(/\\b([6-9][0-9]{9})\\b/) || [])[1] ||
-    (compact.match(/reach the delivery person at\\s*([0-9]{8,12})/i) || [])[1] ||
+    (deliveryBlock.match(/(?:LIMITED|LTD\\.?|LLP)\\s*([6-9][0-9]{9})/) || [])[1] ||
+    (deliveryBlock.match(/(?:^|[^0-9])([6-9][0-9]{9})(?:[^0-9]|$)/) || [])[1] ||
     "";
-  const pincode = (compact.match(/\\b([1-9][0-9]{5})\\b/) || [])[1] || "";
+  const pincode =
+    (deliveryBlock.match(/\\b([1-9][0-9]{5})\\b/) || [])[1] ||
+    "";
+  const billingName = cleanCompany(
+    (deliveryBlock.match(/([A-Z][A-Z0-9 .,&'-]{2,70}\\s+(?:PRIVATE LIMITED|PVT\\.?\\s*LTD\\.?|LLP))/i) || [])[1] ||
+    ""
+  );
   const skipProduct = /seller|order received|order confirmed|see all|download invoice|gst|ewb|flipkart|payment successful|out for delivery|delivered to|rate your/i;
   const looksProduct = (t) => {
     const s = String(t || "").replace(/\\s+/g, " ").trim();
@@ -371,10 +434,6 @@ const READ_PAGE = `() => {
     const next = idx >= 0 ? lines[idx + 1] : "";
     if (next && next.length < 60 && !/^Seller:|^₹/i.test(next)) productName = productName + " (" + next + ")";
   }
-  const billingName =
-    (compact.match(/DASHMOBILES[\\sA-Z]*/i) || [])[0] ||
-    (compact.match(/([A-Z][A-Z0-9 .,&'-]{8,80}PRIVATE LIMITED)/) || [])[1] ||
-    "";
   const deliveryMessage =
     (compact.match(/((?:Delivered on|Out For Delivery|Expected By|Payment Successful)[^\\n]{0,80})/i) || [])[1] || "";
   return {
@@ -505,7 +564,11 @@ function emptyReport(): FetchReport {
     accountsQueued: 0,
     accountsDone: 0,
     idsFound: 0,
+    idsDiscovered: 0,
+    idsNew: 0,
+    idsDuplicate: 0,
     idsOpened: 0,
+    enrichQueued: 0,
     idsScraped: 0,
     idsSkippedClosed: 0,
     idsSkippedOld: 0,
@@ -541,6 +604,7 @@ function state(userId: string): FetchJobState {
     jobs.set(userId, {
       running: false,
       cancelled: false,
+      phase: "",
       currentEmail: null,
       logs: [],
       total: 0,
@@ -559,6 +623,13 @@ function state(userId: string): FetchJobState {
   }
   const job = jobs.get(userId)!;
   if (!job.report) job.report = emptyReport();
+  if (job.report.idsDiscovered == null) {
+    job.report.idsDiscovered = 0;
+    job.report.idsNew = 0;
+    job.report.idsDuplicate = 0;
+  }
+  if (job.report.enrichQueued == null) job.report.enrichQueued = 0;
+  if (!job.phase) job.phase = "";
   if (!job.liveBrowsers) job.liveBrowsers = [];
   return job;
 }
@@ -839,10 +910,13 @@ function parseTracking(raw: string): ITrackingStage[] {
 function lastTrackingStep(tracking: ITrackingStage[]) {
   const done = [...tracking].reverse().find((row) => row.stage === "DONE");
   if (!done) return "";
-  return `${done.date || ""} | ${done.status}`.replace(/^\s*\|\s*/, "");
+  const last = done.detailed_steps.slice(-1)[0];
+  const when = last?.progress[0]?.date || done.date;
+  if (!when) return done.status;
+  return `${done.status} · ${when}`;
 }
 
-function parseOrderId(raw: string): string | null {
+export function parseOrderId(raw: string): string | null {
   const text = String(raw || "").trim();
   if (!text) return null;
   const fromUrl = text.match(/order_id=([A-Za-z0-9]+)/i);
@@ -853,7 +927,7 @@ function parseOrderId(raw: string): string | null {
   return null;
 }
 
-function cookiesFor(row: { sessionCookies?: unknown[]; sessionState?: { cookies?: unknown[] } } | null) {
+export function cookiesFor(row: { sessionCookies?: unknown[]; sessionState?: { cookies?: unknown[] } } | null) {
   const fromState = row?.sessionState?.cookies;
   if (Array.isArray(fromState) && fromState.length) return fromState;
   return Array.isArray(row?.sessionCookies) ? row.sessionCookies : [];
@@ -864,13 +938,13 @@ function parseQueryParam(raw: string, key: string) {
   return match ? match[1] : "";
 }
 
-function fallbackUnitId(orderId: string, itemId = "", unitId = "") {
+export function fallbackUnitId(orderId: string, itemId = "", unitId = "") {
   if (unitId) return unitId;
   if (itemId) return `${itemId}000`;
   return `${String(orderId || "").replace(/^OD/i, "")}000`;
 }
 
-function orderDetailsUrl(orderId: string, itemId = "", unitId = "") {
+export function orderDetailsUrl(orderId: string, itemId = "", unitId = "") {
   const params = new URLSearchParams({ order_id: orderId });
   if (itemId) params.set("item_id", itemId);
   if (unitId) params.set("unit_id", unitId);
@@ -909,11 +983,123 @@ function savedUnit(row: {
   };
 }
 
-interface QueueAccount {
+export interface OrderAccount {
   id: Types.ObjectId;
   email: string;
   cookies: unknown[];
+}
+
+interface QueueAccount extends OrderAccount {
   existing: ExistingUnit[];
+}
+
+export type OrderUnitCard = {
+  orderId: string;
+  itemId: string;
+  unitId: string;
+  orderUrl: string;
+  amount: string;
+  productName?: string;
+  status?: string;
+  text?: string;
+};
+type ListCard = OrderUnitCard;
+
+export async function patchOrderIndex(
+  userId: string,
+  account: OrderAccount,
+  card: { orderId: string; itemId?: string; unitId: string; orderUrl?: string },
+  fields: {
+    scrape_status?: IndexScrapeStatus;
+    list_hint?: string;
+    status_key?: string;
+    order_date?: Date | null;
+    shipped_date?: Date | null;
+    last_error?: string;
+    order_url?: string;
+  }
+) {
+  const now = new Date();
+  await OrderIndex.updateOne(
+    { userId, platformAccountId: account.id, unit_id: card.unitId },
+    {
+      $set: {
+        platform_email: account.email,
+        platform: "FLIPKART",
+        order_id: card.orderId,
+        item_id: card.itemId || "",
+        order_url: fields.order_url || card.orderUrl || orderDetailsUrl(card.orderId, card.itemId, card.unitId),
+        last_seen_at: now,
+        ...fields,
+      },
+      $setOnInsert: {
+        userId,
+        platformAccountId: account.id,
+        unit_id: card.unitId,
+        first_seen_at: now,
+      },
+    },
+    { upsert: true }
+  );
+}
+
+async function discoverUnit(
+  userId: string,
+  account: OrderAccount,
+  card: ListCard
+): Promise<"new" | "duplicate" | "seeded"> {
+  const now = new Date();
+  const existing = await OrderIndex.findOne({
+    userId,
+    platformAccountId: account.id,
+    unit_id: card.unitId,
+  }).lean();
+  if (existing) {
+    await OrderIndex.updateOne(
+      { _id: existing._id },
+      { $set: { last_seen_at: now, list_hint: card.status || existing.list_hint || "", order_url: card.orderUrl || existing.order_url } }
+    );
+    return "duplicate";
+  }
+
+  const saved = await Order.findOne({ userId, unit_id: card.unitId }).select("status_key last_fetch last_error order_date").lean();
+  let scrape_status: IndexScrapeStatus = "pending";
+  if (saved?.last_fetch && !/^skipped — older/i.test(String(saved.last_error || ""))) {
+    scrape_status = "scraped";
+  } else {
+    const listDate = parseListCardDate(card.status || card.text || "");
+    if (listDate && listDate.getTime() < jobSince(userId).getTime()) scrape_status = "skipped_old";
+  }
+
+  await OrderIndex.updateOne(
+    { userId, platformAccountId: account.id, unit_id: card.unitId },
+    {
+      $setOnInsert: {
+        userId,
+        platformAccountId: account.id,
+        platform_email: account.email,
+        platform: "FLIPKART",
+        order_id: card.orderId,
+        item_id: card.itemId || "",
+        unit_id: card.unitId,
+        order_url: card.orderUrl || orderDetailsUrl(card.orderId, card.itemId, card.unitId),
+        scrape_status,
+        list_hint: card.status || "",
+        status_key: saved?.status_key || "",
+        order_date: saved?.order_date || listDateSafe(card) || null,
+        shipped_date: null,
+        first_seen_at: now,
+        last_seen_at: now,
+        last_error: scrape_status === "skipped_old" ? `list date before ${jobSinceLabel(userId)}` : "",
+      },
+    },
+    { upsert: true }
+  );
+  return scrape_status === "scraped" ? "seeded" : "new";
+}
+
+function listDateSafe(card: ListCard) {
+  return parseListCardDate(card.status || card.text || "");
 }
 
 async function closeLiveBrowsers(userId: string) {
@@ -946,7 +1132,9 @@ export async function stopOrderFetch(userId: string) {
   const job = state(userId);
   job.cancelled = true;
   job.running = false;
+  job.phase = "";
   job.currentEmail = null;
+  markFetchRunning(userId, false);
   log(userId, "warn", "Force kill: stopping order fetch and killing Chrome");
   await closeLiveBrowsers(userId);
 }
@@ -958,6 +1146,7 @@ export async function stopAllOrderFetch() {
 }
 
 export async function startOrderFetch(userId: string, emails: string[], sinceDate: Date) {
+  assertIdleForFetch(userId);
   const job = state(userId);
   if (job.running) throw new Error("Order fetch is already running");
 
@@ -1009,7 +1198,9 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
 
   const windows = fetchWindowCount(queue.length);
   job.running = true;
+  job.phase = "discover";
   job.cancelled = false;
+  markFetchRunning(userId, true);
   job.done = 0;
   job.failed = 0;
   job.skipped = skipped.length;
@@ -1031,29 +1222,20 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
   log(
     userId,
     "info",
-    `Fetch from ${job.sinceLabel}: ${queue.length} email(s) · ${windows} Chrome window(s) · scroll My Orders, scrape each unit_id on/after that date (no invoice)` +
+    `Fetch from ${job.sinceLabel}: ${queue.length} email(s) · ${windows} Chrome window(s) · discover all unit IDs, then enrich new ones on/after placed date (no invoice)` +
       (skipped.length ? ` · skipped ${skipped.length} not logged in` : "")
   );
   for (const email of skipped.slice(0, 8)) log(userId, "warn", `Skipped ${email} — not logged in`);
 
   void run(userId, queue).finally(() => {
     job.running = false;
+    job.phase = "";
     job.currentEmail = null;
+    markFetchRunning(userId, false);
     if (!job.report.finishedAt) job.report.finishedAt = new Date().toISOString();
     tickElapsed(job);
   });
 }
-
-type ListCard = {
-  orderId: string;
-  itemId: string;
-  unitId: string;
-  orderUrl: string;
-  amount: string;
-  productName?: string;
-  status?: string;
-  text?: string;
-};
 
 async function clickShowMoreOrders(page: Page) {
   try {
@@ -1110,7 +1292,6 @@ async function collectOrderIds(page: Page, userId: string, existing: ExistingUni
       if (cardDate) datedVisible += 1;
       if (cardDate && cardDate.getTime() < jobSince(userId).getTime()) {
         olderVisible += 1;
-        continue;
       }
       if (!kept.has(unitId)) added += 1;
       const prev = kept.get(unitId);
@@ -1171,11 +1352,12 @@ async function clickSeeAllUpdates(page: Page) {
 
 /* Invoice download helpers omitted — scrape data only. */
 
-async function scrapeAndSave(
+export async function scrapeAndSave(
   page: Page,
   userId: string,
-  account: QueueAccount,
-  card: ListCard
+  account: OrderAccount,
+  card: ListCard,
+  opts: { applyCalendar?: boolean } = { applyCalendar: true }
 ) {
   const itemId = card.itemId || parseQueryParam(card.orderUrl || "", "item_id");
   const unitId = fallbackUnitId(card.orderId, itemId, card.unitId || parseQueryParam(card.orderUrl || "", "unit_id"));
@@ -1195,6 +1377,24 @@ async function scrapeAndSave(
   await sleep(500);
   if (flipkartLoginUrl(page.url())) throw new Error("Flipkart session expired");
 
+  const deliveryHeading = page.getByText("Delivery details", { exact: true }).first();
+  if (await deliveryHeading.isVisible().catch(() => false)) {
+    await deliveryHeading.scrollIntoViewIfNeeded().catch(() => undefined);
+    const expanded = await page.getByText(/Cabin|UDYOG VIHAR|PHASE-1/i).first().isVisible().catch(() => false);
+    if (!expanded) {
+      await deliveryHeading.click({ timeout: 4000 }).catch(() => undefined);
+      const row = deliveryHeading.locator("xpath=ancestor::*[self::div or self::button][1]");
+      await row.click({ timeout: 4000 }).catch(() => undefined);
+    }
+    await page.getByText(/[6-9]\d{9}/).first().waitFor({ timeout: 5000 }).catch(() => undefined);
+  }
+  const priceHeading = page.getByText("Price details", { exact: true }).first();
+  if (await priceHeading.isVisible().catch(() => false)) {
+    const totalVisible = await page.getByText("Total amount", { exact: true }).first().isVisible().catch(() => false);
+    if (!totalVisible) await priceHeading.click({ timeout: 4000 }).catch(() => undefined);
+  }
+  await evalOnPage(page, EXPAND_ORDER_SECTIONS).catch(() => undefined);
+  await sleep(700);
   const snapshot = (await evalOnPage<Record<string, string | number | boolean>>(page, READ_PAGE)) || {};
   await evalOnPage(page, SCROLL_GST).catch(() => undefined);
   await sleep(700);
@@ -1245,8 +1445,12 @@ async function scrapeAndSave(
   const pageText = String(pageData.pageText || "");
   const pageDelivered = /your item has been delivered|\bdelivered\b/i.test(String(pageData.deliveryMessage || ""))
     || /Your item has been delivered/i.test(pageText);
+  const returnedStage = tracking.find((row) => /^returned$/i.test(row.status) && row.stage === "DONE");
+  const refundedStage = tracking.find((row) => /^refund/i.test(row.status) && row.stage === "DONE");
   const delivered = !failed && (Boolean(deliveredStageHit) || (pageDelivered && !cancelledStage));
   const cancelled = !failed && Boolean(cancelledStage) && !delivered;
+  const returned = !failed && !delivered && !cancelled && Boolean(returnedStage);
+  const refunded = !failed && !delivered && !cancelled && !returned && Boolean(refundedStage);
   const current =
     (delivered && (deliveredStageHit || tracking.find((row) => /^delivered$/i.test(row.status)))) ||
     (cancelled && cancelledStage) ||
@@ -1255,10 +1459,10 @@ async function scrapeAndSave(
   const received = tracking.find((row) => /received/i.test(row.status));
   const confirmed = tracking.find((row) => /confirmed/i.test(row.status));
   const placedIso =
+    received?.detailed_steps.find((step) => /has been placed|put on hold/i.test(step.step_text))?.progress[0]?.date ||
     confirmed?.detailed_steps.find((step) => /has been placed/i.test(step.step_text))?.progress[0]?.date ||
-    received?.detailed_steps.find((step) => /put on hold|has been placed/i.test(step.step_text))?.progress[0]?.date ||
-    confirmed?.date ||
-    received?.date;
+    received?.date ||
+    confirmed?.date;
   const placed = placedIso;
   const expected = tracking.find((row) => /expected/i.test(row.status));
   const deliveredStage = tracking.find((row) => /^delivered$/i.test(row.status));
@@ -1279,30 +1483,44 @@ async function scrapeAndSave(
     const listed = String(card.productName || "");
     if (listed && !/shared this order with you/i.test(listed)) productName = listed;
   }
+  const shippedStage = tracking.find((row) => /^shipped$/i.test(row.status));
+  const shippedDate = shippedStage?.date ? new Date(shippedStage.date) : null;
   const orderDate =
-    placed ? new Date(placed) : bestDateTime(trackingText) || parseFlipkartDateTime(String(pageData.deliveryMessage || pageText || ""));
-  if (orderDate && !isOnOrAfterSince(orderDate, jobSince(userId))) {
-    log(userId, "info", `${card.orderId} unit ${unitKey}: ${orderDate.toLocaleDateString("en-IN")} is before ${jobSinceLabel(userId)} — skip scrape`);
-    await Order.updateOne(
-      { userId, unit_id: unitKey },
+    placed ? new Date(placed) : failed ? parseFlipkartDateTime(String(pageData.deliveryMessage || pageText || "")) : null;
+  if (opts.applyCalendar !== false && !failed && !orderDate) {
+    await patchOrderIndex(userId, account, { orderId: card.orderId, itemId: savedItemId, unitId: unitKey, orderUrl: page.url() }, {
+      scrape_status: "failed",
+      last_error: "no placed date in tracking",
+      order_url: page.url(),
+    });
+    log(userId, "warn", `${card.orderId} unit ${unitKey}: no placed date in See all updates — skip`);
+    return {
+      lastFetch: new Date(),
+      productName: "",
+      totalAmount: "",
+      statusKey: "unknown",
+      gstNumber: "",
+      trackingCount: tracking.length,
+      invoiceDownloaded: false,
+      imei: null,
+      orderDate: null,
+      skippedOld: true,
+    };
+  }
+  if (opts.applyCalendar !== false && orderDate && !isOnOrAfterSince(orderDate, jobSince(userId))) {
+    log(userId, "info", `${card.orderId} unit ${unitKey}: placed ${orderDate.toLocaleDateString("en-IN")} is before ${jobSinceLabel(userId)} — index only`);
+    await patchOrderIndex(
+      userId,
+      account,
+      { orderId: card.orderId, itemId: savedItemId, unitId: unitKey, orderUrl: page.url() },
       {
-        $set: {
-          userId,
-          platformAccountId: account.id,
-          platform_email: account.email,
-          platform: "FLIPKART",
-          order_id: card.orderId,
-          item_id: savedItemId,
-          order_url: page.url() || card.orderUrl || orderDetailsUrl(card.orderId, savedItemId, unitKey),
-          order_date: orderDate,
-          unit_id: unitKey,
-          last_fetch: new Date(),
-          since_date: jobSince(userId),
-          last_error: `skipped — older than ${jobSinceLabel(userId)}`,
-        },
-        $setOnInsert: { id: await nextSeq("order_fetch") },
-      },
-      { upsert: true }
+        scrape_status: "skipped_old",
+        order_date: orderDate,
+        shipped_date: shippedDate,
+        status_key: delivered ? "Delivered" : cancelled ? "Cancelled" : current?.status || "",
+        last_error: `placed before ${jobSinceLabel(userId)}`,
+        order_url: page.url(),
+      }
     );
     return {
       lastFetch: new Date(),
@@ -1343,7 +1561,11 @@ async function scrapeAndSave(
       ? "Delivered"
       : cancelled
         ? "Cancelled"
-        : current?.status || "";
+        : returned
+          ? "Returned"
+          : refunded
+            ? "Refunded"
+            : current?.status || "";
   const statusLabel = failed
     ? failState?.status_label || "Order not placed"
     : delivered
@@ -1411,11 +1633,24 @@ async function scrapeAndSave(
         imei,
         is_logged_in: true,
         last_fetch: lastFetch,
-        since_date: jobSince(userId),
+        ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
         last_error: "",
       },
     },
     { upsert: true }
+  );
+  await patchOrderIndex(
+    userId,
+    account,
+    { orderId: card.orderId, itemId: savedItemId, unitId: unitKey, orderUrl: page.url() },
+    {
+      scrape_status: "scraped",
+      status_key: statusKey,
+      order_date: orderDate,
+      shipped_date: shippedDate,
+      last_error: "",
+      order_url: page.url(),
+    }
   );
 
   return {
@@ -1436,7 +1671,8 @@ async function scrapeAndSave(
 async function processAccount(page: Page, userId: string, queue: QueueAccount[], row: QueueAccount, index: number) {
   const job = state(userId);
   job.currentEmail = row.email;
-  log(userId, "info", `Flipkart fetch ${index + 1}/${queue.length}: ${row.email}`);
+  job.phase = "discover";
+  log(userId, "info", `Discover ${index + 1}/${queue.length}: ${row.email}`);
   await restoreFlipkartSession(page, row.cookies);
   await page.goto(ORDERS_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
   await sleep(2500);
@@ -1452,42 +1688,57 @@ async function processAccount(page: Page, userId: string, queue: QueueAccount[],
   const cards = await collectOrderIds(page, userId, row.existing);
   job.report.idsFound += cards.length;
   tickElapsed(job);
-  const savedRows = await Order.find({ userId, platformAccountId: row.id })
-    .select("order_id unit_id status_key last_fetch")
-    .lean();
-  const closed = new Map(
-    savedRows
-      .filter((saved) => isClosedOrderStatus(saved.status_key) && saved.last_fetch && saved.unit_id)
-      .map((saved) => [saved.unit_id, saved.status_key] as const)
-  );
+
+  let discoveredNew = 0;
+  let discoveredDup = 0;
+  for (const card of cards) {
+    if (job.cancelled) throw new Error("cancelled");
+    const kind = await discoverUnit(userId, row, card);
+    job.report.idsDiscovered += 1;
+    if (kind === "duplicate" || kind === "seeded") {
+      discoveredDup += 1;
+      job.report.idsDuplicate += 1;
+    } else {
+      discoveredNew += 1;
+      job.report.idsNew += 1;
+    }
+  }
   log(
     userId,
     "info",
-    `${row.email}: ${cards.length} unit(s) found · ${closed.size} already Delivered/Cancelled/Failed will be skipped`
+    `${row.email}: indexed ${cards.length} unit(s) · ${discoveredNew} new · ${discoveredDup} already known`
   );
 
-  let skippedClosed = 0;
-  for (let n = 0; n < cards.length; n++) {
-    const card = cards[n];
+  job.phase = "enrich";
+  const pending = await OrderIndex.find({
+    userId,
+    platformAccountId: row.id,
+    scrape_status: { $in: ["pending", "failed"] },
+  }).lean();
+  job.report.enrichQueued += pending.length;
+  log(userId, "info", `Enrich ${row.email}: ${pending.length} pending/failed unit(s) to open`);
+
+  for (let n = 0; n < pending.length; n++) {
+    const rowIdx = pending[n];
     if (job.cancelled) throw new Error("cancelled");
-    job.currentEmail = `${row.email} ${n + 1}/${cards.length} ${card.orderId} ${card.unitId}`;
-    const closedStatus = closed.get(card.unitId);
-    if (closedStatus) {
-      skippedClosed += 1;
-      job.report.idsSkippedClosed += 1;
-      tickElapsed(job);
-      log(userId, "info", `${card.orderId} unit ${card.unitId}: already ${closedStatus} — skip refetch`);
-      continue;
-    }
+    const card: ListCard = {
+      orderId: rowIdx.order_id,
+      itemId: rowIdx.item_id,
+      unitId: rowIdx.unit_id,
+      orderUrl: rowIdx.order_url || orderDetailsUrl(rowIdx.order_id, rowIdx.item_id, rowIdx.unit_id),
+      amount: "",
+    };
+    job.currentEmail = `${row.email} enrich ${n + 1}/${pending.length} ${card.orderId} ${card.unitId}`;
     job.report.idsOpened += 1;
     try {
-      const scraped = await scrapeAndSave(page, userId, row, card);
+      const scraped = await scrapeAndSave(page, userId, row, card, { applyCalendar: true });
       if (scraped.skippedOld) {
         job.report.idsSkippedOld += 1;
         tickElapsed(job);
         continue;
       }
       job.report.idsScraped += 1;
+      job.savedOrders += 1;
       if (scraped.productName) job.report.withProduct += 1;
       if (scraped.trackingCount) job.report.withTracking += 1;
       if (scraped.gstNumber) job.report.withGst += 1;
@@ -1495,29 +1746,25 @@ async function processAccount(page: Page, userId: string, queue: QueueAccount[],
       log(
         userId,
         "info",
-        `${card.orderId} unit ${card.unitId}: ${scraped.productName || "product"} · ₹${scraped.totalAmount || "?"} · ${scraped.statusKey || "status"} · ${scraped.trackingCount} tracking stage(s)${scraped.imei ? ` · IMEI ${scraped.imei}` : ""} · last fetch ${scraped.lastFetch.toLocaleString("en-IN")}`
+        `${card.orderId} unit ${card.unitId}: ${scraped.productName || "product"} · ₹${scraped.totalAmount || "?"} · ${scraped.statusKey || "status"} · ${scraped.trackingCount} tracking stage(s)`
       );
     } catch (err) {
       if (isDestroyedContext(err)) throw err;
       job.report.idsFailed += 1;
       tickElapsed(job);
-      log(userId, "warn", `${card.orderId} unit ${card.unitId}: fetch skipped (${err instanceof Error ? err.message : err})`);
-      await Order.updateOne(
-        { userId, unit_id: card.unitId },
-        { $set: { last_error: err instanceof Error ? err.message : String(err) } }
-      );
+      const message = err instanceof Error ? err.message : String(err);
+      log(userId, "warn", `${card.orderId} unit ${card.unitId}: enrich failed (${message})`);
+      await patchOrderIndex(userId, row, card, { scrape_status: "failed", last_error: message });
     }
   }
 
-  const accountFetch = new Date();
   job.done += 1;
   job.report.accountsDone += 1;
-  job.savedOrders = await Order.countDocuments({ userId, platformAccountId: { $in: queue.map((q) => q.id) } });
   tickElapsed(job);
   log(
     userId,
     "info",
-    `${row.email}: ${cards.length} unit(s) on/after ${jobSinceLabel(userId)} · skipped ${skippedClosed} closed · last fetch ${accountFetch.toLocaleString("en-IN")}`
+    `${row.email}: discover ${cards.length} · enrich opened ${pending.length} · last fetch ${new Date().toLocaleString("en-IN")}`
   );
 }
 

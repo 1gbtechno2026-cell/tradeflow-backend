@@ -29,4 +29,6 @@ export const config = {
   slowMoMs: Math.max(0, Number(process.env.SLOW_MO_MS || 200)),
   /** Keep the Chrome window open after the job so you can inspect the page. */
   keepBrowserOpenMs: Math.max(0, Number(process.env.KEEP_BROWSER_OPEN_MS || 60000)),
+  /** Bearer token the Android SMS forwarder sends to /api/sms. Empty = webhook disabled. */
+  smsApiToken: process.env.SMS_API_TOKEN || "",
 };

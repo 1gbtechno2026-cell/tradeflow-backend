@@ -73,6 +73,8 @@ export async function resolveAddress(input: {
       locality: input.address.locality || "",
       addressType: input.address.addressType || "Home",
       checkoutPincode: input.address.checkoutPincode || "",
+      label: input.address.label || "",
+      gstLabel: input.address.gstLabel || "",
     };
   }
 
@@ -86,11 +88,13 @@ export async function resolveAddress(input: {
 
   let gstNumber = "";
   let companyName = "";
+  let gstLabel = "";
   if (input.gstId != null) {
     const gst = await Gst.findOne({ userId, id: input.gstId }).lean();
     if (!gst) throw new Error(`GST ${input.gstId} not found`);
     gstNumber = gst.gstNumber;
     companyName = gst.businessName;
+    gstLabel = gst.label || gst.businessName;
   } else if (row.linkedGstIds?.length) {
     const gst = await Gst.findOne({
       userId,
@@ -99,6 +103,7 @@ export async function resolveAddress(input: {
     if (gst) {
       gstNumber = gst.gstNumber;
       companyName = gst.businessName;
+      gstLabel = gst.label || gst.businessName;
     }
   }
 
@@ -114,5 +119,7 @@ export async function resolveAddress(input: {
     addressType: "Home",
     gstNumber,
     companyName,
+    label: row.label || "",
+    gstLabel,
   };
 }

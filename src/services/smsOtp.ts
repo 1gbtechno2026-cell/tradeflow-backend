@@ -6,6 +6,7 @@ import { OtpMessage } from "../models/OtpMessage.js";
 import { normalizePhone } from "../lib/phone.js";
 import { getRedis } from "../lib/redis.js";
 import { findRunHoldingPhone } from "./employeePhoneLease.js";
+import { extractCardLast4, extractOtp } from "./otpParse.js";
 import { sleep } from "./browser.js";
 import { workspaceUserId } from "./sessionStore.js";
 
@@ -15,16 +16,19 @@ const FORWARDER_PATTERN = /(?:Incoming|Outgoing)(?:\s+MMS)?\s*[-–—]\s*(.*?)\
 // the employee phone to match, not the bank sender parsed out of `message`.
 // Digits may be grouped with spaces/dashes ("+91 87967 01297"); normalizePhone strips them.
 const SUBJECT_PHONE_PATTERN = /number\s*(\+?\d[\d\s-]{6,}\d)/i;
-// "680668 is the OTP for..." — some banks put the digits before the keyword.
-const OTP_LEADING_DIGIT_PATTERN = /(\d{4,8})\s+is\s+(?:the\s+|your\s+)?OTP\b/i;
-// "Your OTP is 483920" / "OTP: 483920" — others put them after.
-const OTP_TRAILING_KEYWORD_PATTERN = /\bOTP\D{0,12}(\d{4,8})/i;
-// "...on your ICICI Bank Card XX8002." / "Card ending 4411" / "Card no. XX1234" — last 4, masked or not.
-const CARD_LAST4_PATTERN = /Card\s+(?:(?:ending|no\.?|number)\s+(?:with\s+|in\s+)?)?[A-Za-z*Xx]*?(\d{4})\b/i;
 
 const PHONE_OTP_TTL_SECONDS = 300;
 const OTP_POLL_INTERVAL_MS = 2000;
 const OTP_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Parsing lives in otpParse.ts, with a regression test per bank
+ * (scripts/otpParseTest.ts). It moved out of here because the patterns that used
+ * to sit inline got two of five real messages wrong: Pine Labs' masked PAN
+ * ("817546****7845") yielded no card at all, and IndusInd's "One Time Password
+ * (OTP)" yielded no OTP. Re-exported so existing callers are unaffected.
+ */
+export { extractOtp, extractCardLast4, extractAmount } from "./otpParse.js";
 
 export class SmsPayloadError extends Error {}
 export class OtpTimeoutError extends Error {}
@@ -54,18 +58,6 @@ function runKey(runId: string) {
   return `otp:run:${runId}`;
 }
 
-/** Only digits near the word "OTP" — a bare 4–8 digit fallback would false-positive on dates/times. */
-export function extractOtp(message: string): string | null {
-  const leading = message.match(OTP_LEADING_DIGIT_PATTERN);
-  if (leading) return leading[1];
-  const trailing = message.match(OTP_TRAILING_KEYWORD_PATTERN);
-  return trailing ? trailing[1] : null;
-}
-
-export function extractCardLast4(message: string): string | null {
-  const match = message.match(CARD_LAST4_PATTERN);
-  return match ? match[1] : null;
-}
 
 /**
  * Accepts `{ sender, message }` or the SMS-forwarder app shape

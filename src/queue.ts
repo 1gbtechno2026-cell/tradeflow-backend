@@ -22,8 +22,15 @@ export function getCheckoutQueue() {
       connection: redisConnection(),
       defaultJobOptions: {
         attempts: 1,
-        removeOnComplete: { age: 60 * 60 * 24 * 7, count: 1000 },
-        removeOnFail: { age: 60 * 60 * 24 * 14 },
+        // Dropped the moment the job settles, rather than retained for 7/14
+        // days, because the payload now carries unmasked card data (see
+        // CheckoutJobData.cards). Retention cost nothing before and costs a lot
+        // now: a failed job used to sit in Redis for two weeks holding a PAN and
+        // CVV. Nothing is lost — every status, log line, failure code and result
+        // this UI reads lives on the CheckoutJob document in Mongo, not here.
+        // Revisit only once cards are a reference instead of the secret itself.
+        removeOnComplete: true,
+        removeOnFail: true,
       } satisfies JobsOptions,
     });
   }

@@ -1,3 +1,5 @@
+import type { AuthType, CardDetails } from "./paymentStrategies/types.js";
+
 export type AddressType = "Home" | "Work";
 
 export type JobStatus =
@@ -57,6 +59,10 @@ export interface JobRequestSnapshot {
   platform: string;
   paymentMode: string;
   cardType: string;
+  /** Credential arm chosen for this batch — also its concurrency class:
+   *  "otp" needs a handset from the shared pool, password/pin do not. */
+  authType?: string;
+  corporateId?: string;
   sellerName: string;
   listingId: string;
   deliverySlaDays?: number;
@@ -102,4 +108,30 @@ export interface CheckoutJobData {
   gstMandatory?: boolean;
   address: AddressDetails;
   isRetry?: boolean;
+  /** COD | card | ... — decides whether a card is needed at all. */
+  paymentMode?: string;
+  cardType?: string;
+  authType?: AuthType;
+  corporateId?: string | null;
+  /**
+   * The cards this batch may pay with, UNMASKED — full PAN, CVV and the card
+   * type's credential. Nothing else in this codebase carries these: the stored
+   * request snapshot masks them (orderSnapshot.maskCards) and always will.
+   *
+   * They ride the queue payload because there is nowhere else yet to read them
+   * from — the order form holds cards in browser state only, and no collection
+   * persists them (Order.card_number is an unpopulated placeholder). That makes
+   * the payload the ONLY path from the operator's CSV to the bank's form.
+   *
+   * Consequences that are deliberately accepted for now, and the reason
+   * queue.ts drops completed AND failed jobs immediately rather than retaining
+   * them for 7/14 days:
+   *   - plaintext card data exists in Redis for the lifetime of the job
+   *   - it crosses the network if Redis is not on the same host
+   * To be replaced by an encrypted cards collection plus a reference here,
+   * matching the rule sessionVerifyQueue.ts already states for cookies: the
+   * payload carries a Mongo reference, never the secret. Until then: never log
+   * a member of this array, and never copy it onto a persisted document.
+   */
+  cards?: CardDetails[];
 }

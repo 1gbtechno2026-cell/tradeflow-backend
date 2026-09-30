@@ -124,6 +124,15 @@ async function maybeEnqueueRetry(
     address: data.address,
     request,
     isRetry: true,
+    // Carried from the payload we were handed, not re-read from Mongo: the
+    // persisted snapshot's cards are masked, so a retry that rebuilt them from
+    // `request` would queue a job holding "54XXXXXXXX000759" and fail at the
+    // bank with nothing in the logs to explain why.
+    paymentMode: data.paymentMode,
+    cardType: data.cardType,
+    authType: data.authType,
+    corporateId: data.corporateId,
+    cards: data.cards,
   });
   console.log(
     `[${data.jobId}] [info] [batch] retry queued job=${job._id} after ${reason} (purchased=${progress.purchasedQuantity}/${totalQuantity} attempts=${progress.attemptsUsed}/${totalAttempts})`

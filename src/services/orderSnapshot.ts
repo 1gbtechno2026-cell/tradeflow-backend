@@ -35,6 +35,11 @@ export function requestSnapshot(data: NormalizedCreateJob): JobRequestSnapshot {
     platform: (data.platform || "FLIPKART").toUpperCase(),
     paymentMode: data.paymentMode || "",
     cardType: data.cardType || "",
+    // Safe to persist — neither is a secret, and both are needed to explain
+    // after the fact why an order took the handset-pool path or not. The cards
+    // below stay masked; that is the line this snapshot does not cross.
+    authType: data.authType || "",
+    corporateId: data.corporateId || "",
     sellerName: data.sellerName || "",
     listingId: data.listingId || "",
     deliverySlaDays: data.deliverySlaDays,

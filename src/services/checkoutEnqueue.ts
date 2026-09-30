@@ -1,5 +1,6 @@
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import { getCheckoutQueue } from "../queue.js";
+import type { AuthType, CardDetails } from "../paymentStrategies/types.js";
 import type { AddressDetails, CheckoutJobData, JobRequestSnapshot } from "../types.js";
 
 export async function enqueueCheckoutJob(input: {
@@ -18,6 +19,14 @@ export async function enqueueCheckoutJob(input: {
   request?: JobRequestSnapshot;
   dryRun?: boolean;
   isRetry?: boolean;
+  paymentMode?: string;
+  cardType?: string;
+  authType?: AuthType;
+  corporateId?: string | null;
+  /** Unmasked. Goes on the Redis payload ONLY — see CheckoutJobData.cards. It is
+   *  never written to the CheckoutJob document, whose `request.cards` stays
+   *  masked by orderSnapshot.maskCards. */
+  cards?: CardDetails[];
 }): Promise<{ job: InstanceType<typeof CheckoutJob>; queued: boolean }> {
   const perOrderQty = input.quantityPerOrder;
   const created = await CheckoutJob.create({
@@ -68,6 +77,11 @@ export async function enqueueCheckoutJob(input: {
     gstMandatory: input.gstMandatory,
     address: input.address,
     isRetry: input.isRetry,
+    paymentMode: input.paymentMode,
+    cardType: input.cardType,
+    authType: input.authType,
+    corporateId: input.corporateId,
+    cards: input.cards,
   };
   const queued = await getCheckoutQueue().add("checkout", payload, { jobId: String(created._id) });
   created.bullmqJobId = queued.id || String(created._id);

@@ -9,6 +9,8 @@ import { initBatchCounters, readBatchProgress } from "../services/batchCounters.
 import { enqueueCheckoutJob } from "../services/checkoutEnqueue.js";
 import { requestSnapshot } from "../services/orderSnapshot.js";
 import { resolveAddress, resolveLoggedInSession, workspaceUserId } from "../services/sessionStore.js";
+import { toCardDetails } from "../services/paymentCards.js";
+import type { AuthType } from "../paymentStrategies/types.js";
 import type { AddressDetails, JobRequestSnapshot, JobResultSnapshot } from "../types.js";
 
 export const jobsRouter = Router();
@@ -166,6 +168,11 @@ jobsRouter.post("/", async (req, res) => {
     const effectiveAttempts = effectiveAttemptsFor(data.totalAttempts, requiredOrders);
     const jobs: Array<ReturnType<typeof publicJob>> = [];
     const request = requestSnapshot({ ...data, totalAttempts: effectiveAttempts });
+    // Unmasked, for the queue payload only. `request.cards` just above is the
+    // masked copy that gets persisted on the job document; the two must never be
+    // confused for one another.
+    const cards = toCardDetails(data.cards);
+    const authType = data.authType as AuthType | undefined;
 
     // Emails are assigned round-robin across requiredOrders jobs.
     // uniqueEmails.length may be < requiredOrders — the same logged-in ID is reused
@@ -253,6 +260,11 @@ jobsRouter.post("/", async (req, res) => {
         address,
         request,
         dryRun: data.dryRun,
+        paymentMode: data.paymentMode,
+        cardType: data.cardType,
+        authType,
+        corporateId: data.corporateId,
+        cards,
       });
       if (!data.dryRun) {
         console.log(`[trade-flow] QUEUED ${session.email} job=${created._id} redis=${created.bullmqJobId || created._id}`);

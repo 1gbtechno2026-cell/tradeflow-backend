@@ -53,6 +53,13 @@ const normalizedSchema = z.object({
   listingId: z.string().optional(),
   paymentMode: z.string().optional(),
   cardType: z.string().optional(),
+  /** Which credential arm the operator picked. Load-bearing, not cosmetic: it
+   *  decides whether this order needs a handset from the shared phone pool
+   *  (otp) or carries its own credential in the CSV (password/pin), which is
+   *  what determines the order's concurrency class. */
+  authType: z.enum(["password", "otp", "pin"]).optional(),
+  /** Required by corporate card types; names the onboarded handset group. */
+  corporateId: z.string().optional(),
   deliverySlaDays: z.number().int().positive(),
   cards: z.array(z.record(z.unknown())).optional(),
   dryRun: z.boolean().default(false),
@@ -86,6 +93,12 @@ export function parseCreateJobBody(raw: unknown): NormalizedCreateJob {
     listingId: asString(b.listingId) ?? asString(b.listing_id),
     paymentMode: asString(b.paymentMode) ?? asString(b.payment_mode),
     cardType: asString(b.cardType) ?? asString(b.card_type),
+    // Both of these were being dropped on the floor: the order form has sent
+    // auth_type and corporate_id all along, and nothing mapped them, so a
+    // corporate card arrived with no Corporate ID and the lease could not scope
+    // to the onboarded group.
+    authType: (asString(b.authType) ?? asString(b.auth_type))?.toLowerCase(),
+    corporateId: (asString(b.corporateId) ?? asString(b.corporate_id))?.toUpperCase(),
     deliverySlaDays: asNumber(b.deliverySlaDays) ?? asNumber(b.delivery_sla_days),
     cards: Array.isArray(b.cards) ? b.cards : undefined,
     dryRun:

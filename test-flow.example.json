@@ -1,0 +1,40 @@
+{
+  "//": "Copy to test-flow.json and fill in your own values. test-flow.json is gitignored.",
+
+  "//platformId": "An ALREADY LOGGED IN platform id — email or ObjectId. The harness reads its cookies from platformids and never logs in; a dead session fails fast.",
+  "platformId": "actbogtee@bobbhai.in",
+
+  "//addressId": "id from the dashboard's addresses collection. gstId from gsts.",
+  "addressId": 1,
+  "gstId": 1,
+  "gstMandatory": true,
+
+  "//checkoutPincode": "Optional. Overrides the address's pincode, so deliverability can be flipped without editing address records.",
+  "checkoutPincode": "",
+
+  "quantity": 1,
+  "deliverySlaDays": 7,
+
+  "//paymentMode": "cod | card | none. none stops at /payments.",
+  "paymentMode": "cod",
+
+  "//stopAfter": "payments (default) | payment_probe | pay. 'pay' ALSO needs payLive: true.",
+  "stopAfter": "payment_probe",
+  "payLive": false,
+
+  "//cardType": "Only for paymentMode=card. cards[] takes the same columns as the order form's CSV.",
+  "cardType": "HDFC_VIRTUAL",
+  "authType": "password",
+  "cards": [],
+
+  "mobileDevice": "Pixel 7",
+  "headless": false,
+
+  "//productUrls": "One per case id. Only `happy` is required. An out-of-stock product does not stay out of stock — keep these current.",
+  "productUrls": {
+    "happy": "https://www.flipkart.com/samsung-galaxy-a06-5g-black-128-gb/p/itm2bf1cd87d2bf7?pid=MOBH9GQKCNWVNM2M",
+    "oos": "",
+    "pincode": "",
+    "qty": ""
+  }
+}

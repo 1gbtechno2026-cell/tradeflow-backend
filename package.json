@@ -10,7 +10,8 @@
     "start": "node dist/index.js",
     "worker": "tsx src/worker.ts",
     "typecheck": "tsc --noEmit",
-    "test:otp": "tsx src/scripts/otpParseTest.ts"
+    "test:otp": "tsx src/scripts/otpParseTest.ts",
+    "test:flow": "tsx src/scripts/testFlowCli.ts"
   },
   "dependencies": {
     "bullmq": "^5.58.5",

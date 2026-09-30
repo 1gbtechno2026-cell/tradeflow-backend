@@ -94,7 +94,17 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
   // carry exists because of a shared resource COD does not touch.
   if (mode === "cod") {
     if (input.dryRun) {
-      log("info", "[pay] dry run — COD selection and Place Order skipped", "payment");
+      // Still ASK the page, because isCodAvailable only reads it — no click, no
+      // order. Skipping it entirely would make a dry run prove the plumbing while
+      // telling you nothing about whether the COD selectors actually match, which
+      // is the one thing a first dry run is for. Failures here are reported, not
+      // thrown: a selector that cannot find COD must not fail a dry run.
+      try {
+        const available = await fk.isCodAvailable();
+        log("info", `[pay] dry run — isCodAvailable() says ${available}; nothing clicked`, "payment");
+      } catch (err) {
+        log("warn", `[pay] dry run — isCodAvailable() threw: ${err instanceof Error ? err.message : String(err)}`, "payment");
+      }
       return { attempted: true, ok: true, result: null, cardId: null, ordersOnCard: 0, confirmation: null };
     }
     try {

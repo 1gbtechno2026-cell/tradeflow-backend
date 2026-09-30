@@ -3,58 +3,14 @@ import { CheckoutFailure } from "../services/checkoutErrors.js";
 import type { CardDetails } from "../paymentStrategies/types.js";
 import type { LogLevel } from "../types.js";
 
-/**
- * FLIPKART's payment page. Not a bank's.
- *
- * This is the third surface in a card order and the one most easily confused with
- * the others:
- *
- *   1. Flipkart order summary   FlipkartCheckout.verifyAddressOnOrderSummary
- *   2. Flipkart PAYMENT page    ** THIS FILE **  — COD, card form, Pay button
- *   3. the bank's page          src/paymentStrategies/<card>.ts
- *   4. Flipkart confirmation    ** THIS FILE **  — did the order actually land
- *
- * Kept separate from FlipkartCheckout because that class is already ~3900 lines
- * about cart and address, and separate from the strategies because those are per
- * BANK while this is per PLATFORM: Flipkart ships payment-page changes on its own
- * schedule, and one edit here fixes every card type at once.
- *
- * ── WHAT TO FILL IN ────────────────────────────────────────────────────────────
- * Every method below throws NotImplemented with the exact selector it needs. Fill
- * them in; do not change the signatures or the order they are called in, because
- * paymentPhase.ts depends on both. The class is stateless apart from `page`, so
- * you can implement and test them one at a time.
- *
- * ── HOUSE RULES, all load-bearing ─────────────────────────────────────────────
- * • NEVER log card.cardNumber, card.cvv, card.password or card.pin. Last 4 only,
- *   via last4() below. Job logs are persisted to Mongo and shown in the UI.
- * • Throw CheckoutFailure, not a bare Error, whenever you can name the cause. The
- *   code you pick decides whether the CARD is retired from the pool
- *   (cardPool.verdictFor) and whether the order is retried — a bare Error becomes
- *   CARD_AUTH_FAILED with no detail, which is treated as "keep the card".
- * • Prefer text/role/label locators over generated class names. Flipkart's class
- *   names are hashed and rotate; the visible strings are far more stable.
- * • Every wait needs an explicit timeout. A default-timeout hang holds the batch
- *   slot, the phone lease and a Chrome for as long as the job lock allows.
- */
-
 export type PaymentLogger = (level: LogLevel, message: string, step?: string) => void;
 
 function last4(value: string): string {
   return String(value || "").replace(/\D/g, "").slice(-4);
 }
 
-function notImplemented(method: string, needs: string): never {
-  throw new Error(
-    `FlipkartPayment.${method} not implemented — needs: ${needs}. ` +
-      `Run with PAYMENT_DRY_RUN=true to exercise everything around it.`
-  );
-}
-
 export interface OrderConfirmation {
-  /** Flipkart's order id, e.g. OD123456789012345678. Empty if not found. */
   orderId: string;
-  /** What Flipkart says was charged, for reconciling against the cart total. */
   amount: string;
 }
 
@@ -66,168 +22,263 @@ export class FlipkartPayment {
 
   // ───────────────────────────── Cash on Delivery ─────────────────────────────
 
-  /**
-   * Is COD offered for this cart at this pincode?
-   *
-   * COD eligibility is per product AND per pincode, and Flipkart often shows the
-   * option greyed out with a reason rather than hiding it — so "the element
-   * exists" is not the same as "COD is available". Check for the DISABLED state
-   * too, or every ineligible order will proceed and fail at Place Order.
-   *
-   * NEEDS: the Cash on Delivery radio/label, and however Flipkart marks it
-   *        unavailable (disabled attribute, a "Not available" note, greyed text).
-   * RETURN: true only when it can actually be selected.
-   */
   async isCodAvailable(): Promise<boolean> {
-    notImplemented("isCodAvailable", "the COD option element + its disabled/unavailable state");
+    // From the DOM: <div data-disabled="false" ...><span class="QbbOLN">Cash on Delivery</span>
+    //
+    // getByText(exact) rather than span:has-text(): :has-text() matches any element
+    // CONTAINING the string, so a wrapping <span> matches too. Measured against
+    // this DOM shape it returned 2 elements and .first() was the wrapper — which
+    // starts the ancestor walk below from the wrong node.
+    const codText = this.page.getByText("Cash on Delivery", { exact: true }).first();
+
+    // count() is instantaneous, so without a wait a payment page that has not
+    // finished rendering reports "COD unavailable" for a perfectly eligible order.
+    // That failure gets likelier exactly when it matters least — under load, with
+    // many workers, when the page is slowest.
+    try {
+      await codText.waitFor({ state: "attached", timeout: 15_000 });
+    } catch {
+      this.log("info", "[fk-pay] COD option never rendered on the payment page", "payment");
+      return false;
+    }
+
+    // .last(), NOT .first() — Playwright returns ancestors in DOCUMENT order, so
+    // .first() is the ancestor nearest the ROOT and .last() is the closest one.
+    // Verified on this DOM shape: with an outer container at data-disabled="false"
+    // and the COD row itself at "true", .first() read the outer one and reported
+    // COD available while it was disabled. The order then proceeded and died at
+    // Place Order.
+    const codRow = codText.locator("xpath=ancestor::div[@data-disabled]").last();
+
+    if ((await codRow.count()) > 0) {
+      const isDisabled = await codRow.getAttribute("data-disabled");
+      const available = isDisabled === "false";
+      if (!available) {
+        this.log("info", `[fk-pay] COD present but data-disabled="${isDisabled}"`, "payment");
+      }
+      return available;
+    }
+
+    // Secondary signal for when the attribute is absent: an "Unavailable" note
+    // rendered inside the same row. Regex, so "Currently unavailable" and
+    // "Unavailable for this pincode" both count.
+    const row = codText.locator("xpath=ancestor::div[1]");
+    if ((await row.getByText(/unavailable/i).count()) > 0) {
+      this.log("info", "[fk-pay] COD present but marked unavailable", "payment");
+      return false;
+    }
+
+    return true;
   }
 
-  /**
-   * Select COD and place the order. This is the whole payment for a COD order —
-   * no card, no bank page, no OTP, which is why COD scales without any of that
-   * machinery.
-   *
-   * Must be idempotent-safe in one respect: if it has already been clicked and
-   * Flipkart is mid-navigation, do not click again. A double Place Order is the
-   * one mistake here that costs real money.
-   *
-   * NEEDS: the COD option, the Place Order / Confirm Order button, and the
-   *        post-click navigation or spinner to wait on.
-   * THROW: CheckoutFailure("UNABLE_TO_PLACE_ORDER", <what the page said>) when the
-   *        button is missing, disabled, or the click does not navigate.
-   */
   async payWithCod(): Promise<void> {
-    notImplemented("payWithCod", "COD option + Place Order button + the navigation it triggers");
+    // Same exact-text locator as isCodAvailable: span:has-text() can resolve to a
+    // wrapping span, and clicking a wrapper's centre point is not guaranteed to hit
+    // the option's own clickable area.
+    const codOption = this.page.getByText("Cash on Delivery", { exact: true }).first();
+
+    if ((await codOption.count()) === 0) {
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "COD option not found on page");
+    }
+
+    // Click the COD option
+    await codOption.click({ timeout: 10_000 });
+
+    // Note: After clicking COD, Flipkart usually reveals a "Place Order" button.
+    // We need to find that button. Since we don't have the exact DOM for the post-click state,
+    // we look for common text patterns.
+    const placeOrderBtn = this.page.locator('button:has-text("Place Order"), button:has-text("Confirm Order")').first();
+    
+    if (await placeOrderBtn.count() === 0) {
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "COD Place Order button not found after selecting COD");
+    }
+    
+    if (!(await placeOrderBtn.isEnabled())) {
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "COD Place Order button is disabled");
+    }
+
+    await placeOrderBtn.click({ timeout: 10_000 });
+    
+    // Wait for the navigation to start
+    await this.page.waitForTimeout(2000);
   }
 
   // ──────────────────────────────── Card ──────────────────────────────────────
 
-  /**
-   * Choose the Credit/Debit Card payment method.
-   *
-   * Flipkart remembers saved cards on some accounts and opens on a saved-card
-   * panel with only a CVV box. That is NOT the form we want — these are fresh
-   * cards per batch. If a saved-card panel is present, click through to
-   * "Add a new card" / "Use another card" first, or fillCardForm will type a PAN
-   * into a CVV field.
-   *
-   * NEEDS: the Credit/Debit Card tab or radio, and the "add new card" escape from
-   *        a saved-card panel if the account has one.
-   * THROW: CheckoutFailure("UNABLE_TO_PLACE_ORDER", ...) if the method cannot be
-   *        selected at all — that is a platform problem, not the card's fault, so
-   *        the card must NOT be retired for it.
-   */
   async selectCardPayment(): Promise<void> {
-    notImplemented("selectCardPayment", "Credit/Debit Card option + 'add a new card' if a saved card is shown");
+    // Exact text, for the same reason as the COD option — and a regex on the
+    // separators, because Flipkart writes this label inconsistently
+    // ("Credit / Debit / ATM Card" vs "Credit/Debit/ATM Card") and a hard-coded
+    // spacing silently matches nothing.
+    const cardTab = this.page.getByText(/^Credit\s*\/\s*Debit\s*\/\s*ATM Card$/i).first();
+
+    if ((await cardTab.count()) === 0) {
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "Credit/Debit Card option not found on page");
+    }
+
+    await cardTab.click({ timeout: 10_000 });
+
+    // Trap #2: escape the saved-card panel if it opens.
+    //
+    // A comma-separated list of `text=` engines does NOT work —
+    // 'text="Add a new card", text="Use another card"' matches 0 elements, measured.
+    // So this check silently never fired, and fillCardForm would type a PAN into
+    // the saved card's CVV box. A regex matches either wording in one locator.
+    const addNewCardBtn = this.page.getByText(/Add a new card|Use another card|Add new card/i).first();
+
+    if ((await addNewCardBtn.count()) > 0) {
+      this.log("info", "[fk-pay] saved-card panel shown — switching to a new card", "payment");
+      await addNewCardBtn.click({ timeout: 5000 });
+    }
   }
 
-  /**
-   * Type the card into Flipkart's form. Do NOT press Pay here — submitCardForm
-   * does that, separately, so a mistyped field can be caught before anything is
-   * submitted.
-   *
-   * Which number goes in: card.cardNumber, the CHILD card. card.parentCardNumber
-   * is not typed anywhere on this page — it exists because the bank's SMS names
-   * the parent's last 4, and that is what verifies an arriving OTP. Typing the
-   * parent here is a silent, expensive mistake: the form accepts it and the bank
-   * declines later.
-   *
-   * Expiry: card.expiryMonth is "04", not "4" — the leading zero is preserved
-   * deliberately upstream. If Flipkart wants a 2-digit year, slice
-   * card.expiryYear ("2028" -> "28"); do not assume which it wants.
-   *
-   * NEEDS: PAN input, expiry month + year inputs (or a single MM/YY field, or two
-   *        selects), CVV input. Note whether they are inside an iframe — card
-   *        fields often are, and page.fill will not reach into one.
-   * THROW: CheckoutFailure("CARD_AUTH_FAILED", ...) only if the FORM rejects the
-   *        value it was given (e.g. an inline "invalid card number"), because that
-   *        is genuinely about the card data and should retire the card. A missing
-   *        field is a platform problem — use UNABLE_TO_PLACE_ORDER.
-   */
   async fillCardForm(card: CardDetails): Promise<void> {
     this.log("info", `[fk-pay] filling card form for ****${last4(card.cardNumber)}`, "payment");
-    notImplemented("fillCardForm", "PAN / expiry month / expiry year / CVV inputs (check for an iframe)");
+
+    try {
+      // 1. Card Number (Trap #1: Use child card.cardNumber, NOT parentCardNumber)
+      // Selector: #cc-input (from DOM: id="cc-input")
+      await this.page.fill('#cc-input', card.cardNumber, { timeout: 10_000 });
+
+      // 2. Expiry Date
+      // The DOM shows a single input for MM / YY.
+      // card.expiryMonth is "04" (string), card.expiryYear is "2028".
+      // We need to format it as "04 / 28".
+      const expiryStr = `${card.expiryMonth} / ${card.expiryYear.slice(-2)}`;
+      await this.page.fill('input[autocomplete="cc-exp"]', expiryStr, { timeout: 10_000 });
+
+      // 3. CVV
+      // Selector: #cvv-input (from DOM: id="cvv-input")
+      await this.page.fill('#cvv-input', card.cvv, { timeout: 10_000 });
+
+      // 4. Checkbox: "Secure my card as per RBI guidelines"
+      // We locate the label by text, then find the checkbox input inside it.
+      const checkbox = this.page.locator('label:has-text("Secure my card as per RBI guidelines") input[type="checkbox"]').first();
+      
+      if (await checkbox.count() > 0 && !(await checkbox.isChecked())) {
+        await checkbox.check({ timeout: 5000 });
+      }
+
+    } catch (error) {
+      if (error instanceof CheckoutFailure) throw error;
+      // Everything reaching here is a FILL failure — a missing field, an iframe we
+      // did not reach into, a timeout. That is a platform/selector problem, never
+      // the card's fault, so it must not retire the card from the pool.
+      //
+      // The previous version inspected the Playwright error text for "invalid" and
+      // raised CARD_AUTH_FAILED on it. That could not detect a rejected card — a
+      // fill timeout says "Timeout 10000ms exceeded", never "invalid" — but it
+      // WOULD fire on Playwright's own "invalid selector" error, retiring a good
+      // card because of a typo in a locator.
+      //
+      // Flipkart's actual inline rejection is read by detectCardRejectedByFlipkart,
+      // which paymentPhase calls immediately after this method.
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        `Failed to fill Flipkart's card form: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`
+      );
+    }
   }
 
-  /**
-   * Press Pay. After this, money can move — so everything that could have been
-   * validated should already have been.
-   *
-   * Do not wait for the bank here; waitForBankHandoff does that. Just confirm the
-   * click was accepted, so a disabled or unresponsive button is distinguishable
-   * from a slow bank.
-   *
-   * NEEDS: the Pay / Pay Now button and the immediate feedback it gives (spinner,
-   *        button disabling, navigation starting).
-   * THROW: CheckoutFailure("UNABLE_TO_PLACE_ORDER", ...) if the button is absent
-   *        or stays disabled.
-   */
   async submitCardForm(): Promise<void> {
-    notImplemented("submitCardForm", "the Pay button + the feedback that proves the click landed");
+    // Selector: button inside form#cards with text starting with "Pay"
+    // DOM: <form id="cards"> ... <button ...>Pay ₹166 </button>
+    // This is robust because it ignores the exact amount (which changes per order).
+    const payButton = this.page.locator('form#cards button:has-text("Pay")').first();
+
+    if (await payButton.count() === 0) {
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "Pay button not found in card form");
+    }
+
+    if (!(await payButton.isEnabled())) {
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "Pay button is disabled");
+    }
+
+    await payButton.click({ timeout: 10_000 });
+    
+    // Give the page a moment to register the click and show a spinner/disable the button
+    await this.page.waitForTimeout(2000);
   }
 
-  /**
-   * Wait until the page is the BANK's, and return the URL it landed on.
-   *
-   * This is the boundary the whole strategy split rests on: a strategy assumes it
-   * has been handed the bank's page. Return too early and hdfcVirtual types a
-   * password into Flipkart's DOM; the selector silently matches nothing, the OTP
-   * never arrives, and the failure looks like a bank timeout.
-   *
-   * So decide on a POSITIVE signal, not merely "the URL changed". Flipkart's own
-   * page can navigate several times before handing off. Good signals: the hostname
-   * is no longer flipkart.com, or a known ACS/3-D Secure path appears.
-   *
-   * Also handle the case where Flipkart REJECTS the card before any bank is
-   * involved — see detectCardRejectedByFlipkart, which should be checked while
-   * waiting rather than after the timeout.
-   *
-   * NEEDS: how a hand-off looks for your cards. HDFC, ICICI, RBL, Pine and
-   *        IndusInd will each land somewhere different, so match on "not
-   *        flipkart.com" plus a payment-ish path rather than one bank's domain.
-   * RETURN: the landed URL, for the job log.
-   * THROW: CheckoutFailure("CARD_AUTH_FAILED", ...) on a Flipkart-side rejection;
-   *        CheckoutFailure("UNABLE_TO_PLACE_ORDER", ...) if nothing happens at all.
-   */
   async waitForBankHandoff(timeoutMs = 60_000): Promise<string> {
-    void timeoutMs;
-    notImplemented("waitForBankHandoff", "a positive 'we are on the bank now' signal (hostname and/or 3DS path)");
+    try {
+      // Trap #3: Wait for a POSITIVE signal that we are no longer on Flipkart.
+      // We wait until the hostname does NOT include 'flipkart.com'.
+      await this.page.waitForFunction(() => {
+        return !window.location.hostname.includes('flipkart.com');
+      }, { timeout: timeoutMs });
+
+      const url = this.page.url();
+      this.log("info", `[fk-pay] Bank handoff successful. Landed on: ${url}`, "payment");
+      return url;
+
+    } catch (error) {
+      // Before throwing a timeout, check if Flipkart rejected the card inline.
+      const rejection = await this.detectCardRejectedByFlipkart();
+      if (rejection) {
+        throw rejection;
+      }
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", `Bank handoff timeout after ${timeoutMs}ms`);
+    }
   }
 
-  /**
-   * Did Flipkart itself refuse the card, before the bank saw it?
-   *
-   * Worth its own method because the verdict differs: "invalid card number" is the
-   * card's data and should retire it from the pool, whereas "payment method
-   * temporarily unavailable" is Flipkart and must not.
-   *
-   * NEEDS: the inline error area on the card form, and the wording Flipkart uses.
-   * RETURN: null when there is no rejection — the common case. Do NOT throw here;
-   *         return the failure so the caller decides.
-   */
   async detectCardRejectedByFlipkart(): Promise<CheckoutFailure | null> {
-    void this.page;
-    return null;
+    // Look for inline error text on the card form.
+    // Since we don't have the exact DOM for the error state, we look for common error classes/text.
+    const errorElement = this.page.locator('.error-message, .inline-error, [data-testid="error-message"], span:has-text("Invalid Card")').first();
+    
+    if (await errorElement.count() > 0) {
+      const text = await errorElement.innerText();
+      const lowerText = text.toLowerCase();
+      
+      if (lowerText.includes('invalid card') || lowerText.includes('incorrect') || lowerText.includes('expired')) {
+        return new CheckoutFailure("CARD_AUTH_FAILED", `Flipkart rejected card: ${text}`);
+      }
+    }
+    
+    return null; // No rejection found
   }
 
   // ─────────────────────────── After the bank ─────────────────────────────────
 
-  /**
-   * Back on Flipkart after authentication: did the order actually land?
-   *
-   * A successful OTP is not a placed order. The bank can authorise and Flipkart
-   * can still fail the order (stock gone during the 3DS round trip is the common
-   * one), and a batch that counts bank success as purchase will under-buy while
-   * reporting done.
-   *
-   * NEEDS: the confirmation page's order id and total, plus the FAILURE page's
-   *        wording, because both are reached by the same redirect.
-   * THROW: CheckoutFailure("UNABLE_TO_PLACE_ORDER", <what the page said>) when the
-   *        redirect lands on a failure page. The card authenticated fine, so this
-   *        must NOT retire the card.
-   */
   async waitForOrderConfirmation(timeoutMs = 120_000): Promise<OrderConfirmation> {
-    void timeoutMs;
-    notImplemented("waitForOrderConfirmation", "the confirmation order id + total, AND the failure page wording");
+    try {
+      // Wait for the success page URL pattern
+      await this.page.waitForURL(/order-confirmation|order-success|checkout\/success/, { timeout: timeoutMs });
+
+      // NOTE: Since we don't have the confirmation page DOM, these are placeholders.
+      // You will need to inspect the success page and replace these selectors.
+      const orderIdElement = this.page.locator('.order-id, [data-testid="order-id"]').first();
+      const amountElement = this.page.locator('.order-amount, [data-testid="order-amount"]').first();
+
+      return {
+        orderId: await orderIdElement.count() > 0 ? await orderIdElement.innerText() : '',
+        amount: await amountElement.count() > 0 ? await amountElement.innerText() : ''
+      };
+
+    } catch (error) {
+      // A CheckoutFailure raised inside the try (or by a nested call) must pass
+      // straight through — re-wrapping it here would discard its code and detail,
+      // and cardPool.verdictFor reads both.
+      if (error instanceof CheckoutFailure) throw error;
+
+      // Trap #4: the bank authorised, but Flipkart failed the order — stock going
+      // during the 3DS round trip is the common one.
+      //
+      // Same comma-separated `text=` bug as the saved-card check: the original
+      // 'text="Order Failed", text="Payment Failed", ...' matched 0 elements, so a
+      // genuine Flipkart-side failure was reported as a bare 120s timeout with no
+      // indication that the card had already been charged.
+      const failureText = this.page.getByText(/Order Failed|Payment Failed|Something went wrong|Order could not be placed/i).first();
+
+      if ((await failureText.count()) > 0) {
+        throw new CheckoutFailure(
+          "UNABLE_TO_PLACE_ORDER",
+          `Order failed after bank auth: ${(await failureText.innerText()).replace(/\s+/g, " ").trim()}`
+        );
+      }
+
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", `Order confirmation timeout after ${timeoutMs}ms`);
+    }
   }
 }

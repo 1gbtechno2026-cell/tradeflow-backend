@@ -31,4 +31,13 @@ export const config = {
   keepBrowserOpenMs: Math.max(0, Number(process.env.KEEP_BROWSER_OPEN_MS || 60000)),
   /** Bearer token the Android SMS forwarder sends to /api/sms. Empty = webhook disabled. */
   smsApiToken: process.env.SMS_API_TOKEN || "",
+  /** Playwright device emulated for the m-site leg of checkout. Flipkart chooses
+   *  which site to serve from the User-Agent, and FlipkartCheckout is m-site
+   *  automation, so this decides whether its selectors exist at all. */
+  mobileDevice: process.env.MOBILE_DEVICE || "Pixel 7",
+  /** Test-flow routes and the dashboard's Test tab. Off unless explicitly on, so
+   *  a harness that drives real Flipkart pages cannot be reachable by accident. */
+  enableTestRoutes: process.env.ENABLE_TEST_ROUTES === "1",
+  /** Where test-run screenshots and page text are written. */
+  testArtifactDir: process.env.TEST_ARTIFACT_DIR || "debug/test-runs",
 };

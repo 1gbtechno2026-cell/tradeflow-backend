@@ -1,6 +1,7 @@
 import { Types } from "mongoose";
 import { CardType } from "../models/CardType.js";
 import { EmployeePhone } from "../models/EmployeePhone.js";
+import { EmployeePhoneSettings } from "../models/EmployeePhoneSettings.js";
 import { normalizePhone } from "../lib/phone.js";
 import { workspaceUserId } from "./sessionStore.js";
 
@@ -26,6 +27,79 @@ import { workspaceUserId } from "./sessionStore.js";
 /** 3 minutes — deliberately shorter than the OTP's own ~5 minute lifetime, so a
  *  lapsed lease can never outlive the code it was guarding. */
 export const LEASE_TTL_MS = Number(process.env.OTP_LEASE_TTL_MS || 3 * 60 * 1000);
+
+/**
+ * May a handset be claimed when nothing has confirmed it is reachable?
+ *
+ * Defaults to true when the settings row is missing, matching the dashboard, so
+ * a settings outage cannot silently stop every OTP order. Not cached: an
+ * operator flipping the switch mid-batch expects the next lease to obey it.
+ */
+async function assumeAllOnline(userId: Types.ObjectId): Promise<boolean> {
+  const doc = await EmployeePhoneSettings.findOne({ userId }).lean();
+  return doc?.assumeAllOnline ?? true;
+}
+
+/**
+ * Only the handsets that could actually receive an OTP right now.
+ *
+ * Shared by the lease and by capacity reporting so the two can never disagree
+ * about what "available" means — the number an autoscaler caps worker count on
+ * has to be the same number the lease will actually hand out.
+ */
+function claimableFilter(opts: {
+  userId: Types.ObjectId;
+  cardTypeId: number;
+  now: Date;
+  online: boolean;
+  corporateId?: string;
+  employeeId?: string;
+}): Record<string, unknown> {
+  const filter: Record<string, unknown> = {
+    userId: opts.userId,
+    cardTypeId: opts.cardTypeId,
+    isActive: { $ne: false },
+    // Claimable when never leased OR the hold has lapsed.
+    // { leasedUntil: { $lt: now } } ALONE MATCHES NOTHING: MongoDB brackets
+    // comparisons by BSON type, so $lt against a Date never matches null — and
+    // every phone starts null, so the first claim would fail forever.
+    $or: [{ leasedUntil: null }, { leasedUntil: { $exists: false } }, { leasedUntil: { $lt: opts.now } }],
+  };
+  // With the switch off, an unreachable handset must not be claimed at all.
+  // Leaving this out is what let 76 OFFLINE phones be handed to workers whose
+  // OTP could never arrive — the order then died on a timeout having burnt an
+  // attempt, for a reason that looked nothing like "the phone was off".
+  if (opts.online) filter.connectionStatus = "ONLINE";
+  if (opts.corporateId) filter.corporateId = String(opts.corporateId).toUpperCase();
+  if (opts.employeeId) filter.employeeId = String(opts.employeeId).toUpperCase();
+  return filter;
+}
+
+/**
+ * How many handsets could be claimed right now.
+ *
+ * This is the real concurrency ceiling for any otp-auth card type, and the
+ * number Fargate task count should be capped at — NOT the total ever onboarded.
+ * Today those differ by more than 2x: 144 rows exist, 67 are ONLINE and active.
+ */
+export async function availablePhoneCapacity(opts: {
+  cardTypeName: string;
+  corporateId?: string;
+}): Promise<{ claimable: number; onlineOnly: boolean; totalOnboarded: number }> {
+  const userId = new Types.ObjectId(workspaceUserId());
+  const name = String(opts.cardTypeName || "").trim().toUpperCase();
+  const cardType = await CardType.findOne({ userId, cardTypeName: name }).lean();
+  if (!cardType) throw new Error(`Card type "${name}" not found in cardtypes for this workspace`);
+
+  const online = !(await assumeAllOnline(userId));
+  const [claimable, totalOnboarded] = await Promise.all([
+    EmployeePhone.countDocuments(
+      claimableFilter({ userId, cardTypeId: cardType.id, now: new Date(), online, corporateId: opts.corporateId })
+    ),
+    EmployeePhone.countDocuments({ userId, cardTypeId: cardType.id }),
+  ]);
+  return { claimable, onlineOnly: online, totalOnboarded };
+}
 
 export interface LeasedOtpPhone {
   phoneId: number;
@@ -61,33 +135,47 @@ export async function leaseOtpPhone(opts: {
 
   const now = new Date();
   const until = new Date(now.getTime() + (opts.ttlMs ?? LEASE_TTL_MS));
+  const online = !(await assumeAllOnline(userId));
 
-  const filter: Record<string, unknown> = {
+  const filter = claimableFilter({
     userId,
     cardTypeId: cardType.id,
-    isActive: { $ne: false },
-    // Claimable when never leased OR the hold has lapsed.
-    // { leasedUntil: { $lt: now } } ALONE MATCHES NOTHING: MongoDB brackets
-    // comparisons by BSON type, so $lt against a Date never matches null — and
-    // every phone starts null, so the first claim would fail forever.
-    $or: [{ leasedUntil: null }, { leasedUntil: { $exists: false } }, { leasedUntil: { $lt: now } }],
-  };
-  if (opts.corporateId) filter.corporateId = String(opts.corporateId).toUpperCase();
-  if (opts.employeeId) filter.employeeId = String(opts.employeeId).toUpperCase();
+    now,
+    online,
+    corporateId: opts.corporateId,
+    employeeId: opts.employeeId,
+  });
 
   const row = await EmployeePhone.findOneAndUpdate(
     filter,
     { $set: { leasedBy: opts.runId, leasedUntil: until } },
-    // Prefer a reachable handset, then the one idle longest — spreading usage
-    // instead of hammering the lowest id, which is what made the old picker
-    // collide in the first place.
-    { new: true, sort: { connectionStatus: 1, leasedUntil: 1, id: 1 } }
+    // Idle longest first, so usage spreads instead of hammering the lowest id —
+    // which is what made the old picker collide in the first place.
+    //
+    // connectionStatus is deliberately NOT in this sort any more. It used to be,
+    // ascending, described as "prefer a reachable handset" — but these are
+    // strings, and "OFFLINE" < "ONLINE", so ascending order preferred exactly
+    // the phones that cannot receive anything. Reachability is a filter now
+    // (claimableFilter), which is where a hard requirement belongs; leaving it
+    // in the sort would only re-introduce an alphabet dependency.
+    { new: true, sort: { leasedUntil: 1, id: 1 } }
   );
 
   if (!row) {
+    // Say WHICH scarcity this is. "No free phone" reads as "they are all busy",
+    // but with the switch off it is far more often "almost none are reachable" —
+    // 67 of 144 here — and those two need completely different actions.
+    const capacity = await availablePhoneCapacity({
+      cardTypeName: name,
+      corporateId: opts.corporateId,
+    }).catch(() => null);
+    const detail = capacity
+      ? ` (${capacity.claimable} claimable of ${capacity.totalOnboarded} onboarded` +
+        `${capacity.onlineOnly ? ", ONLINE-only because 'assume all online' is off" : ""})`
+      : "";
     throw new NoPhoneAvailableError(
-      `No free OTP phone for "${name}"${opts.corporateId ? ` / ${opts.corporateId}` : ""} — ` +
-        `every handset is leased to a running checkout. Wait, or add more under Employee Phones.`
+      `No free OTP phone for "${name}"${opts.corporateId ? ` / ${opts.corporateId}` : ""}${detail} — ` +
+        `every claimable handset is leased to a running checkout. Wait, or add more under Employee Phones.`
     );
   }
 

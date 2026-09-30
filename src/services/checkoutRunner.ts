@@ -569,16 +569,25 @@ async function runClaimedCheckoutJob(
       job.step = "paid";
       job.completedAt = new Date();
       await job.save();
+      // result is null for COD — no card, no bank, nothing to record about either.
       await patchResult(data.jobId, {
-        cardTypeName: payment.result.cardTypeName,
-        cardLast4: payment.result.cardLast4,
-        authType: payment.result.authType,
-        employeeId: payment.result.employeeId,
-        authenticatedAt: payment.result.authenticatedAt,
+        ...(payment.result
+          ? {
+              cardTypeName: payment.result.cardTypeName,
+              cardLast4: payment.result.cardLast4,
+              authType: payment.result.authType,
+              employeeId: payment.result.employeeId,
+              authenticatedAt: payment.result.authenticatedAt,
+            }
+          : {}),
+        ...(payment.confirmation?.orderId ? { flipkartOrderId: payment.confirmation.orderId } : {}),
+        ...(payment.confirmation?.amount ? { transactionAmount: payment.confirmation.amount } : {}),
       });
       log(
         "info",
-        `Payment authenticated with card ${payment.cardId} (${payment.ordersOnCard} order(s) on it in this batch)`,
+        payment.cardId
+          ? `Payment authenticated with card ${payment.cardId} (${payment.ordersOnCard} order(s) on it in this batch)`
+          : "COD order placed",
         "paid"
       );
     } else {

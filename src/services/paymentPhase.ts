@@ -1,4 +1,5 @@
 import type { Page } from "playwright";
+import { FlipkartPayment, type OrderConfirmation } from "../automation/FlipkartPayment.js";
 import { authenticatePayment, UnsupportedPaymentError } from "../paymentStrategies/index.js";
 import type { AuthType, CardDetails, PaymentResult } from "../paymentStrategies/types.js";
 import { CheckoutFailure } from "./checkoutErrors.js";
@@ -41,25 +42,76 @@ export interface PaymentPhaseInput {
 }
 
 export type PaymentPhaseOutcome =
-  /** Not a card order — nothing attempted, caller keeps today's behaviour. */
+  /** Nothing attempted — an unrecognised mode, so the caller keeps the old
+   *  stop-at-payment behaviour rather than guessing. */
   | { attempted: false; reason: string }
-  | { attempted: true; ok: true; result: PaymentResult; cardId: string; ordersOnCard: number }
+  | {
+      attempted: true;
+      ok: true;
+      /** Absent for COD: there is no card and no bank to authenticate with. */
+      result: PaymentResult | null;
+      cardId: string | null;
+      ordersOnCard: number;
+      confirmation: OrderConfirmation | null;
+    }
   | { attempted: true; ok: false; failure: CheckoutFailure; cardId: string | null };
 
-/** Card payment is the only mode with a bank hand-off. COD and wallet-only orders
- *  have no card, no credential and no shared pool, so they never come through
- *  here — which is also why COD can scale without any of this machinery. */
-export function needsCardPayment(data: CheckoutJobData): boolean {
+export type PaymentModeClass = "cod" | "card" | "unsupported";
+
+/**
+ * Which of the four payment methods is this, as a concurrency class?
+ *
+ * The distinction that matters is not the bank, it is whether a shared resource is
+ * needed:
+ *   cod   — no card, no credential, no pool. Scales to whatever you will pay for.
+ *   card  — needs a card from the pool; if auth_type is "otp" it ALSO needs a
+ *           handset, which caps concurrency at the online phone count.
+ * Batch-level, because card type and payment mode are singular for a whole batch —
+ * so the queue an order belongs on is known at enqueue time.
+ */
+export function paymentModeClass(data: CheckoutJobData): PaymentModeClass {
   const mode = String(data.paymentMode || "").toLowerCase();
-  return mode === "card" || mode === "credit_card" || mode === "debit_card";
+  if (mode === "cod" || mode === "cash_on_delivery") return "cod";
+  if (mode === "card" || mode === "credit_card" || mode === "debit_card") return "card";
+  return "unsupported";
+}
+
+export function needsCardPayment(data: CheckoutJobData): boolean {
+  return paymentModeClass(data) === "card";
 }
 
 export async function runPaymentPhase(input: PaymentPhaseInput): Promise<PaymentPhaseOutcome> {
   const { data, log } = input;
+  const mode = paymentModeClass(data);
+  const fk = new FlipkartPayment(input.page, log);
 
-  if (!needsCardPayment(data)) {
-    return { attempted: false, reason: `payment_mode=${data.paymentMode || "(unset)"} needs no card` };
+  if (mode === "unsupported") {
+    return { attempted: false, reason: `payment_mode=${data.paymentMode || "(unset)"} is not handled here` };
   }
+
+  // ---- Cash on Delivery -------------------------------------------------
+  // No card, no credential, no pool, no bank. Every constraint the card paths
+  // carry exists because of a shared resource COD does not touch.
+  if (mode === "cod") {
+    if (input.dryRun) {
+      log("info", "[pay] dry run — COD selection and Place Order skipped", "payment");
+      return { attempted: true, ok: true, result: null, cardId: null, ordersOnCard: 0, confirmation: null };
+    }
+    try {
+      if (!(await fk.isCodAvailable())) {
+        // Per product AND per pincode, so this is a real outcome rather than a bug.
+        throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "Cash on Delivery is not available for this cart/pincode");
+      }
+      await fk.payWithCod();
+      const confirmation = await fk.waitForOrderConfirmation();
+      log("info", `[pay] COD order placed${confirmation.orderId ? ` — ${confirmation.orderId}` : ""}`, "payment");
+      return { attempted: true, ok: true, result: null, cardId: null, ordersOnCard: 0, confirmation };
+    } catch (err) {
+      return { attempted: true, ok: false, failure: asFailure(err), cardId: null };
+    }
+  }
+
+  // ---- Card -------------------------------------------------------------
   const cards = data.cards || [];
   if (!cards.length) {
     // Loud rather than a silent stop-at-payment: a card batch submitted with no
@@ -90,15 +142,23 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
   log("info", `[pay] using card ${id} (${claimed.used} order(s) already placed on it)`, "payment");
 
   try {
-    // ---- surface 1: Flipkart's own card form -----------------------------
+    // ---- surface 2: Flipkart's own payment page --------------------------
     if (!input.dryRun) {
-      await fillFlipkartCardForm(input.page, claimed.card, log);
-      await waitForBankHandoff(input.page, log);
+      await fk.selectCardPayment();
+      await fk.fillCardForm(claimed.card);
+      // Check for a Flipkart-side refusal BEFORE pressing Pay, so an invalid card
+      // is caught without a submission — and so its verdict is about the card
+      // rather than about a hand-off that never happened.
+      const rejected = await fk.detectCardRejectedByFlipkart();
+      if (rejected) throw rejected;
+      await fk.submitCardForm();
+      const bankUrl = await fk.waitForBankHandoff();
+      log("info", `[pay] handed off to the bank: ${bankUrl}`, "payment");
     } else {
       log("info", "[pay] dry run — Flipkart card form and bank hand-off skipped", "payment");
     }
 
-    // ---- surface 2: the bank's page (the 14 strategies) -------------------
+    // ---- surface 3: the bank's page (the 14 strategies) -------------------
     const result = await authenticatePayment({
       page: input.page,
       runId: `${data.jobId}`,
@@ -111,21 +171,29 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
       dryRun: input.dryRun,
     });
 
-    const ordersOnCard = await recordCardSuccess(data.batchId, id);
     log(
       "info",
       `[pay] authenticated ${result.cardTypeName} (${result.authType}) on ****${result.cardLast4}` +
         `${result.employeeId ? ` via ${result.employeeId}` : ""}`,
       "payment"
     );
-    return { attempted: true, ok: true, result, cardId: id, ordersOnCard };
+
+    // ---- surface 4: back on Flipkart -------------------------------------
+    // A successful OTP is NOT a placed order. The bank can authorise and Flipkart
+    // can still fail the order — stock going during the 3DS round trip is the
+    // common one — and counting bank success as a purchase makes a batch under-buy
+    // while reporting itself complete. So the card's success counter is only
+    // incremented once Flipkart confirms.
+    let confirmation: OrderConfirmation | null = null;
+    if (!input.dryRun) {
+      confirmation = await fk.waitForOrderConfirmation();
+      log("info", `[pay] order confirmed${confirmation.orderId ? ` — ${confirmation.orderId}` : ""}`, "payment");
+    }
+
+    const ordersOnCard = await recordCardSuccess(data.batchId, id);
+    return { attempted: true, ok: true, result, cardId: id, ordersOnCard, confirmation };
   } catch (err) {
-    const failure =
-      err instanceof CheckoutFailure
-        ? err
-        : err instanceof UnsupportedPaymentError
-          ? new CheckoutFailure("CARD_AUTH_FAILED", err.message)
-          : new CheckoutFailure("CARD_AUTH_FAILED", err instanceof Error ? err.message : String(err));
+    const failure = asFailure(err);
 
     // Decide what this says about the CARD, as opposed to about the order. Only a
     // verdict of dead/paused removes it from the pool; anything ambiguous keeps
@@ -142,32 +210,17 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
   }
 }
 
-// ---------------------------------------------------------------------------
-// TODO(selector): Flipkart's payments page. A different page from any bank's.
-//
-// Needs: the "Credit/Debit Card" option, the PAN / expiry month / expiry year /
-// CVV inputs, and the Pay button — plus whatever Flipkart shows when a card is
-// rejected before it ever reaches the bank.
-//
-// Until these land, a real (non-dry-run) card order stops here with a clear
-// message rather than half-submitting a payment.
-// ---------------------------------------------------------------------------
-
-async function fillFlipkartCardForm(
-  _page: Page,
-  _card: CardDetails,
-  _log: PaymentPhaseInput["log"]
-): Promise<void> {
-  throw new Error(
-    "fillFlipkartCardForm not implemented — Flipkart payments-page selectors needed " +
-      "(card option, PAN, expiry, CVV, Pay). Run with dry_run to exercise everything else."
-  );
-}
-
-/** TODO(selector): wait for Flipkart to hand off to the bank's domain, so a
- *  strategy is never handed Flipkart's own page by mistake. */
-async function waitForBankHandoff(_page: Page, _log: PaymentPhaseInput["log"]): Promise<void> {
-  throw new Error("waitForBankHandoff not implemented — need the post-Pay redirect signal");
+/**
+ * Anything thrown, as a CheckoutFailure.
+ *
+ * A bare Error becomes CARD_AUTH_FAILED with the message as detail, which
+ * cardPool.verdictFor reads as "keep the card" — the deliberately cheap default.
+ * Naming a real code in the page objects is what makes a card actually retire.
+ */
+function asFailure(err: unknown): CheckoutFailure {
+  if (err instanceof CheckoutFailure) return err;
+  if (err instanceof UnsupportedPaymentError) return new CheckoutFailure("CARD_AUTH_FAILED", err.message);
+  return new CheckoutFailure("CARD_AUTH_FAILED", err instanceof Error ? err.message : String(err));
 }
 
 /** Never log a PAN beyond its last 4, nor a CVV/password/PIN at all. */

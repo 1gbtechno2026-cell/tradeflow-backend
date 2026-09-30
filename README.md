@@ -14,6 +14,34 @@ npm run dev      # API, default :4100
 npm run worker   # checkout consumer
 ```
 
+## Stopping these processes — do not use a bare `pkill -f`
+
+This service and the dashboard backend run the **identical** command line:
+
+```
+node .../node_modules/.bin/tsx watch src/index.ts
+```
+
+`pkill -f` matches the full command line and ignores the working directory, so
+`pkill -f "tsx watch src/index.ts"` intended for one of them kills **both**. It
+happened on 2026-09-30: restarting the dashboard API silently took Trade Flow's
+API down with it, and because `tsx watch` only restarts on a file change — never
+on a kill or a crash — it stayed down unnoticed for about an hour.
+
+Qualify the pattern with the repo path, so it can only match one:
+
+```bash
+# this repo only
+pkill -f "Trade_Flow_Backend.*tsx watch src/index.ts"
+# the dashboard only
+pkill -f "gmail-id-dashboard_mongodb.*tsx watch src/index.ts"
+```
+
+Safer still: `pgrep -af "<pattern>"` first and read what it matched, or stop the
+process from the terminal that started it. The same trap applies to the workers,
+since `npm run worker` here and the dashboard's verify worker are both `tsx`
+processes.
+
 ## Integration endpoint
 
 Post your Smart Bulk Order payload as-is:

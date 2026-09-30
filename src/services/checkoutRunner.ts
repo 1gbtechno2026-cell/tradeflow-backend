@@ -19,6 +19,7 @@ import {
 import { config } from "../config.js";
 import { enqueueCheckoutJob } from "./checkoutEnqueue.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
+import { runPaymentPhase } from "./paymentPhase.js";
 import { FlipkartNetworkObserver } from "../automation/FlipkartNetworkObserver.js";
 import {
   CheckoutFailure,
@@ -145,10 +146,101 @@ async function maybeEnqueueRetry(
  * - Chrome is a throwaway window; we never click Flipkart Logout.
  * - Closing the window only drops local cookies in that process.
  */
+/**
+ * Exercise the payment phase without touching a real bank page.
+ *
+ * Defaults to ON deliberately. Flipkart's payments-page selectors are not written
+ * yet (paymentPhase.fillFlipkartCardForm), so a live run would stop mid-flow with
+ * a card already chosen; and the first real charge should be a decision someone
+ * makes explicitly, not something that happens because a default flipped. Set
+ * PAYMENT_DRY_RUN=false once the selectors land and you mean it.
+ */
+const PAYMENT_DRY_RUN = process.env.PAYMENT_DRY_RUN !== "false";
+
+/** How quiet a `running` job's heartbeat must go before another worker may take
+ *  it. Comfortably longer than HEARTBEAT_MS so a slow page never looks dead. */
+const CLAIM_STALE_MS = Number(process.env.CHECKOUT_CLAIM_STALE_MS || 10 * 60 * 1000);
+const HEARTBEAT_MS = Number(process.env.CHECKOUT_HEARTBEAT_MS || 60 * 1000);
+
+/**
+ * Take exclusive ownership of a job, or report that someone else has it.
+ *
+ * One findOneAndUpdate, so two workers handed the same job cannot both win —
+ * which matters because the delivery guarantee is about to change. BullMQ holds a
+ * Redis lock per job today, so `findById` then `save()` was safe; SQS Standard is
+ * at-least-once BY DESIGN, and the same message WILL occasionally be delivered
+ * twice. Without this, the second delivery opens a second Chrome on the same
+ * order and the product is bought twice.
+ *
+ * The filter also readmits a job whose worker died: `running` with a heartbeat
+ * older than CLAIM_STALE_MS. Without that clause the claim would be permanent and
+ * a killed worker would strand its order forever — BullMQ's stalledInterval does
+ * this job today and SQS has no equivalent.
+ */
+async function claimCheckoutJob(jobId: string, runId: string) {
+  const staleBefore = new Date(Date.now() - CLAIM_STALE_MS);
+  return CheckoutJob.findOneAndUpdate(
+    {
+      _id: jobId,
+      $or: [
+        { status: "queued" },
+        // Reclaim only a *silent* running job. heartbeatAt null means it was
+        // claimed before this field existed, or claimed and never beat once.
+        { status: "running", heartbeatAt: { $lt: staleBefore } },
+        { status: "running", heartbeatAt: null, startedAt: { $lt: staleBefore } },
+      ],
+    },
+    {
+      $set: {
+        status: "running",
+        step: "session",
+        startedAt: new Date(),
+        heartbeatAt: new Date(),
+        claimedBy: runId,
+      },
+    },
+    { new: true }
+  );
+}
+
 export async function runCheckoutJob(data: CheckoutJobData) {
-  const job = await CheckoutJob.findById(data.jobId);
-  if (!job) throw new Error(`Job ${data.jobId} not found`);
-  if (job.status === "cancelled") return;
+  const runId = `${data.jobId}:${Date.now().toString(36)}`;
+  const existing = await CheckoutJob.findById(data.jobId).select("status claimedBy");
+  if (!existing) throw new Error(`Job ${data.jobId} not found`);
+  if (existing.status === "cancelled") return;
+
+  const job = await claimCheckoutJob(data.jobId, runId);
+  if (!job) {
+    // Already finished, or another worker is actively on it. Either way this
+    // delivery must not open a browser — dropping it is the correct outcome, not
+    // an error, so the message is acknowledged and no attempt is consumed.
+    console.log(
+      `[${data.jobId}] [info] [claim] not claimable (status=${existing.status}` +
+        `${existing.claimedBy ? `, held by ${existing.claimedBy}` : ""}) — dropping this delivery`
+    );
+    return;
+  }
+
+  // Keeps the claim alive for as long as this worker is genuinely working. Also
+  // what a future SQS ChangeMessageVisibility heartbeat should ride alongside.
+  const heartbeat = setInterval(() => {
+    void CheckoutJob.updateOne(
+      { _id: data.jobId, claimedBy: runId },
+      { $set: { heartbeatAt: new Date() } }
+    ).catch(() => undefined);
+  }, HEARTBEAT_MS);
+  heartbeat.unref?.();
+  try {
+    return await runClaimedCheckoutJob(data, job);
+  } finally {
+    clearInterval(heartbeat);
+  }
+}
+
+async function runClaimedCheckoutJob(
+  data: CheckoutJobData,
+  job: NonNullable<Awaited<ReturnType<typeof claimCheckoutJob>>>
+) {
 
   const { quantityPerOrder, totalQuantity, totalAttempts } = batchLimits(data);
   const already = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
@@ -220,10 +312,9 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     );
   };
 
-  job.status = "running";
-  job.startedAt = new Date();
-  job.step = "session";
-  await job.save();
+  // status/step/startedAt were set by claimCheckoutJob — re-saving them here
+  // would overwrite the claim's own fields and, worse, a full save() of this
+  // document could clobber a concurrent cancel.
   await appendLog(
     data.jobId,
     "info",
@@ -467,6 +558,32 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     });
     await job.save();
     await patchResult(data.jobId, { paymentUrl: page.url() });
+
+    // Reaching payment is no longer the end of the road for a card order. The
+    // reservation is held until the payment phase resolves: releasing it here
+    // would let a sibling job claim the slot this order is about to spend.
+    const payment = await runPaymentPhase({ page, data, log, dryRun: PAYMENT_DRY_RUN });
+    if (payment.attempted) {
+      if (!payment.ok) throw payment.failure;
+      job.status = "paid";
+      job.step = "paid";
+      job.completedAt = new Date();
+      await job.save();
+      await patchResult(data.jobId, {
+        cardTypeName: payment.result.cardTypeName,
+        cardLast4: payment.result.cardLast4,
+        authType: payment.result.authType,
+        employeeId: payment.result.employeeId,
+        authenticatedAt: payment.result.authenticatedAt,
+      });
+      log(
+        "info",
+        `Payment authenticated with card ${payment.cardId} (${payment.ordersOnCard} order(s) on it in this batch)`,
+        "paid"
+      );
+    } else {
+      log("info", `Stopping at payment page — ${payment.reason}`, "payment");
+    }
     reservationHeld = false;
     const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
     log(

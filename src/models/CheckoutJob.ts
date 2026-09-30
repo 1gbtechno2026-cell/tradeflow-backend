@@ -39,6 +39,8 @@ export interface ICheckoutJob {
   logs: JobLog[];
   bullmqJobId?: string;
   startedAt: Date | null;
+  heartbeatAt?: Date | null;
+  claimedBy?: string;
   completedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -92,6 +94,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
         "queued",
         "running",
         "reached_payment",
+        "paid",
         "failed",
         "cancelled",
         "skipped",
@@ -124,6 +127,12 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       platform: { type: String, default: "FLIPKART" },
       paymentMode: { type: String, default: "" },
       cardType: { type: String, default: "" },
+      // Declared explicitly because Mongoose is strict by default: a field
+      // present on JobRequestSnapshot but absent here is dropped on save without
+      // an error, so the snapshot would silently lose the two values the payment
+      // phase depends on for explaining itself after the fact.
+      authType: { type: String, default: "" },
+      corporateId: { type: String, default: "" },
       sellerName: { type: String, default: "" },
       listingId: { type: String, default: "" },
       deliverySlaDays: { type: Number },
@@ -160,13 +169,35 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       cartAfterCardOffer: { type: String, default: "" },
       cartAfterOfferPrelim: { type: String, default: "" },
       giftCardApplied: { type: String, default: "" },
+      cardTypeName: { type: String, default: "" },
+      cardLast4: { type: String, default: "" },
+      authType: { type: String, default: "" },
+      employeeId: { type: String, default: "" },
+      authenticatedAt: { type: Date, default: null },
     },
     logs: { type: [JobLogSchema], default: [] },
     bullmqJobId: { type: String },
     startedAt: { type: Date, default: null },
+    /**
+     * Refreshed while a worker is actually running this job.
+     *
+     * Exists because "status is running" alone cannot tell a live worker from one
+     * that died mid-checkout. BullMQ hides that today behind its own Redis lock
+     * and stalled-job detection; SQS has neither. Once the transport moves, a job
+     * whose worker was killed would sit at `running` forever with nothing able to
+     * claim it. The heartbeat is what makes claimCheckoutJob's claim reclaimable
+     * rather than permanent.
+     */
+    heartbeatAt: { type: Date, default: null },
+    /** Which worker run holds the claim, so a stale reclaim is attributable. */
+    claimedBy: { type: String, default: "" },
     completedAt: { type: Date, default: null },
   },
   { timestamps: true, collection: "tradeflowjobs" }
 );
+
+// Backs the stale-claim reclaim: find `running` jobs whose heartbeat has gone
+// quiet without scanning the collection.
+CheckoutJobSchema.index({ status: 1, heartbeatAt: 1 });
 
 export const CheckoutJob = mongoose.model<ICheckoutJob>("CheckoutJob", CheckoutJobSchema);

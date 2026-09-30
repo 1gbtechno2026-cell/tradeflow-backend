@@ -6,6 +6,9 @@ export type JobStatus =
   | "queued"
   | "running"
   | "reached_payment"
+  /** Bank authentication succeeded. Distinct from reached_payment, which now
+   *  only means "got as far as the payment page and stopped there". */
+  | "paid"
   | "failed"
   | "cancelled"
   | "skipped"
@@ -91,6 +94,14 @@ export interface JobResultSnapshot {
   cartAfterCardOffer: string;
   cartAfterOfferPrelim: string;
   giftCardApplied: string;
+  /** Which card type and credential arm actually authenticated. Last 4 only —
+   *  no full PAN is ever written to a persisted document. */
+  cardTypeName?: string;
+  cardLast4?: string;
+  authType?: string;
+  /** Set only when a corporate handset was leased for the OTP. */
+  employeeId?: string;
+  authenticatedAt?: Date;
 }
 
 export interface CheckoutJobData {

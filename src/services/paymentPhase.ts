@@ -59,8 +59,21 @@ export type PaymentPhaseOutcome =
       cardId: string | null;
       ordersOnCard: number;
       confirmation: OrderConfirmation | null;
+      cardUsed: CardUsed | null;
     }
-  | { attempted: true; ok: false; failure: CheckoutFailure; cardId: string | null };
+  | { attempted: true; ok: false; failure: CheckoutFailure; cardId: string | null; cardUsed: CardUsed | null };
+
+/** Which card this order went on — what the Orders tab shows per order. */
+export interface CardUsed {
+  name: string;
+  parentCardLast4: string;
+  childCardLast4: string;
+}
+
+function cardUsedOf(card: CardDetails): CardUsed {
+  const last4 = (v: string) => String(v || "").replace(/\D/g, "").slice(-4);
+  return { name: card.name || "", parentCardLast4: last4(card.parentCardNumber), childCardLast4: last4(card.cardNumber) };
+}
 
 export type PaymentModeClass = "cod" | "card" | "unsupported";
 
@@ -112,7 +125,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
       } catch (err) {
         log("warn", `[pay] dry run — isCodAvailable() threw: ${err instanceof Error ? err.message : String(err)}`, "payment");
       }
-      return { attempted: true, ok: true, result: null, cardId: null, ordersOnCard: 0, confirmation: null };
+      return { attempted: true, ok: true, result: null, cardId: null, ordersOnCard: 0, confirmation: null, cardUsed: null };
     }
     try {
       if (!(await fk.isCodAvailable())) {
@@ -123,9 +136,9 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
       await fk.payWithCod();
       const confirmation = await fk.waitForOrderConfirmation();
       log("info", `[pay] COD order placed${confirmation.orderId ? ` — ${confirmation.orderId}` : ""}`, "payment");
-      return { attempted: true, ok: true, result: null, cardId: null, ordersOnCard: 0, confirmation };
+      return { attempted: true, ok: true, result: null, cardId: null, ordersOnCard: 0, confirmation, cardUsed: null };
     } catch (err) {
-      return { attempted: true, ok: false, failure: asFailure(err), cardId: null };
+      return { attempted: true, ok: false, failure: asFailure(err), cardId: null, cardUsed: null };
     }
   }
 
@@ -214,7 +227,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
     }
 
     const ordersOnCard = await recordCardSuccess(data.batchId, id);
-    return { attempted: true, ok: true, result, cardId: id, ordersOnCard, confirmation };
+    return { attempted: true, ok: true, result, cardId: id, ordersOnCard, confirmation, cardUsed: cardUsedOf(claimed.card) };
   } catch (err) {
     const failure = asFailure(err);
 
@@ -229,7 +242,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
       `[pay] card ${id} -> ${verdict.kind}: ${verdict.reason}`,
       "payment"
     );
-    return { attempted: true, ok: false, failure, cardId: id };
+    return { attempted: true, ok: false, failure, cardId: id, cardUsed: cardUsedOf(claimed.card) };
   }
 }
 

@@ -473,6 +473,9 @@ export function failureFields(err: CheckoutFailure) {
     errorCodeDisplay: err.display,
     errorSource: err.source,
     errorDetails: err.details,
+    /** The stage it failed in, in the operator's words ("Adding to cart",
+     *  "Processing Payment") — the Orders tab's "Processing Stage" column. */
+    errorStage: err.stageDisplay,
     failedStep: err.failedStep,
     failureMessage: err.details,
     error: err.details,

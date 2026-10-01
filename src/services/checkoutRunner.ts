@@ -588,7 +588,11 @@ async function runClaimedCheckoutJob(
     // would let a sibling job claim the slot this order is about to spend.
     const payment = await runPaymentPhase({ page, data, log, dryRun: PAYMENT_DRY_RUN, paymentApi });
     if (payment.attempted) {
-      if (!payment.ok) throw payment.failure;
+      if (!payment.ok) {
+        // Which card the failed attempt went on, before the failure is recorded.
+        if (payment.cardUsed) await patchResult(data.jobId, payment.cardUsed);
+        throw payment.failure;
+      }
       job.status = "paid";
       job.step = "paid";
       job.completedAt = new Date();
@@ -607,6 +611,7 @@ async function runClaimedCheckoutJob(
         ...(payment.confirmation?.orderId ? { flipkartOrderId: payment.confirmation.orderId } : {}),
         ...(payment.confirmation?.amount ? { transactionAmount: payment.confirmation.amount } : {}),
         ...orderDetailFields(payment.confirmation?.details),
+        ...(payment.cardUsed ?? {}),
       });
       log(
         "info",

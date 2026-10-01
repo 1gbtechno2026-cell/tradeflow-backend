@@ -40,6 +40,7 @@ function publicJob(job: {
   errorCodeDisplay?: string;
   errorSource?: string;
   errorDetails?: string;
+  errorStage?: string;
   filterReason?: string;
   failedAt?: Date | null;
   batchStatus?: string;
@@ -76,6 +77,7 @@ function publicJob(job: {
     errorCodeDisplay: job.errorCodeDisplay || undefined,
     errorSource: job.errorSource || undefined,
     errorDetails: job.errorDetails || undefined,
+    errorStage: job.errorStage || undefined,
     filterReason: job.filterReason || undefined,
     failedAt: job.failedAt,
     batchStatus: job.batchStatus || undefined,

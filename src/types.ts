@@ -107,6 +107,11 @@ export interface JobResultSnapshot {
   promiseDate?: Date;
   orderStatus?: string;
   sellerName?: string;
+  /** The card the pool used for THIS order (a batch's CSV holds many).
+   *  Label and last-4s only. */
+  cardName?: string;
+  parentCardLast4?: string;
+  childCardLast4?: string;
   /** Which card type and credential arm actually authenticated. Last 4 only —
    *  no full PAN is ever written to a persisted document. */
   cardTypeName?: string;

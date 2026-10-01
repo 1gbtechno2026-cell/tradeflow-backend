@@ -29,6 +29,7 @@ export interface ICheckoutJob {
   errorCodeDisplay?: string;
   errorSource?: string;
   errorDetails?: string;
+  errorStage?: string;
   filterReason?: string;
   failedAt?: Date | null;
   batchStatus?: string;
@@ -114,6 +115,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
     errorCodeDisplay: { type: String, default: "" },
     errorSource: { type: String, default: "" },
     errorDetails: { type: String, default: "" },
+    errorStage: { type: String, default: "" },
     filterReason: { type: String, default: "" },
     failedAt: { type: Date, default: null },
     batchStatus: { type: String, default: "" },
@@ -186,6 +188,11 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       promiseDate: { type: Date, default: null },
       orderStatus: { type: String, default: "" },
       sellerName: { type: String, default: "" },
+      // The card the pool actually used for this order — the batch's CSV may
+      // hold many. Label and last-4s only; never a full PAN.
+      cardName: { type: String, default: "" },
+      parentCardLast4: { type: String, default: "" },
+      childCardLast4: { type: String, default: "" },
     },
     logs: { type: [JobLogSchema], default: [] },
     bullmqJobId: { type: String },

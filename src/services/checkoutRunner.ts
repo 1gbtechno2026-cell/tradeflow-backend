@@ -10,9 +10,11 @@ import {
 import { CheckoutBatch } from "../models/CheckoutBatch.js";
 import {
   blockFlipkartLogout,
-  closeBrowser,
+  desktopContext,
   flipkartLoginUrl,
-  launchStealthContext,
+  launchMobileBrowser,
+  launchStealthBrowser,
+  mobileContext,
   restoreFlipkartSession,
   sleep,
 } from "./browser.js";
@@ -156,6 +158,12 @@ async function maybeEnqueueRetry(
  * PAYMENT_DRY_RUN=false once the selectors land and you mean it.
  */
 const PAYMENT_DRY_RUN = process.env.PAYMENT_DRY_RUN !== "false";
+
+/** Flipkart's E002 page. "Deliver to" present means a real checkout, not the error. */
+async function checkoutShowsE002(page: Page): Promise<boolean> {
+  const text = String(await page.evaluate(() => document.body?.innerText || "").catch(() => ""));
+  return /Something went wrong/i.test(text) && !/Deliver to/i.test(text);
+}
 
 /** How quiet a `running` job's heartbeat must go before another worker may take
  *  it. Comfortably longer than HEARTBEAT_MS so a slow page never looks dead. */
@@ -342,10 +350,30 @@ async function runClaimedCheckoutJob(
     return;
   }
 
-  const launched = await launchStealthContext({ headless: config.headless });
-  const page: Page = await launched.context.newPage();
+  /**
+   * TWO browsers, because Flipkart is two sites and this job needs one leg on each.
+   *
+   * FlipkartCheckout is m-site automation — it looks for #msite-bottomsheet and
+   * drives the page with touchscreen.tap — and Flipkart chooses which site to serve
+   * from the User-Agent. Running the whole job in the desktop context (what this
+   * did until now) meant every location/pincode check silently matched nothing, so
+   * the delivery pincode was never set, Flipkart dropped the item server side, and
+   * the job died with "Your cart is empty! / Enter Delivery Pincode" — a failure
+   * that reads exactly like a selector bug and is not one.
+   *
+   * The account pages, the address book and the cart are fine on desktop and are
+   * left there; only the add-to-cart -> checkout -> payments leg moves.
+   * Proven by scripts/testFlowCli.ts: `npm run test:flow -- happy` reaches
+   * pay.flipkart.com with the item in the cart.
+   */
+  const deskBrowser = await launchStealthBrowser({ headless: config.headless });
+  const deskContext = await desktopContext(deskBrowser);
+  let mobBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
+  // Reassigned when the job moves to the mobile leg; everything below reads
+  // whichever page is current.
+  let page: Page = await deskContext.newPage();
   await blockFlipkartLogout(page);
-  const netObserver = FlipkartNetworkObserver.attach(page);
+  let netObserver = FlipkartNetworkObserver.attach(page);
   const address = { ...data.address };
 
   const log = (level: LogLevel, message: string, step?: string) => {
@@ -435,8 +463,35 @@ async function runClaimedCheckoutJob(
       throw new Error("Session expired: Flipkart showed the login page during pre-flight");
     }
 
+    // ---- desktop leg done; everything from here is the m-site ----------------
+    netObserver.dispose();
+    await deskContext.close().catch(() => undefined);
+    mobBrowser = await launchMobileBrowser({ headless: config.headless });
+    const mobContext = await mobileContext(mobBrowser);
+    page = await mobContext.newPage();
+    await blockFlipkartLogout(page);
+    netObserver = FlipkartNetworkObserver.attach(page);
+    await restoreFlipkartSession(page, session.cookies);
+
+    const ua = await page.evaluate(() => navigator.userAgent).catch(() => "");
+    if (!/Mobile|Android/i.test(ua)) {
+      // Loud, because this is the exact failure that masqueraded as a selector
+      // bug: without a mobile UA the m-site selectors below cannot match, and the
+      // job would fail several minutes later for an unrelated-looking reason.
+      throw new Error(`Mobile context is not mobile (ua="${ua.slice(0, 80)}") — m-site selectors cannot match`);
+    }
+    log("info", `Switched to the m-site (${config.mobileDevice})`, "session");
+
+    // Establish the m-site session before pasting a deep product link. Handing
+    // Flipkart a product URL in a session it has not set up is one of the ways
+    // the cart silently drops the item.
+    await page.goto("https://www.flipkart.com/", { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+    await page.waitForLoadState("load", { timeout: 15_000 }).catch(() => undefined);
+
     log("info", "Opening product page", "product");
-    checkout.setProductUrl(data.productUrl);
+    checkout = new FlipkartCheckout(page, data.productUrl, log);
+    checkout.setCheckoutFlags(jobPincode, data.gstMandatory ?? job.request?.gstMandatory ?? true);
     await checkout.navigateToProduct();
     const details = await checkout.captureProductDetails();
     job.product = details;
@@ -526,6 +581,32 @@ async function runClaimedCheckoutJob(
 
     log("info", "Place Order → viewcheckout for GST, then Continue", "product");
     await checkout.clickPlaceOrder();
+
+    // Flipkart answers "Something went wrong! E002" when viewcheckout is opened
+    // without a real Place Order behind it. Going back to the cart and placing
+    // again clears it; retrying in place does not.
+    for (let retry = 1; retry <= 2 && (await checkoutShowsE002(page)); retry++) {
+      log("warn", `Checkout shows "Something went wrong" — Place Order again (${retry}/2)`, "order-summary");
+      await checkout.gotoViewCart();
+      await checkout.clickPlaceOrder();
+    }
+    if (await checkoutShowsE002(page)) {
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        'Checkout keeps showing "Something went wrong! E002" after Place Order'
+      );
+    }
+
+    // Refuse to pay for something we did not add. A checkout session left over
+    // from an earlier run looks entirely normal until the order confirmation.
+    const checkoutText = String(await page.evaluate(() => document.body?.innerText || "").catch(() => ""));
+    const modelKey = details.model.slice(0, 24).toLowerCase();
+    if (modelKey && checkoutText && !checkoutText.toLowerCase().includes(modelKey)) {
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        `Checkout does not show "${details.model}" — refusing to continue with a different product`
+      );
+    }
 
     log("info", "viewcheckout: qty / address / GST then Continue", "order-summary");
     await checkout.verifyAddressOnOrderSummary(
@@ -650,7 +731,8 @@ async function runClaimedCheckoutJob(
     await sleep(Math.min(config.keepBrowserOpenMs, 15000));
   } finally {
     netObserver.dispose();
-    await closeBrowser(launched.browser, launched.context);
+    await deskBrowser.close().catch(() => undefined);
+    await mobBrowser?.close().catch(() => undefined);
     const latest = await CheckoutJob.findById(data.jobId).select("status");
     if (latest?.status === "cancelled") await releaseReservation();
   }

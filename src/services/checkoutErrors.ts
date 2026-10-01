@@ -382,7 +382,7 @@ export function classifyPageText(
   if (hasNotify) {
     return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
   }
-  if (/payment (?:couldn'?t|could not|cannot) be processed|due to a technical error/i.test(compact)) {
+  if (/payment (?:couldn'?t|could not|cannot) be processed|technical error (?:at the bank|\. please try again)|due to a technical error/i.test(compact)) {
     return new CheckoutFailure("PAYMENT_FAILED", lineMatching(text, /couldn'?t be processed|could not be processed|technical error/i));
   }
   if (/insufficient (funds|balance)|insufficient bank/i.test(compact)) {
@@ -460,7 +460,7 @@ export function classifyThrownMessage(message: string, pageText = ""): CheckoutF
   if (/cash on delivery.*(unavailable|not available)|\bCOD\b.*(unavailable|not available)/i.test(m)) {
     return new CheckoutFailure("COD_UNAVAILABLE", m);
   }
-  if (/payment (?:couldn'?t|could not|cannot) be processed|due to a technical error/i.test(m)) {
+  if (/payment (?:couldn'?t|could not|cannot) be processed|technical error at the bank|due to a technical error/i.test(m)) {
     return new CheckoutFailure("PAYMENT_FAILED", m);
   }
   if (/insufficient/i.test(m)) return new CheckoutFailure("INSUFFICIENT_BALANCE", m);

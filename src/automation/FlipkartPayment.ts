@@ -212,46 +212,81 @@ export class FlipkartPayment {
     // the first press was intercepted rather than slowly submitted — so a slow
     // redirect can never be double-charged.
     // <button data-testid="secure-card-primary-btn">Yes, secure my card</button>
+    // <button data-testid="secure-card-secondary-btn">Maybe later</button>
     const consentYes = this.page
       .locator('[data-testid="secure-card-primary-btn"]')
       .or(this.page.getByText(/^\s*Yes, secure my card\s*$/i))
       .first();
+    const consentLater = this.page
+      .locator('[data-testid="secure-card-secondary-btn"]')
+      .or(this.page.getByText(/^\s*Maybe later\s*$/i))
+      .first();
     const rbiLabel = this.page.getByText(/^\s*Secure my card as per RBI guidelines\s*$/i).first();
     const rbiBox = this.page.locator('label:has-text("Secure my card as per RBI guidelines") input[type="checkbox"]').first();
-    let secondPay = false;
-    const deadline = Date.now() + 20_000;
+    const retryPayment = this.page.getByText(/^\s*Retry payment\s*$/i).first();
+
+    // Tokenising goes through the ISSUER, and the 2026-10-01 runs show the
+    // bank refusing it: "There was a technical error at the bank's end" straight
+    // after "Yes, secure my card", before any 3-D Secure page. That is the
+    // tokenisation failing, not the payment. So the first pass secures the card
+    // as instructed; if Flipkart reports a bank-end error on that pass, Retry
+    // payment is pressed ONCE and the second pass declines tokenisation (Maybe
+    // later, checkbox left clear) so the payment itself can reach the bank. A
+    // modal on the second pass is final.
+    let tokenise = true;
+    let retried = false;
+    let payPressed = false;
+    const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
       if (!/flipkart\.com$/i.test(new URL(this.page.url()).hostname)) return; // handed off to the bank
       // Flipkart's own failure modal ends it here, with its sentence — not
       // after a 60s wait for a bank page that is not coming.
       const failed = await this.detectPaymentFailedModal();
-      if (failed) throw failed;
+      if (failed) {
+        if (tokenise && !retried && /bank'?s end/i.test(failed.details) && (await retryPayment.isVisible().catch(() => false))) {
+          await retryPayment.click({ timeout: 5000 });
+          tokenise = false;
+          retried = true;
+          payPressed = false;
+          this.log("info", "[fk-pay] bank-end error after tokenisation consent — Retry payment, this time WITHOUT securing the card", "payment");
+          await this.page.waitForTimeout(1500);
+          continue;
+        }
+        throw failed;
+      }
       if (await consentYes.isVisible().catch(() => false)) {
-        await consentYes.click({ timeout: 5000 });
-        this.log("info", "[fk-pay] RBI consent sheet — chose 'Yes, secure my card'", "payment");
+        if (tokenise) {
+          await consentYes.click({ timeout: 5000 });
+          this.log("info", "[fk-pay] RBI consent sheet — chose 'Yes, secure my card'", "payment");
+        } else {
+          await consentLater.click({ timeout: 5000 });
+          this.log("info", "[fk-pay] RBI consent sheet — chose 'Maybe later'", "payment");
+        }
         await this.page.waitForTimeout(1500);
         continue;
       }
       const hasBox = (await rbiBox.count()) > 0;
-      if (hasBox && !(await rbiBox.isChecked().catch(() => true))) {
+      if (hasBox && tokenise && !(await rbiBox.isChecked().catch(() => true))) {
         // The input is a styled control; check() fails when it is not the
-        // visible element, so fall back to the label text, which is.
+        // visible element, so fall back to the label text, which is. A click
+        // that times out usually means a modal is over the form — re-read it
+        // on the next pass rather than dying with a bare Playwright timeout.
         try {
           await rbiBox.check({ timeout: 3000 });
         } catch {
-          await rbiLabel.click({ timeout: 5000 });
+          await rbiLabel.click({ timeout: 5000 }).catch(() => undefined);
         }
         this.log("info", "[fk-pay] ticked 'Secure my card as per RBI guidelines'", "payment");
         await this.page.waitForTimeout(800);
         continue;
       }
-      if (hasBox && !secondPay) {
+      if (hasBox && !payPressed) {
         const btn = payButton();
         if ((await btn.count()) > 0 && (await btn.isEnabled().catch(() => false))) {
           const label = (await btn.innerText().catch(() => "Pay")).replace(/\s+/g, " ").trim();
-          await btn.click({ timeout: 10_000 });
-          secondPay = true;
-          this.log("info", `[fk-pay] consent given — pressed '${label}' again (fee may have been added)`, "payment");
+          await btn.click({ timeout: 10_000 }).catch(() => undefined);
+          payPressed = true;
+          this.log("info", `[fk-pay] pressed '${label}' (secure card: ${tokenise ? "yes" : "no"})`, "payment");
           await this.page.waitForTimeout(1500);
           continue;
         }
@@ -292,7 +327,12 @@ export class FlipkartPayment {
    * Flipkart's sentence, and the card stays in the pool.
    */
   async detectPaymentFailedModal(): Promise<CheckoutFailure | null> {
-    const modal = this.page.getByText(/payment (?:couldn'?t|could not|cannot) be processed|due to a technical error/i).first();
+    // Two wordings seen so far, same modal, same Retry payment button:
+    //   "Your payment couldn't be processed due to a technical error. Please try again."
+    //   "There was a technical error at the bank's end"
+    const modal = this.page
+      .getByText(/payment (?:couldn'?t|could not|cannot) be processed|technical error/i)
+      .first();
     if (!(await modal.isVisible().catch(() => false))) return null;
     const text = (await modal.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
     this.log("warn", `[fk-pay] Flipkart payment failure modal: "${text}"`, "payment");

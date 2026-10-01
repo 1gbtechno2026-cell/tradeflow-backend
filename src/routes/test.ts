@@ -81,6 +81,8 @@ testRouter.post("/flow", (req, res) => {
     gstMandatory: Boolean(body.gstMandatory),
     checkoutPincode: body.checkoutPincode ? String(body.checkoutPincode) : undefined,
     deliverySlaDays: body.deliverySlaDays != null ? Number(body.deliverySlaDays) : undefined,
+    cartAmountLimit: body.cartAmountLimit != null ? Number(body.cartAmountLimit) : undefined,
+    finalAmountLimit: body.finalAmountLimit != null ? Number(body.finalAmountLimit) : undefined,
     paymentMode: body.paymentMode,
     cardType: body.cardType,
     authType: body.authType,

@@ -61,6 +61,17 @@ export interface TestFlowConfig {
   /** Overrides the address's own pincode, for testing deliverability quickly. */
   checkoutPincode?: string;
   deliverySlaDays?: number;
+  /** Refuse the order if the CART total exceeds this. Checked before Place Order. */
+  cartAmountLimit?: number;
+  /**
+   * Refuse to PAY if the amount the payment page is about to charge exceeds this.
+   *
+   * Enforced here for the first time. It has been parsed, validated and stored on
+   * every job's request snapshot since the beginning and read by nothing — so a
+   * batch whose price moved between the cart and the payment page had no backstop
+   * at the only point where money actually moves.
+   */
+  finalAmountLimit?: number;
   paymentMode?: "cod" | "card" | "none";
   cardType?: string;
   authType?: AuthType;
@@ -367,6 +378,30 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       console.log(`  delivery: "${sla.text}" = ${sla.days}d (limit ${cfg.deliverySlaDays}d)`);
     }
 
+    // Cart total, before Place Order — the last point an order can be abandoned
+    // for free.
+    const payable = await flow.captureCartPayable();
+    if (payable.amount) {
+      console.log(`  cart payable ₹${payable.amount} (from ${payable.source})`);
+      await capture("08b-cart-total", `cart ₹${payable.amount}`);
+      if (cfg.cartAmountLimit) {
+        const total = Number(String(payable.amount).replace(/,/g, ""));
+        if (Number.isFinite(total) && total > cfg.cartAmountLimit) {
+          throw new CheckoutFailure(
+            "CART_AMOUNT_LIMIT",
+            `Cart total ₹${total} exceeds the cart amount limit ₹${cfg.cartAmountLimit}`
+          );
+        }
+      }
+    } else if (cfg.cartAmountLimit) {
+      // A limit that cannot be evaluated is not a limit — better to stop than to
+      // continue as though the check had passed.
+      throw new CheckoutFailure(
+        "CART_AMOUNT_LIMIT",
+        "cart_amount_limit was set but the cart total could not be read"
+      );
+    }
+
     await step(7, "Mobile: Place Order → checkout");
     await flow.clickPlaceOrder();
     await capture("09-checkout");
@@ -406,6 +441,42 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       await step(9, `Payment surface (${stopAfter})`);
       const fk = new FlipkartPayment(mobPage, (lvl, msg) => log(lvl, msg));
       const mode = cfg.paymentMode || "none";
+
+      /**
+       * The final amount, checked at the only place it is final.
+       *
+       * finalAmountLimit has existed on the job schema from the beginning — parsed,
+       * validated, persisted — and read by nothing. So a batch whose price moved
+       * between the cart and the payment page had no backstop at the exact point
+       * where money moves: COD handling fees, Protect Promise fees and offers that
+       * fall off all land here, after the cart total was approved.
+       *
+       * Read from the payment page's own text rather than carried forward from the
+       * cart, because carrying it forward would check the number we already knew.
+       */
+      if (cfg.finalAmountLimit) {
+        const payText = String(await mobPage.evaluate(() => document.body?.innerText || "").catch(() => ""));
+        const finalAmount = readPayableTotal(payText);
+        await capture("10b-final-amount", `final ₹${finalAmount ?? "unreadable"} / limit ₹${cfg.finalAmountLimit}`);
+        if (finalAmount == null) {
+          // Ambiguous, so stop rather than guess. The first version of this took
+          // the LARGEST amount on the page and read ₹599 — the struck-through MRP —
+          // against a real payable of ₹109, which would have blocked a perfectly
+          // good order. A limit that might be measuring the wrong number is worse
+          // than no limit, because it fails in the direction you cannot see.
+          throw new CheckoutFailure(
+            "CART_AMOUNT_LIMIT",
+            "final_amount_limit was set but no labelled total could be read from the payment page"
+          );
+        }
+        console.log(`  final amount ₹${finalAmount} (limit ₹${cfg.finalAmountLimit})`);
+        if (finalAmount > cfg.finalAmountLimit) {
+          throw new CheckoutFailure(
+            "CART_AMOUNT_LIMIT",
+            `Payment page total ₹${finalAmount} exceeds the final amount limit ₹${cfg.finalAmountLimit}`
+          );
+        }
+      }
 
       if (mode === "cod") {
         const available = await fk.isCodAvailable();
@@ -475,6 +546,26 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
     await desktopBrowser.close().catch(() => {});
     await mobileBrowser?.close().catch(() => {});
   }
+}
+
+/**
+ * What the payment page is actually about to charge.
+ *
+ * Must be the LABELLED total, never "the biggest number on the page". A real
+ * Flipkart payments page carries, in order: ₹7 (COD fee), ₹599 (MRP, struck
+ * through), ₹18, ₹11, -₹508 and -₹505 (discounts), -₹3, then "Total Amount ₹109".
+ * Taking the maximum returns 599 — five times the real figure — and a limit built
+ * on that rejects orders that were always within budget.
+ *
+ * Returns null when no label is found, so the caller stops instead of guessing.
+ */
+export function readPayableTotal(pageText: string): number | null {
+  const labelled = String(pageText || "").match(
+    /(?:total amount|amount payable|total payable|order total|grand total|amount to pay|to pay)\D{0,24}₹\s?([\d,]+(?:\.\d{1,2})?)/i
+  );
+  if (!labelled) return null;
+  const n = Number(labelled[1].replace(/,/g, ""));
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 /** Flipkart's E002 page. "Deliver to" present means it is a real checkout, not the error. */

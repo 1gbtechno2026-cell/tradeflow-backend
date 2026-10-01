@@ -87,6 +87,7 @@ testRouter.post("/flow", (req, res) => {
     cardType: body.cardType,
     authType: body.authType,
     corporateId: body.corporateId ? String(body.corporateId) : undefined,
+    employeeId: body.employeeId ? String(body.employeeId).trim().toUpperCase() : undefined,
     cards: Array.isArray(body.cards) ? body.cards : undefined,
     mobileDevice: body.mobileDevice,
     // VISIBLE by default. Trade Flow runs on the operator's own machine while this

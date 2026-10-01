@@ -1,6 +1,7 @@
 import type { Page } from "playwright";
 import { FlipkartPayment, type OrderConfirmation } from "../automation/FlipkartPayment.js";
 import type { PaymentApiWatcher } from "../automation/PaymentApiWatcher.js";
+import { config } from "../config.js";
 import { authenticatePayment, UnsupportedPaymentError } from "../paymentStrategies/index.js";
 import type { AuthType, CardDetails, PaymentResult } from "../paymentStrategies/types.js";
 import { CheckoutFailure } from "./checkoutErrors.js";
@@ -182,6 +183,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
       card: claimed.card,
       authType,
       corporateId: data.corporateId ?? null,
+      otpTimeoutMs: config.otpTimeoutMs,
       log: (level, message) => log(level, message, "payment"),
       dryRun: input.dryRun,
     });

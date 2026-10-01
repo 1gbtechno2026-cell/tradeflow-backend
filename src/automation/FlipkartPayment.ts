@@ -149,7 +149,9 @@ export class FlipkartPayment {
       // The DOM shows a single input for MM / YY.
       // card.expiryMonth is "04" (string), card.expiryYear is "2028".
       // We need to format it as "04 / 28".
-      const expiryStr = `${card.expiryMonth} / ${card.expiryYear.slice(-2)}`;
+      // Zero-pad the month: a CSV that says "7" must type "07 / 28", because
+      // the field is MM / YY and "7 / 28" is not a date to it.
+      const expiryStr = `${String(card.expiryMonth).replace(/\D/g, "").padStart(2, "0")} / ${card.expiryYear.replace(/\D/g, "").slice(-2)}`;
       await this.page.fill('input[autocomplete="cc-exp"]', expiryStr, { timeout: 10_000 });
 
       // 3. CVV

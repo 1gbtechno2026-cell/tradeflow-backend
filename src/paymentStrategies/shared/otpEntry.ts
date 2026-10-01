@@ -54,6 +54,7 @@ export async function withLeasedPhone<T>(
     cardTypeName,
     runId: ctx.runId,
     corporateId: ctx.corporateId,
+    employeeId: ctx.employeeId || undefined,
   });
   ctx.log(
     "info",

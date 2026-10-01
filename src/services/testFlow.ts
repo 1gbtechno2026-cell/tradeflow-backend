@@ -81,6 +81,8 @@ export interface TestFlowConfig {
   authType?: AuthType;
   /** Required by corporate card types; the OTP goes to that corporate's handset. */
   corporateId?: string;
+  /** Optional: which employee's handset to lease, so the tester can hold it. */
+  employeeId?: string;
   /** Raw CSV-shaped rows; converted with the same mapper the real route uses. */
   cards?: Array<Record<string, unknown>>;
   mobileDevice?: string;
@@ -621,6 +623,8 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
               card: cards[0],
               authType: cfg.authType,
               corporateId: cfg.corporateId ?? null,
+              employeeId: cfg.employeeId ?? null,
+              otpTimeoutMs: config.otpTimeoutMs,
               log: (lvl, msg) => log(lvl, msg),
               dryRun: false,
             });

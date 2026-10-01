@@ -193,6 +193,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       cardName: { type: String, default: "" },
       parentCardLast4: { type: String, default: "" },
       childCardLast4: { type: String, default: "" },
+      billingPhone: { type: String, default: "" },
     },
     logs: { type: [JobLogSchema], default: [] },
     bullmqJobId: { type: String },

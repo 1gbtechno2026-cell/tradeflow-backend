@@ -112,6 +112,9 @@ export interface JobResultSnapshot {
   cardName?: string;
   parentCardLast4?: string;
   childCardLast4?: string;
+  /** The account's registered mobile, read from /account in pre-flight — the
+   *  phone on the delivery address, i.e. the order's billing phone. */
+  billingPhone?: string;
   /** Which card type and credential arm actually authenticated. Last 4 only —
    *  no full PAN is ever written to a persisted document. */
   cardTypeName?: string;

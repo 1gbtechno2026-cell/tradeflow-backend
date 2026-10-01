@@ -416,7 +416,12 @@ async function runClaimedCheckoutJob(
     const mobile = await checkout.fetchAccountMobile();
     if (mobile) {
       const normalised = mobile.replace(/\D/g, "").slice(-10);
-      if (normalised) address.mobile = normalised;
+      if (normalised) {
+        address.mobile = normalised;
+        // The dashboard's address has no phone; the one on the Flipkart
+        // address IS the account's. Recorded so the order row can show it.
+        await patchResult(data.jobId, { billingPhone: normalised });
+      }
       await checkout.ensureAddressForAccount(address, mobile);
       log("info", `Pre-flight done: one Flipkart address, mobile ending ${normalised.slice(-4)}`, "preflight");
     } else {

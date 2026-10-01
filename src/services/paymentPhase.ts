@@ -63,16 +63,18 @@ export type PaymentPhaseOutcome =
     }
   | { attempted: true; ok: false; failure: CheckoutFailure; cardId: string | null; cardUsed: CardUsed | null };
 
-/** Which card this order went on — what the Orders tab shows per order. */
+/** Which card this order went on — what the Orders tab shows per order. Keys
+ *  are the JobResultSnapshot field names, so the runner can spread it straight
+ *  into the result (the first version said `name`, which the schema dropped). */
 export interface CardUsed {
-  name: string;
+  cardName: string;
   parentCardLast4: string;
   childCardLast4: string;
 }
 
 function cardUsedOf(card: CardDetails): CardUsed {
   const last4 = (v: string) => String(v || "").replace(/\D/g, "").slice(-4);
-  return { name: card.name || "", parentCardLast4: last4(card.parentCardNumber), childCardLast4: last4(card.cardNumber) };
+  return { cardName: card.name || "", parentCardLast4: last4(card.parentCardNumber), childCardLast4: last4(card.cardNumber) };
 }
 
 export type PaymentModeClass = "cod" | "card" | "unsupported";

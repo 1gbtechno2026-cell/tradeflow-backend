@@ -2739,8 +2739,29 @@ export class FlipkartCheckout {
       throw new CheckoutFailure("GST_NOT_FOUND", "GST is not found on page — job has no GST number but GST is mandatory");
     }
     const gstinReady = await this.waitUntil(async () => Boolean((await this.locateGstInvoiceBlock()).gstin), 5000, 120, "GSTIN on GST Invoice block");
-    if (!gstinReady && gstMandatory) {
-      throw new CheckoutFailure("GST_NOT_FOUND", "GST is not found on page — GST Invoice label is there but no GSTIN was readable");
+    if (!gstinReady) {
+      // No GST saved on this account yet: the row is an unticked "Use GST Invoice"
+      // with no GSTIN under it. Ticking it opens the add drawer directly (there is
+      // no Change on this row), so go through the same picker path from there.
+      // This used to throw GST_NOT_FOUND, which made a fresh account unusable for
+      // any GST order.
+      console.log(`[GST] no GSTIN on GST Invoice — ticking Use GST Invoice to add ${gstNumber}`);
+      await this.clickGstInvoiceControl();
+      if (!(await this.waitUntil(() => this.gstPickerOpen(), 6000, 120, "GST drawer after ticking GST Invoice"))) {
+        throw new CheckoutFailure("GST_NOT_FOUND", "Ticked Use GST Invoice but the GST details drawer did not open");
+      }
+      await this.ensureCorrectGstInPicker(gstNumber, companyName);
+      await this.waitUntil(async () => {
+        const p = await this.locateGstInvoiceBlock();
+        return this.gstPanelMatches(p, gstNumber, companyName) && p.checked;
+      }, 5000);
+      const added = await this.locateGstInvoiceBlock();
+      console.log(`[GST] after add: checked=${added.checked} gstin=${added.gstin || "(none)"}`);
+      if (!this.gstPanelMatches(added, gstNumber, companyName) || !added.checked) {
+        throw new Error(`GST not correct after adding (have ${added.gstin || "none"}, want ${gstNumber})`);
+      }
+      console.log("GST invoice ticked with the correct GST");
+      return;
     }
 
     const panel = await this.locateGstInvoiceBlock();
@@ -2911,54 +2932,21 @@ export class FlipkartCheckout {
     });
   }
 
+  /**
+   * The m-site GST tick box is an <img> to the left of the "GST Invoice" label,
+   * not an <input type=checkbox> — so there is nothing to .click() in the DOM. The
+   * old version looked for a checkbox / role=checkbox / pointer ancestor and found
+   * none of them on this layout. Tap where the box is drawn, like a thumb would.
+   */
   private async clickGstInvoiceControl(): Promise<void> {
-    const clicked = await this.evaluate(() => {
-      const clickEl = (el: HTMLElement) => {
-        el.scrollIntoView({ block: "center" });
-        el.click();
-      };
-      const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]')) as HTMLInputElement[];
-      for (const box of boxes) {
-        let el: HTMLElement | null = box;
-        for (let i = 0; i < 8 && el; i++) {
-          if (/GST Invoice/i.test(el.innerText || "")) {
-            clickEl(box);
-            return "checkbox";
-          }
-          el = el.parentElement;
-        }
-      }
-      const aria = Array.from(document.querySelectorAll('[role="checkbox"]')) as HTMLElement[];
-      for (const cb of aria) {
-        let el: HTMLElement | null = cb;
-        for (let i = 0; i < 8 && el; i++) {
-          if (/GST Invoice/i.test(el.innerText || "")) {
-            clickEl(cb);
-            return "aria";
-          }
-          el = el.parentElement;
-        }
-      }
-      const nodes = Array.from(document.querySelectorAll("div,span,label,button")) as HTMLElement[];
-      for (const n of nodes) {
-        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
-        if (!/^Use GST Invoice$/i.test(t) && t !== "Use GST Invoice") continue;
-        let el: HTMLElement | null = n;
-        while (el && el !== document.body) {
-          const style = el.getAttribute("style") || "";
-          if (style.includes("cursor: pointer") || el.getAttribute("role") === "checkbox") {
-            clickEl(el);
-            return "label";
-          }
-          el = el.parentElement;
-        }
-        clickEl(n);
-        return "text";
-      }
-      return null;
-    });
-    if (!clicked) throw new Error("Could not tap Use GST Invoice / GST checkbox");
-    console.log(`[GST] tapped via ${clicked}`);
+    const label = this.page.getByText(/^\s*(Use )?GST Invoice\s*$/).first();
+    await label.scrollIntoViewIfNeeded({ timeout: 5000 });
+    const box = await label.boundingBox();
+    if (!box) throw new Error("Could not find GST Invoice label to tick");
+    const x = Math.max(8, box.x - 22);
+    const y = box.y + box.height / 2;
+    await this.page.touchscreen.tap(x, y);
+    console.log(`[GST] tapped GST Invoice tick box at (${x.toFixed(0)}, ${y.toFixed(0)})`);
   }
 
   /**
@@ -3063,6 +3051,7 @@ export class FlipkartCheckout {
     const formReady = await this.waitForGstFormInputs(10000);
     if (!formReady) throw new Error("GST form inputs never appeared");
     await this.fillGstForm(gstNumber, companyName);
+    const confirmSince = Date.now();
     await this.clickConfirmAndUseGst();
 
     // A drawer that stays open after Confirm means Flipkart REFUSED the GST, and it
@@ -3076,15 +3065,26 @@ export class FlipkartCheckout {
       "GST drawer close after add"
     );
     if (!closed) {
+      // Flipkart's answer, if the page asked it anything after Confirm. Passive.
+      const action = this.api ? await this.api.waitForAction(/GST/i, confirmSince, 1500) : null;
+      if (action) {
+        console.log(`[API] ${action.type}: success=${action.success}${action.messages.length ? ` "${action.messages.join(" ")}"` : ""}`);
+      }
       const text = await this.evaluate(() => document.body?.innerText || "");
-      const msg = text
-        .split(/\n+/)
-        .map((l) => l.trim())
-        .find(
-          (l) =>
-            /invalid|valid gst|incorrect|not (a )?valid|does not match|already (exists|added)|mandatory|required/i.test(l) &&
-            l.length < 160
-        );
+      const msg =
+        action?.messages.join(" ") ||
+        text
+          .split(/\n+/)
+          .map((l) => l.trim())
+          // The form carries a standing note, "Incorrect GSTIN details will lead
+          // to order cancellation", on every open. It is not the rejection —
+          // skip it, or every refusal reports that sentence.
+          .filter((l) => !/will lead to order cancellation/i.test(l))
+          .find(
+            (l) =>
+              /invalid|valid gst|incorrect|not (a )?valid|does not match|already (exists|added)|mandatory|required/i.test(l) &&
+              l.length < 160
+          );
       throw new CheckoutFailure(
         "GST_SELECT_FAILED",
         msg
@@ -3094,32 +3094,17 @@ export class FlipkartCheckout {
     }
   }
 
+  // Every control in the GST drawer below is tapped through a Playwright locator
+  // (touch), the way the reference flow does it. The versions these replace found
+  // the element in the DOM and called .click() on it, or computed a point and sent
+  // a mouse click — and on the m-site drawer that visibly did nothing: the form
+  // filled, "Confirm and Save" was "clicked" at 380x72, and the drawer stayed open
+  // with no error on it. `.last()` because the drawer is appended after the page
+  // content, so when both carry the same label the drawer's is the later one.
+
   private async clickGstEditInPicker(): Promise<void> {
-    const clicked = await this.evaluate(() => {
-      const compact = (s: string) => s.replace(/\s+/g, " ").trim();
-      const nodes = Array.from(document.querySelectorAll("div,span,button,a")) as HTMLElement[];
-      for (const n of nodes) {
-        if (compact(n.textContent || "") !== "Edit") continue;
-        let el: HTMLElement | null = n;
-        let inGst = false;
-        let pointer: HTMLElement = n;
-        for (let i = 0; i < 16 && el && el !== document.body; i++) {
-          const t = compact(el.innerText || "");
-          if (/Select GST Details/i.test(t) || (/GST/i.test(t) && t.length < 400)) inGst = true;
-          if ((el.getAttribute("style") || "").includes("cursor: pointer") || el.tagName === "BUTTON") {
-            pointer = el;
-          }
-          el = el.parentElement;
-        }
-        if (!inGst) continue;
-        pointer.scrollIntoView({ block: "center" });
-        pointer.click();
-        return true;
-      }
-      return false;
-    });
-    if (!clicked) throw new Error("GST Edit button not found in Select GST Details");
-    console.log("[GST] clicked Edit in picker");
+    await this.page.getByText("Edit", { exact: true }).last().tap({ timeout: 5000 });
+    console.log("[GST] tapped Edit in picker");
   }
 
   private async waitForGstPicker(timeoutMs: number): Promise<boolean> {
@@ -3144,103 +3129,22 @@ export class FlipkartCheckout {
   }
 
   private async selectGstRowInPicker(gstNumber: string): Promise<void> {
-    const clicked = await this.evaluate((gst: string) => {
-      const upper = gst.toUpperCase();
-      const nodes = Array.from(document.querySelectorAll("div,label,span,li")) as HTMLElement[];
-      let best: HTMLElement | null = null;
-      let bestLen = Infinity;
-      for (const n of nodes) {
-        const t = (n.innerText || "").replace(/\s+/g, " ").trim();
-        if (!t.toUpperCase().includes(upper)) continue;
-        if (/^Edit$/i.test(t)) continue;
-        if (t.length < bestLen && t.length < 240) {
-          best = n;
-          bestLen = t.length;
-        }
-      }
-      if (!best) return false;
-      let el: HTMLElement | null = best;
-      while (el && el !== document.body) {
-        const radio = el.querySelector('input[type="radio"]') as HTMLInputElement | null;
-        if (radio) {
-          radio.click();
-          el.click();
-          return true;
-        }
-        const style = el.getAttribute("style") || "";
-        if (style.includes("cursor: pointer") || el.getAttribute("role") === "radio") {
-          el.click();
-          return true;
-        }
-        el = el.parentElement;
-      }
-      best.click();
-      return true;
-    }, gstNumber);
-    if (!clicked) throw new Error(`Could not select GST row ${gstNumber} in picker`);
+    const row = this.page.getByText(new RegExp(`^\\s*${gstNumber}\\s*$`, "i")).last();
+    await row.tap({ timeout: 5000 });
+    console.log(`[GST] selected ${gstNumber} in picker`);
     await sleep(400);
   }
 
   private async clickAddNewGstDetails(): Promise<void> {
-    const clicked = await this.evaluate(() => {
-      const nodes = Array.from(document.querySelectorAll("div,span,button,a")) as HTMLElement[];
-      for (const n of nodes) {
-        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
-        if (!/Add new GST Details/i.test(t) || t.length > 40) continue;
-        let el: HTMLElement | null = n;
-        while (el && el !== document.body) {
-          const style = el.getAttribute("style") || "";
-          if (style.includes("cursor: pointer") || el.tagName === "BUTTON" || el.tagName === "A") {
-            el.scrollIntoView({ block: "center" });
-            el.click();
-            return true;
-          }
-          el = el.parentElement;
-        }
-        n.scrollIntoView({ block: "center" });
-        n.click();
-        return true;
-      }
-      return false;
-    });
-    if (!clicked) throw new Error("Could not click Add new GST Details");
-    console.log("[GST] clicked Add new GST Details");
+    await this.page.getByText(/^\s*\+?\s*Add new GST Details\s*$/i).last().tap({ timeout: 5000 });
+    console.log("[GST] tapped Add new GST Details");
     await sleep(800);
   }
 
   private async clickConfirmAndUseGst(): Promise<void> {
-    const box = await this.evaluate(() => {
-      const compact = (s: string) => s.replace(/\s+/g, " ").trim();
-      const labels = /^(Confirm and Use|Confirm and Save)$/i;
-      const hits: Array<{ x: number; y: number; w: number; h: number; bottom: number }> = [];
-      for (const n of Array.from(document.querySelectorAll("button,div,span")) as HTMLElement[]) {
-        if (!labels.test(compact(n.textContent || ""))) continue;
-        let el: HTMLElement | null = n;
-        let best = n;
-        while (el && el !== document.body) {
-          const r = el.getBoundingClientRect();
-          if (r.height >= 36 && r.height <= 88 && r.width >= 80) best = el;
-          if ((el.getAttribute("style") || "").includes("cursor: pointer")) {
-            best = el;
-            break;
-          }
-          el = el.parentElement;
-        }
-        const r = best.getBoundingClientRect();
-        if (r.width < 40 || r.height < 20) continue;
-        hits.push({ x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, bottom: r.bottom });
-      }
-      if (!hits.length) return null;
-      hits.sort((a, b) => b.bottom - a.bottom || b.w - a.w);
-      const pick = hits[0];
-      return { x: pick.x, y: pick.y, w: pick.w, h: pick.h };
-    });
-    if (box) {
-      console.log(`=== Confirm GST ${box.w.toFixed(0)}x${box.h.toFixed(0)} ===`);
-      await this.tapPoint(box.x, box.y, "Confirm and Use / Save");
-      return;
-    }
-    throw new Error("Could not click Confirm and Use / Confirm and Save");
+    const btn = this.page.getByText(/^\s*Confirm and (Use|Save)\s*$/i).last();
+    await btn.tap({ timeout: 5000 });
+    console.log("=== Confirm GST tapped ===");
   }
 
   private async clickContinueToCheckout(): Promise<void> {
@@ -4188,60 +4092,27 @@ export class FlipkartCheckout {
     }
   }
 
+  /**
+   * Type into the drawer's inputs with Playwright `fill()` — real input events on
+   * the focused element — rather than setting `.value` and dispatching synthetic
+   * events from inside the page. The inputs are maxlength 15 (GSTIN) and 60
+   * (business name); `.last()` because the drawer's inputs come after any the page
+   * already had. Business name is optional on some forms, so it is filled only
+   * when the input is visible.
+   */
   private async fillGstForm(gstNumber: string, companyName: string): Promise<void> {
     console.log("Filling GST form...");
-
-    let filled = false;
-    for (let attempt = 0; attempt < 5 && !filled; attempt++) {
-      const result = await this.evaluate((gst: string, company: string) => {
-        // Find GST number input: maxlength=15
-        const gstEl = document.querySelector('input[maxlength="15"]') as HTMLInputElement | null;
-        // Find company name input: maxlength=60
-        const companyEl = document.querySelector('input[maxlength="60"]') as HTMLInputElement | null;
-
-        const filledGst = gstEl !== null;
-        const filledCompany = companyEl !== null;
-
-        if (gstEl) {
-          gstEl.focus();
-          gstEl.value = "";
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-          if (setter) setter.call(gstEl, gst);
-          else gstEl.value = gst;
-          gstEl.dispatchEvent(new Event("input", { bubbles: true }));
-          gstEl.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-        if (companyEl) {
-          companyEl.focus();
-          companyEl.value = "";
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-          if (setter) setter.call(companyEl, company);
-          else companyEl.value = company;
-          companyEl.dispatchEvent(new Event("input", { bubbles: true }));
-          companyEl.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-
-        return { filledGst, filledCompany };
-      }, gstNumber, companyName);
-
-      if (result.filledGst) {
-        console.log(`Entered GST number: ${gstNumber.slice(0, 2)}***${gstNumber.slice(-2)}`);
-      } else {
-        console.log(`WARNING: GST input [maxlength="15"] not found (attempt ${attempt + 1}/5)`);
-      }
-      if (result.filledCompany) {
-        console.log(`Entered company name: ${companyName}`);
-      } else {
-        console.log(`WARNING: Company input [maxlength="60"] not found (attempt ${attempt + 1}/5)`);
-      }
-
-      if (result.filledGst && result.filledCompany) {
-        filled = true;
-      } else {
-        await sleep(300);
-      }
+    const gstEl = this.page.locator('input[maxlength="15"]').last();
+    await gstEl.waitFor({ state: "visible", timeout: 8000 });
+    await gstEl.fill(gstNumber);
+    console.log(`Entered GST number: ${gstNumber.slice(0, 2)}***${gstNumber.slice(-2)}`);
+    const companyEl = this.page.locator('input[maxlength="60"]').last();
+    if (companyName && (await companyEl.isVisible().catch(() => false))) {
+      await companyEl.fill(companyName);
+      console.log(`Entered company name: ${companyName}`);
+    } else {
+      console.log("Company name input not shown — Flipkart fills business name from GSTIN");
     }
-
     await sleep(500);
   }
 

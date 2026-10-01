@@ -51,6 +51,11 @@ export interface PlacedOrderDetails {
   transactionAmount?: string;
   cartAfterCardOffer?: string;
   paymentFee?: string;
+  /** Each applied charge by type, e.g. "CORP_CARD_FEE ₹1; PLATFORM_FEE ₹3". */
+  paymentFeeDetails?: string;
+  shippingAmount?: string;
+  /** Percent, as Flipkart's confirmation data states it. */
+  discountPct?: string;
   bankTransactionId?: string;
   pgTransactionId?: string;
   bankName?: string;
@@ -235,13 +240,23 @@ export class PaymentApiWatcher {
         };
         let primary = "";
         let fee = "";
+        let feeDetails = "";
         try {
           primary = paise((JSON.parse(pp.primary_record || "{}") as { primary_amount?: number }).primary_amount);
         } catch { /* absent */ }
         try {
-          const charges = (JSON.parse(pp.payment_handling_fees_details || "{}") as { applied_charges?: Array<{ amount?: number }> }).applied_charges ?? [];
+          const charges = (JSON.parse(pp.payment_handling_fees_details || "{}") as { applied_charges?: Array<{ type?: string; amount?: number }> }).applied_charges ?? [];
           fee = paise(charges.reduce((n, ch) => n + Number(ch.amount || 0), 0));
+          // Every charge by name: the fee differs by card type (₹1 corporate
+          // fee on a ₹169 cart, ₹181 on ₹18,128; HDFC quoted ₹54 there), so a
+          // total alone cannot be audited.
+          feeDetails = charges.map((ch) => `${ch.type || "FEE"} ₹${paise(ch.amount)}`).join("; ");
+          const adjustments = JSON.parse(pp.merchant_adjustments || "[]") as unknown[];
+          if (Array.isArray(adjustments) && adjustments.length) {
+            feeDetails += `${feeDetails ? "; " : ""}adjustments ${JSON.stringify(adjustments).slice(0, 200)}`;
+          }
         } catch { /* absent */ }
+        out.paymentFeeDetails = feeDetails;
         // merchant_reference_id is the FULL order id ("OD…00", 20 chars) —
         // the form Flipkart's order pages use. merchant_transaction_id is the
         // short form with "-TX-00" appended; only a fallback.
@@ -274,6 +289,8 @@ export class PaymentApiWatcher {
         out.supercoinsApplied = cnc.coinComponent != null ? String(cnc.coinComponent) : "";
         out.unitPrice = u.price != null ? String(u.price) : "";
         out.mrp = u.mrp != null ? String(u.mrp) : "";
+        out.shippingAmount = u.shippingAmt != null ? String(u.shippingAmt) : "";
+        out.discountPct = u.discount != null ? String(u.discount) : "";
         out.orderStatus = String(u.orderStatus || "");
         out.sellerName = String(u.sellerName || "");
         out.instrument = [pim.primaryInstrumentName, pim.primaryInstrumentType].filter(Boolean).join(" ");

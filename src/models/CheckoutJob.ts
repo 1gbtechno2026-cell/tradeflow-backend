@@ -180,6 +180,11 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       // From Flipkart's gateway / order-confirmation responses after a placed
       // order. Declared, or strict mode drops them silently on save.
       paymentFee: { type: String, default: "" },
+      paymentFeeDetails: { type: String, default: "" },
+      shippingAmount: { type: String, default: "" },
+      discountPct: { type: String, default: "" },
+      mrp: { type: String, default: "" },
+      unitPrice: { type: String, default: "" },
       bankTransactionId: { type: String, default: "" },
       pgTransactionId: { type: String, default: "" },
       bankName: { type: String, default: "" },

@@ -100,6 +100,13 @@ export interface JobResultSnapshot {
   /** From Flipkart's gateway response and order-confirmation data, read
    *  passively after a placed order. Rupees as strings; see PaymentApiWatcher. */
   paymentFee?: string;
+  /** Each applied charge by type ("CORP_CARD_FEE ₹1"), plus any adjustments. */
+  paymentFeeDetails?: string;
+  shippingAmount?: string;
+  discountPct?: string;
+  mrp?: string;
+  /** Flipkart's unit price from the confirmation data. */
+  unitPrice?: string;
   bankTransactionId?: string;
   pgTransactionId?: string;
   bankName?: string;

@@ -75,6 +75,13 @@ export function orderDetailFields(d: PlacedOrderDetails | null | undefined, plac
     ...(d.transactionAmount ? { transactionAmount: d.transactionAmount } : {}),
     ...(d.cartAfterCardOffer ? { cartAfterCardOffer: d.cartAfterCardOffer } : {}),
     ...(d.paymentFee ? { paymentFee: d.paymentFee } : {}),
+    ...(d.paymentFeeDetails ? { paymentFeeDetails: d.paymentFeeDetails } : {}),
+    ...(d.shippingAmount ? { shippingAmount: d.shippingAmount } : {}),
+    ...(d.discountPct ? { discountPct: d.discountPct } : {}),
+    ...(d.mrp ? { mrp: d.mrp } : {}),
+    // The product page's price read is unreliable (empty on the keychain);
+    // Flipkart's own unit price from the confirmation data fills the gap.
+    ...(d.unitPrice ? { unitPrice: d.unitPrice } : {}),
     ...(d.bankTransactionId ? { bankTransactionId: d.bankTransactionId } : {}),
     ...(d.pgTransactionId ? { pgTransactionId: d.pgTransactionId } : {}),
     ...(d.bankName ? { bankName: d.bankName } : {}),

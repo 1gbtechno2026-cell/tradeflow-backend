@@ -22,6 +22,7 @@ import { resolveAddress, resolveLoggedInSession } from "./sessionStore.js";
 import { toCardDetails } from "./paymentCards.js";
 import { verdictFor } from "./cardPool.js";
 import { authenticatePayment } from "../paymentStrategies/index.js";
+import { remainingBudgetMs } from "./paymentPhase.js";
 import type { AuthType, CardDetails } from "../paymentStrategies/types.js";
 import type { AddressDetails, LogLevel } from "../types.js";
 
@@ -610,6 +611,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
           await capture("12-card-filled");
           const rejected = await fk.detectCardRejectedByFlipkart();
           if (rejected) throw rejected;
+          const payPressedAt = Date.now();
           await fk.submitCardForm();
           const bankUrl = await fk.waitForBankHandoff();
           console.log(`  handed off to the bank: ${bankUrl.split("?")[0]}`);
@@ -627,7 +629,8 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
               authType: cfg.authType,
               corporateId: cfg.corporateId ?? null,
               employeeId: cfg.employeeId ?? null,
-              otpTimeoutMs: config.otpTimeoutMs,
+              // Same clock as the worker: the budget started when Pay was pressed.
+              otpTimeoutMs: remainingBudgetMs(payPressedAt),
               log: (lvl, msg) => log(lvl, msg),
               dryRun: false,
             });

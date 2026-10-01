@@ -156,6 +156,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
   }
   const id = claimed.id;
   log("info", `[pay] using card ${id} (${claimed.used} order(s) already placed on it)`, "payment");
+  let payPressedAt = Date.now();
 
   try {
     // ---- surface 2: Flipkart's own payment page --------------------------
@@ -167,6 +168,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
       // rather than about a hand-off that never happened.
       const rejected = await fk.detectCardRejectedByFlipkart();
       if (rejected) throw rejected;
+      payPressedAt = Date.now();
       await fk.submitCardForm();
       const bankUrl = await fk.waitForBankHandoff();
       log("info", `[pay] handed off to the bank: ${bankUrl}`, "payment");
@@ -183,7 +185,9 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
       card: claimed.card,
       authType,
       corporateId: data.corporateId ?? null,
-      otpTimeoutMs: config.otpTimeoutMs,
+      // One budget from the moment Pay was pressed: whatever the hand-off and
+      // the bank's identity step used is gone; the OTP gets the remainder.
+      otpTimeoutMs: remainingBudgetMs(payPressedAt),
       log: (level, message) => log(level, message, "payment"),
       dryRun: input.dryRun,
     });
@@ -225,6 +229,15 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
     );
     return { attempted: true, ok: false, failure, cardId: id };
   }
+}
+
+/**
+ * What is left of the payment budget (config.otpTimeoutMs) since Pay was
+ * pressed. Never below 10s, so a slow hand-off still gives the bank a chance
+ * to deliver rather than failing the order at the exact moment it is asked.
+ */
+export function remainingBudgetMs(payPressedAt: number): number {
+  return Math.max(10_000, config.otpTimeoutMs - (Date.now() - payPressedAt));
 }
 
 /**

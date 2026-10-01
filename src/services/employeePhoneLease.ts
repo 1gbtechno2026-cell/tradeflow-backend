@@ -24,9 +24,12 @@ import { workspaceUserId } from "./sessionStore.js";
  * with the model's autoIndex:false / autoCreate:false stance.
  */
 
-/** 3 minutes — deliberately shorter than the OTP's own ~5 minute lifetime, so a
- *  lapsed lease can never outlive the code it was guarding. */
-export const LEASE_TTL_MS = Number(process.env.OTP_LEASE_TTL_MS || 3 * 60 * 1000);
+/** 2 minutes — the payment budget (OTP_TIMEOUT_MS). A run renews its hold
+ *  every 60s while it is alive, so a healthy payment keeps the handset for as
+ *  long as it needs; a run that has gone quiet loses it on the same clock the
+ *  order itself is failed on. Shorter than the OTP's own lifetime, so a lapsed
+ *  lease can never outlive the code it was guarding. */
+export const LEASE_TTL_MS = Number(process.env.OTP_LEASE_TTL_MS || 2 * 60 * 1000);
 
 /**
  * May a handset be claimed when nothing has confirmed it is reachable?

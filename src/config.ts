@@ -31,10 +31,11 @@ export const config = {
   keepBrowserOpenMs: Math.max(0, Number(process.env.KEEP_BROWSER_OPEN_MS || 60000)),
   /** Bearer token the Android SMS forwarder sends to /api/sms. Empty = webhook disabled. */
   smsApiToken: process.env.SMS_API_TOKEN || "",
-  /** How long a payment waits for the bank's OTP before the order is failed.
-   *  Three minutes: the operator's rule, and the bank's own validity window —
-   *  a code older than that is refused by the bank anyway. */
-  otpTimeoutMs: Math.max(30_000, Number(process.env.OTP_TIMEOUT_MS || 3 * 60 * 1000)),
+  /** The payment budget: from the moment Pay is pressed on Flipkart's card
+   *  form, everything — the hand-off, the bank's identity step, and the OTP
+   *  arriving — must complete within this, or the order is failed and the
+   *  handset lease lapses on the same clock. Two minutes: the operator's rule. */
+  otpTimeoutMs: Math.max(30_000, Number(process.env.OTP_TIMEOUT_MS || 2 * 60 * 1000)),
   /** Playwright device emulated for the m-site leg of checkout. Flipkart chooses
    *  which site to serve from the User-Agent, and FlipkartCheckout is m-site
    *  automation, so this decides whether its selectors exist at all. */

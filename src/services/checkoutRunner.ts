@@ -1,6 +1,7 @@
 import type { Page } from "playwright";
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
+import { FlipkartApiWatcher } from "../automation/FlipkartApiWatcher.js";
 import {
   readBatchProgress,
   releaseBatchReservation,
@@ -366,8 +367,11 @@ async function runClaimedCheckoutJob(
    * Proven by scripts/testFlowCli.ts: `npm run test:flow -- happy` reaches
    * pay.flipkart.com with the item in the cart.
    */
+  // One watcher across both legs — see testFlow for why.
+  const apiWatcher = new FlipkartApiWatcher();
   const deskBrowser = await launchStealthBrowser({ headless: config.headless });
   const deskContext = await desktopContext(deskBrowser);
+    apiWatcher.attach(deskContext);
   let mobBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
   // Reassigned when the job moves to the mobile leg; everything below reads
   // whichever page is current.
@@ -439,6 +443,7 @@ async function runClaimedCheckoutJob(
     await restoreFlipkartSession(page, session.cookies);
 
     checkout = new FlipkartCheckout(page, data.productUrl, log);
+    checkout.api = apiWatcher;
     checkout.setCheckoutFlags(jobPincode, data.gstMandatory ?? job.request?.gstMandatory ?? true);
     log("info", "Using FlipkartCheckout (Buying-bot add-to-cart / place-order strategies)", "session");
 
@@ -468,6 +473,7 @@ async function runClaimedCheckoutJob(
     await deskContext.close().catch(() => undefined);
     mobBrowser = await launchMobileBrowser({ headless: config.headless });
     const mobContext = await mobileContext(mobBrowser);
+    apiWatcher.attach(mobContext);
     page = await mobContext.newPage();
     await blockFlipkartLogout(page);
     netObserver = FlipkartNetworkObserver.attach(page);
@@ -491,6 +497,7 @@ async function runClaimedCheckoutJob(
 
     log("info", "Opening product page", "product");
     checkout = new FlipkartCheckout(page, data.productUrl, log);
+    checkout.api = apiWatcher;
     checkout.setCheckoutFlags(jobPincode, data.gstMandatory ?? job.request?.gstMandatory ?? true);
     await checkout.navigateToProduct();
     const details = await checkout.captureProductDetails();

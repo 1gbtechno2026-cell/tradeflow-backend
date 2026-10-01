@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { BrowserContext, Page } from "playwright";
 import { config } from "../config.js";
 import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
+import { FlipkartApiWatcher } from "../automation/FlipkartApiWatcher.js";
 import { FlipkartPayment } from "../automation/FlipkartPayment.js";
 import {
   blockFlipkartLogout,
@@ -272,6 +273,9 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
     publish();
   };
 
+  // One watcher for the whole run: the flow spans two browsers and the add-to-cart
+  // answer arrives on the mobile leg while the address list arrives on the desktop one.
+  const apiWatcher = new FlipkartApiWatcher();
   const desktopBrowser = await launchStealthBrowser({ headless: cfg.headless ?? config.headless });
   let mobileBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
   let reachedPayments = false;
@@ -300,6 +304,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
 
     // ================= DESKTOP LEG =================
     const desk: BrowserContext = await desktopContext(desktopBrowser);
+    apiWatcher.attach(desk);
     const deskPage = await desk.newPage();
     page = deskPage;
     await blockFlipkartLogout(deskPage);
@@ -313,6 +318,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       throw new CheckoutFailure("SESSION_EXPIRED", "Flipkart showed the login page on /account — this session is dead");
     }
     const deskFlow = new FlipkartCheckout(deskPage, cfg.productUrl, log);
+    deskFlow.api = apiWatcher;
     deskFlow.setCheckoutFlags(pincode, gstMandatory);
     const accountMobile = await deskFlow.fetchAccountMobile();
     if (accountMobile) {
@@ -336,6 +342,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
     await step(4, `Mobile: switch context (${cfg.mobileDevice || config.mobileDevice})`);
     mobileBrowser = await launchMobileBrowser({ headless: cfg.headless ?? config.headless });
     const mob = await mobileContext(mobileBrowser, cfg.mobileDevice);
+    apiWatcher.attach(mob);
     const mobPage = await mob.newPage();
     page = mobPage;
     await blockFlipkartLogout(mobPage);
@@ -362,6 +369,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
     await capture("04-msite-home");
 
     const flow = new FlipkartCheckout(mobPage, cfg.productUrl, log);
+    flow.api = apiWatcher;
     flow.setCheckoutFlags(pincode, gstMandatory);
     await flow.navigateToProduct();
     const details = await flow.captureProductDetails();

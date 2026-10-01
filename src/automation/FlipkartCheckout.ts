@@ -10,6 +10,7 @@ import {
 } from "./helpers.js";
 import { sleep } from "../services/browser.js";
 import { CheckoutFailure, classifyPageText } from "../services/checkoutErrors.js";
+import type { FlipkartApiWatcher } from "./FlipkartApiWatcher.js";
 
 /** Remembered Flipkart checkout URLs when a button or page is missing. pageUID is per-session — omit it. */
 const VIEWCART_URL = "https://www.flipkart.com/viewcart?exploreMode=TRUE&preference=FLIPKART";
@@ -64,6 +65,13 @@ const DELAYS = {
  */
 export class FlipkartCheckout {
   summaryQty = 0;
+  /**
+   * Flipkart's own API responses, when a caller attaches one. Optional on purpose:
+   * every use below falls back to the page checks, so the flow behaves exactly as
+   * before when it is absent.
+   */
+  api: FlipkartApiWatcher | null = null;
+
   private jobPincode = "";
   private gstMandatory = true;
 
@@ -787,6 +795,7 @@ export class FlipkartCheckout {
       { label: "Add to Cart button (Buying-bot)", timeoutMs: 10000, maxRetries: 5 }
     );
 
+    const addSince = Date.now();
     const beforeAdd = await this.scanFlipkartPdp();
     if (beforeAdd.notDeliverable || beforeAdd.locationSliderOpen) {
       throw this.notAvailableOnPin(pincode || beforeAdd.selectedPincode);
@@ -948,6 +957,26 @@ export class FlipkartCheckout {
       await sleep(DELAYS.medium);
       await this.failIfLocationSlider(pincode);
       added = (await this.headerCartCount()) > before || (await this.productLooksAddedToCart());
+    }
+
+    // Flipkart's own answer, per listing. An error alongside presentInCart is a
+    // warning (it still went in); an error WITHOUT it is a refusal, and carries the
+    // reason — cart full, listing dead — which the page may never show.
+    if (this.api) {
+      await sleep(500);
+      for (const add of this.api.cartAdds.filter((c) => c.at >= addSince)) {
+        console.log(
+          `[API] add to cart ${add.listingId}: inCart=${add.presentInCart}` +
+            `${add.errorCode ? ` ${add.errorCode} "${add.errorMessage}"` : " ok"}`
+        );
+      }
+      const refused = this.api.refusedAdd(addSince);
+      if (refused) {
+        throw new CheckoutFailure(
+          "ADD_TO_CART_FAILED",
+          `${refused.errorMessage ?? "Add to cart refused"} [${refused.errorCode}]`
+        );
+      }
     }
 
     const count = await this.headerCartCount();
@@ -2439,6 +2468,7 @@ export class FlipkartCheckout {
     }
 
     console.log(`Quantity mismatch: ${displayedQty} vs ${expectedQty} — opening Qty dropdown`);
+    const qtySince = Date.now();
     await this.page.getByText(/^\s*Qty:\s*\d+\s*$/).first().tap({ timeout: 5000 });
     await sleep(500);
 
@@ -2498,6 +2528,20 @@ export class FlipkartCheckout {
       await input.fill(String(expectedQty));
       await this.page.getByText(/^\s*apply\s*$/i).first().tap({ timeout: 5000 });
       console.log(`Typed ${expectedQty} and tapped APPLY`);
+    }
+
+    // Flipkart answers every quantity change, and the answer is the real verdict:
+    // "Successfully updated quantity ... to N", or "You can only purchase N units".
+    // actionSuccess stays true even when it silently CAPS the amount, so the
+    // message matters more than the flag.
+    const qtyAction = this.api ? await this.api.waitForAction("CHECKOUT_UPDATE_ITEM_QUANTITY", qtySince, 8000) : null;
+    if (qtyAction) {
+      const msg = qtyAction.messages.join(" ");
+      console.log(`[API] quantity update: success=${qtyAction.success} "${msg}"`);
+      if (QTY_LIMIT_RE.test(msg)) throw new CheckoutFailure("MAX_UNITS_REACHED", msg);
+      if (!qtyAction.success) {
+        throw new CheckoutFailure("MAX_UNITS_REACHED", `Flipkart refused the quantity change: ${msg || "no message"}`);
+      }
     }
 
     const rejected = async () =>
@@ -2917,43 +2961,50 @@ export class FlipkartCheckout {
     console.log(`[GST] tapped via ${clicked}`);
   }
 
+  /**
+   * Tap the "Change" on the GST Invoice row.
+   *
+   * Ported from the reference flow. The previous version searched the located GST
+   * panel for a div with `cursor: pointer` whose text was exactly "Change" — and on
+   * the real checkout that found nothing, so a GST that genuinely needed changing
+   * failed with "GST Invoice Change button not found", three times, and the order
+   * stopped. Confirmed against the captured DOM of a failing run: the panel IS
+   * found and the GSTIN IS read, so the fault was only ever in locating this
+   * control.
+   *
+   * Geometry instead of DOM structure. The page has two "Change" links — one on the
+   * Deliver-to row, one on the GST row — and the GST one is the one vertically
+   * closest to the "GST Invoice" label. The 40px threshold is what stops it tapping
+   * the address's Change when the GST row has no Change at all, which would silently
+   * open the wrong drawer.
+   */
   private async clickGstChangeButton(): Promise<void> {
-    const box = await this.evaluate(() => {
-      const compact = (s: string) => (s || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-      const gstinRe = /\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b/i;
-      let label: HTMLElement | null = null;
-      for (const n of Array.from(document.querySelectorAll("div,span")) as HTMLElement[]) {
-        if (/^GST Invoice$/i.test(compact(n.textContent || ""))) {
-          label = n;
-          break;
-        }
+    const label = this.page.getByText(/^\s*(Use )?GST Invoice\s*$/).first();
+    await label.scrollIntoViewIfNeeded({ timeout: 5000 });
+    const labelBox = await label.boundingBox();
+    if (!labelBox) throw new Error("GST Invoice label not found");
+
+    const changes = this.page.getByText("Change", { exact: true });
+    const total = await changes.count();
+    let best = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < total; i++) {
+      const b = await changes.nth(i).boundingBox().catch(() => null);
+      if (!b) continue;
+      const dist = Math.abs(b.y + b.height / 2 - (labelBox.y + labelBox.height / 2));
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
       }
-      if (!label) return null;
-      label.scrollIntoView({ block: "center", inline: "nearest" });
-      let root: HTMLElement | null = label;
-      while (root && root !== document.body) {
-        const t = compact(root.innerText || "");
-        if (/GST Invoice/i.test(t) && gstinRe.test(t) && /\bChange\b/i.test(t) && t.length < 800) {
-          break;
-        }
-        root = root.parentElement;
-      }
-      if (!root || root === document.body) root = label.parentElement ?? label;
-      const pointers = Array.from(root.querySelectorAll("div")) as HTMLElement[];
-      const changePtrs = pointers.filter((d) => {
-        const style = d.getAttribute("style") || "";
-        return style.includes("cursor: pointer") && compact(d.innerText || "") === "Change";
-      });
-      const pointer = changePtrs[0];
-      if (!pointer) return null;
-      pointer.scrollIntoView({ block: "center", inline: "nearest" });
-      pointer.click();
-      const r = pointer.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, via: "pointer" };
-    });
-    if (!box) throw new Error("GST Invoice Change button not found (second Change, next to GST Invoice)");
-    console.log(`=== GST Invoice Change ${box.w.toFixed(0)}x${box.h.toFixed(0)} via ${box.via} ===`);
-    await this.tapPoint(box.x, box.y, "GST Invoice Change");
+    }
+    if (best < 0 || bestDist > 40) {
+      throw new Error(
+        `GST Invoice Change button not found next to the GST Invoice label ` +
+          `(${total} "Change" on the page, nearest ${bestDist === Infinity ? "none" : bestDist.toFixed(0) + "px"} away)`
+      );
+    }
+    await changes.nth(best).tap({ timeout: 5000 });
+    console.log(`=== GST Invoice Change tapped (Change #${best + 1}/${total}, ${bestDist.toFixed(0)}px from the label) ===`);
   }
 
 
@@ -2991,24 +3042,56 @@ export class FlipkartCheckout {
       return;
     }
 
-    if (drawer.hasEdit) {
-      console.log(`[GST] ${gstNumber} not in list — Edit the selected GST and refill`);
+    // ADD takes priority over EDIT — the reverse of what this used to do.
+    //
+    // Edit rewrites a GST the account already has. Ordering to a TRANSPARENTS DEALS
+    // address while the drawer holds DASHMOBILES' 06AALCD3578N1Z0, the old order
+    // picked Edit and tried to overwrite DASHMOBILES' saved GSTIN with TRANSPARENTS'
+    // — which would have corrupted that entry for every other order using it, on a
+    // shared account, silently. It also did not work: the drawer never closed and
+    // the run failed with "GST not correct after refill".
+    //
+    // Edit survives only as the fallback for a drawer that offers no "Add new",
+    // which is the one case where there is nothing else to try.
+    if (drawer.hasAddNew || !drawer.hasEdit) {
+      console.log(`[GST] ${gstNumber} not in drawer — Add new GST Details`);
+      await this.clickAddNewGstDetails();
+    } else {
+      console.log(`[GST] ${gstNumber} not in list and no Add option — Edit the selected GST and refill`);
       await this.clickGstEditInPicker();
-      const formReady = await this.waitForGstFormInputs(10000);
-      if (!formReady) throw new Error("GST Edit form inputs never appeared");
-      await this.fillGstForm(gstNumber, companyName);
-      await this.clickConfirmAndUseGst();
-      await this.waitUntil(async () => !(await this.gstPickerOpen()), 8000, 120, "GST drawer close after Edit");
-      return;
     }
-
-    console.log(`[GST] target not in drawer — Add new GST Details ${gstNumber}`);
-    await this.clickAddNewGstDetails();
     const formReady = await this.waitForGstFormInputs(10000);
-    if (!formReady) throw new Error("GST form inputs never appeared after Add new GST Details");
+    if (!formReady) throw new Error("GST form inputs never appeared");
     await this.fillGstForm(gstNumber, companyName);
     await this.clickConfirmAndUseGst();
-    await this.waitUntil(async () => !(await this.gstPickerOpen()), 8000, 120, "GST drawer close after add");
+
+    // A drawer that stays open after Confirm means Flipkart REFUSED the GST, and it
+    // says why on that drawer. Without reading it the run reports "GST not correct
+    // after refill (have X, want Y)" — true, but it never says that Flipkart
+    // rejected the GSTIN, so the operator cannot tell a bad number from a bug.
+    const closed = await this.waitUntil(
+      async () => !(await this.gstPickerOpen()),
+      8000,
+      120,
+      "GST drawer close after add"
+    );
+    if (!closed) {
+      const text = await this.evaluate(() => document.body?.innerText || "");
+      const msg = text
+        .split(/\n+/)
+        .map((l) => l.trim())
+        .find(
+          (l) =>
+            /invalid|valid gst|incorrect|not (a )?valid|does not match|already (exists|added)|mandatory|required/i.test(l) &&
+            l.length < 160
+        );
+      throw new CheckoutFailure(
+        "GST_SELECT_FAILED",
+        msg
+          ? `Flipkart rejected GST ${gstNumber}: ${msg}`
+          : `Flipkart did not accept GST ${gstNumber} — the Add GST form stayed open after Confirm`
+      );
+    }
   }
 
   private async clickGstEditInPicker(): Promise<void> {
@@ -3162,6 +3245,7 @@ export class FlipkartCheckout {
 
   private async clickContinueToCheckout(): Promise<void> {
     console.log("Clicking Continue to proceed to checkout...");
+    const contSince = Date.now();
 
     // Wait for the Continue button to appear
     let buttonFound = false;
@@ -3256,6 +3340,23 @@ export class FlipkartCheckout {
       console.log("Could not click Continue — opening remembered payments URL");
       await this.gotoPayments();
       return;
+    }
+
+    // CHECKOUT_PAYMENT_TOKEN_GENERATE is Flipkart deciding whether a payment page
+    // exists at all. When it refuses, it says why — and that reason never reaches
+    // the DOM, so without this the flow can only report "did not open payments".
+    const pay = this.api ? await this.api.waitForAction("CHECKOUT_PAYMENT_TOKEN_GENERATE", contSince, 15000) : null;
+    if (pay) {
+      console.log(
+        `[API] payment token: success=${pay.success} next=${(pay.landingUrl || "-").split("?")[0]}` +
+          `${pay.messages.length ? ` "${pay.messages.join(" ")}"` : ""}`
+      );
+      if (!pay.success || (!pay.landingUrl && pay.messages.length)) {
+        throw new CheckoutFailure(
+          "UNABLE_TO_PLACE_ORDER",
+          pay.messages.join(" ") || "Flipkart did not create the payment page"
+        );
+      }
     }
 
     console.log("Waiting for Continue → /payments ...");

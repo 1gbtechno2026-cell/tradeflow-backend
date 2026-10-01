@@ -6,9 +6,7 @@ import {
   readBatchProgress,
   releaseBatchReservation,
   reserveBatchSlot,
-  markBatchFiltered,
 } from "./batchCounters.js";
-import { CheckoutBatch } from "../models/CheckoutBatch.js";
 import {
   blockFlipkartLogout,
   desktopContext,
@@ -26,7 +24,6 @@ import { runPaymentPhase } from "./paymentPhase.js";
 import { FlipkartNetworkObserver } from "../automation/FlipkartNetworkObserver.js";
 import {
   CheckoutFailure,
-  classifyPageText,
   classifyThrownMessage,
   failureFields,
 } from "./checkoutErrors.js";
@@ -63,7 +60,7 @@ async function finishWithoutChrome(
   step: string,
   message: string,
   level: LogLevel = "info",
-  extra?: { failedStep?: string; filterReason?: string; batchStatus?: string; failure?: CheckoutFailure }
+  extra?: { failedStep?: string; failure?: CheckoutFailure }
 ) {
   const mapped = extra?.failure;
   await CheckoutJob.updateOne(
@@ -73,11 +70,9 @@ async function finishWithoutChrome(
         status,
         step,
         failedStep: extra?.failedStep || mapped?.failedStep || (status.startsWith("failed") ? step : ""),
-        error: status === "skipped" || status.startsWith("failed") || status === "filtered" ? message : "",
-        failureMessage: extra?.failedStep === "out_of_stock_pincode" || extra?.failedStep === "batch_filtered" || mapped ? message : "",
+        error: status === "skipped" || status.startsWith("failed") ? message : "",
+        failureMessage: mapped ? message : "",
         ...(mapped ? failureFields(mapped) : {}),
-        filterReason: extra?.filterReason || "",
-        batchStatus: extra?.batchStatus || "",
         completedAt: new Date(),
       },
       $push: { logs: { at: new Date(), level, step, message } },
@@ -96,12 +91,6 @@ async function maybeEnqueueRetry(
   if (latest?.status === "cancelled") return;
   const { quantityPerOrder, totalQuantity, totalAttempts } = batchLimits(data);
   const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
-  if (progress.status === "filtered") {
-    console.log(
-      `[${data.jobId}] [info] [batch] filtered (${progress.filterReason || "out_of_stock_pincode"}) — no retry`
-    );
-    return;
-  }
   if (progress.status === "completed" || progress.purchasedQuantity >= totalQuantity) {
     console.log(
       `[${data.jobId}] [info] [batch] target reached purchased=${progress.purchasedQuantity}/${totalQuantity} — no retry`
@@ -252,23 +241,6 @@ async function runClaimedCheckoutJob(
 ) {
 
   const { quantityPerOrder, totalQuantity, totalAttempts } = batchLimits(data);
-  const already = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
-  if (already.status === "filtered") {
-    await finishWithoutChrome(
-      data.jobId,
-      "skipped",
-      "batch_filtered",
-      `Batch already filtered (${already.filterReason || "out_of_stock_pincode"}) — Chrome not opened`,
-      "warn",
-      {
-        failedStep: "batch_filtered",
-        filterReason: already.filterReason || "out_of_stock_pincode",
-        batchStatus: "filtered",
-      }
-    );
-    return;
-  }
-
   const slot = await reserveBatchSlot({
     batchId: data.batchId,
     quantityPerOrder,
@@ -291,22 +263,6 @@ async function runClaimedCheckoutJob(
       "batch",
       `Attempt budget exhausted (${slot.attemptsUsed}/${totalAttempts}, purchased ${slot.purchasedQuantity}/${totalQuantity}) — Chrome not opened`,
       "error"
-    );
-    return;
-  }
-
-  if (slot.kind === "skip_filtered") {
-    await finishWithoutChrome(
-      data.jobId,
-      "skipped",
-      "batch_filtered",
-      `Batch already filtered (${slot.filterReason || "out_of_stock_pincode"}) — Chrome not opened`,
-      "warn",
-      {
-        failedStep: "batch_filtered",
-        filterReason: slot.filterReason || "out_of_stock_pincode",
-        batchStatus: "filtered",
-      }
     );
     return;
   }
@@ -385,51 +341,6 @@ async function runClaimedCheckoutJob(
   };
 
   const jobPincode = (address.checkoutPincode || address.pincode || "").replace(/\D/g, "").slice(-6);
-
-  const applyOutOfStockFilter = async (rawMessage: string, failure?: CheckoutFailure) => {
-    const mapped =
-      failure ||
-      classifyPageText(rawMessage, jobPincode) ||
-      new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", rawMessage);
-    console.log(
-      `[${data.jobId}] [info] [batch] filtered: ${mapped.code} for pincode ${jobPincode} — batch stopped, no retry`
-    );
-    log("error", rawMessage, mapped.failedStep);
-    await releaseReservation();
-    const filteredCount = await markBatchFiltered(data.batchId, "out_of_stock_pincode");
-    const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
-    await CheckoutBatch.findOneAndUpdate(
-      { batchId: data.batchId },
-      {
-        $set: {
-          batchStatus: "filtered",
-          filterReason: "out_of_stock_pincode",
-          filteredCount,
-          purchasedQuantity: progress.purchasedQuantity,
-          attemptsUsed: progress.attemptsUsed,
-        },
-      }
-    );
-    const now = new Date();
-    await CheckoutJob.updateOne(
-      { _id: data.jobId, status: { $ne: "cancelled" } },
-      {
-        $set: {
-          status: "filtered",
-          step: mapped.failedStep,
-          filterReason: "out_of_stock_pincode",
-          failedAt: now,
-          batchStatus: "filtered",
-          completedAt: now,
-          ...failureFields(mapped),
-        },
-      }
-    );
-    await CheckoutJob.updateMany(
-      { batchId: data.batchId, _id: { $ne: data.jobId } },
-      { $set: { batchStatus: "filtered", filterReason: "out_of_stock_pincode" } }
-    );
-  };
 
   log(
     "info",
@@ -528,11 +439,10 @@ async function runClaimedCheckoutJob(
     }
     const oosOnProduct = await checkout.detectOutOfStockForPincode(jobPincode);
     if (oosOnProduct.matched) {
-      await applyOutOfStockFilter(
+      throw new CheckoutFailure(
+        "PRODUCT_NOT_SERVICEABLE",
         oosOnProduct.rawMessage || `Currently out of stock for ${jobPincode}`
       );
-      await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-      return;
     }
     await checkout.gotoViewCart();
     try {
@@ -548,9 +458,7 @@ async function runClaimedCheckoutJob(
 
     const oosOnCart = await checkout.detectOutOfStockForPincode(jobPincode);
     if (oosOnCart.matched) {
-      await applyOutOfStockFilter(oosOnCart.rawMessage || `Currently out of stock for ${jobPincode}`);
-      await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-      return;
+      throw new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", oosOnCart.rawMessage || `Currently out of stock for ${jobPincode}`);
     }
 
     if (data.deliverySlaDays == null) {
@@ -693,29 +601,25 @@ async function runClaimedCheckoutJob(
     for (const s of netObserver.getBlocks().slice(-3)) {
       log("warn", `[net] ${s.kind}: ${s.text} — ${s.url}`, "net");
     }
-    if (err instanceof OutOfStockPincodeError) {
-      await applyOutOfStockFilter(err.rawMessage);
-      await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-      return;
-    }
-    if (err instanceof CheckoutFailure && err.filterBatch) {
-      await applyOutOfStockFilter(err.details, err);
-      await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-      return;
-    }
+    // Every failure is THIS job's failure, recorded on this job with its own
+    // reason. Out of stock / not deliverable used to stop the whole batch here;
+    // they no longer do — the next platform ID gets its own attempt, because a
+    // product Flipkart refuses to one account may still be sold to another.
     const rawMessage = err instanceof Error ? err.message : String(err);
+    let failure = err instanceof CheckoutFailure ? err : null;
+    if (!failure && err instanceof OutOfStockPincodeError) {
+      failure = new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", err.rawMessage);
+    }
     if (
-      /Execution context was destroyed|most likely because of a navigation/i.test(rawMessage) &&
-      checkout
+      !failure &&
+      checkout &&
+      /Execution context was destroyed|most likely because of a navigation/i.test(rawMessage)
     ) {
       const oos = await checkout.detectOutOfStockForPincode(jobPincode).catch(() => ({ matched: false as const }));
       if (oos.matched) {
-        await applyOutOfStockFilter(oos.rawMessage || `Currently out of stock for ${jobPincode}`);
-        await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-        return;
+        failure = new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", oos.rawMessage || `Currently out of stock for ${jobPincode}`);
       }
     }
-    let failure = err instanceof CheckoutFailure ? err : null;
     if (!failure && checkout) {
       failure = await checkout.detectCheckoutBlocker(jobPincode).catch(() => null);
     }
@@ -734,7 +638,11 @@ async function runClaimedCheckoutJob(
       }
     );
     await releaseReservation();
-    await maybeEnqueueRetry(data, job.userId, failedStep, job.request);
+    if (failure.noRetry) {
+      log("info", `${failure.code} is a verdict on this platform ID — not re-queued; the batch continues with the next ID`, "batch");
+    } else {
+      await maybeEnqueueRetry(data, job.userId, failedStep, job.request);
+    }
     await sleep(Math.min(config.keepBrowserOpenMs, 15000));
   } finally {
     netObserver.dispose();

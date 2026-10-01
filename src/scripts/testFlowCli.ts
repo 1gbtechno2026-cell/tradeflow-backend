@@ -43,6 +43,9 @@ const CASES: CaseDef[] = [
   // for <pincode>", which is a different page and filters the batch.
   { id: "oos", title: "Out of stock / sold out product", patch: {}, expect: "PRODUCT_UNAVAILABLE" },
   { id: "pincode", title: "Not deliverable to this pincode", patch: {}, expect: "ITEM_NOT_DELIVERABLE" },
+  // Flipkart offers COD per account/product/address. With paymentMode "cod" the
+  // probe reads the Cash on Delivery row; "Unavailable" is this ID's verdict.
+  { id: "cod", title: "Cash on Delivery unavailable", patch: { paymentMode: "cod", stopAfter: "payment_probe" }, expect: "COD_UNAVAILABLE" },
   {
     id: "qty",
     title: "Desired quantity is not available",

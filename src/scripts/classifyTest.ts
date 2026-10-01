@@ -30,8 +30,8 @@ const CASES: Case[] = [
     pin: "122017",
     expect: "PINCODE_NOT_SET",
     why:
-      "was ITEM_NOT_DELIVERABLE, which has filterBatch:true — so a page state a retry " +
-      "fixes marked the whole batch filtered and queued no retry",
+      "was ITEM_NOT_DELIVERABLE, a per-ID verdict that is never retried — so a page " +
+      "state a retry fixes failed the ID for good (and, back then, stopped the batch)",
   },
   {
     name: "enter delivery pincode (cart)",
@@ -112,14 +112,27 @@ for (const c of CASES) {
   }
 }
 
-console.log("\nBatch-filtering — which codes may stop an ENTIRE batch");
-for (const code of ["ITEM_NOT_DELIVERABLE", "PRODUCT_NOT_SERVICEABLE", "PINCODE_NOT_SET"] as const) {
+console.log("\nPer-ID verdicts — the same platform ID is not re-queued after these (the next ID is the retry)");
+const VERDICTS = [
+  "PRODUCT_UNAVAILABLE",
+  "PRODUCT_NOT_SERVICEABLE",
+  "ITEM_NOT_DELIVERABLE",
+  "MAX_UNITS_REACHED",
+  "COD_UNAVAILABLE",
+] as const;
+for (const code of [...VERDICTS, "PINCODE_NOT_SET"] as const) {
   const def = CHECKOUT_ERRORS[code];
-  console.log(`  ${code.padEnd(26)} filterBatch=${Boolean(def.filterBatch)}`);
+  console.log(`  ${code.padEnd(26)} noRetry=${Boolean(def.noRetry)}`);
 }
-if (CHECKOUT_ERRORS.PINCODE_NOT_SET.filterBatch) {
+if (CHECKOUT_ERRORS.PINCODE_NOT_SET.noRetry) {
   failures += 1;
-  console.log("  FAIL PINCODE_NOT_SET must NOT filter the batch — it is a retryable page state");
+  console.log("  FAIL PINCODE_NOT_SET must be retried — it is a page state, not a verdict");
+}
+for (const code of VERDICTS) {
+  if (!CHECKOUT_ERRORS[code].noRetry) {
+    failures += 1;
+    console.log(`  FAIL ${code} is a verdict on this ID — re-running the same ID shows the same page`);
+  }
 }
 
 console.log("\nThrown-message mapping");
@@ -127,6 +140,7 @@ for (const [msg, want] of [
   ["Enter pincode to see if the product is in stock (122017)", "PINCODE_NOT_SET"],
   ["Session expired: Flipkart showed the login page on viewcart", "SESSION_EXPIRED"],
   ["Product not in viewcart", "ADD_TO_CART_FAILED"],
+  ["Cash on Delivery is unavailable for this cart on this account/pincode", "COD_UNAVAILABLE"],
 ] as const) {
   const got = classifyThrownMessage(msg).code;
   const pass = got === want;

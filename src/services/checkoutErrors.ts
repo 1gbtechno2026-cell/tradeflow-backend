@@ -17,6 +17,7 @@ export type CheckoutErrorCode =
   | "CART_AMOUNT_LIMIT"
   | "SESSION_EXPIRED"
   | "PINCODE_NOT_SET"
+  | "COD_UNAVAILABLE"
   | "INSUFFICIENT_BALANCE"
   | "CARD_AUTH_FAILED"
   | "OTP_TIMEOUT"
@@ -29,7 +30,14 @@ export interface CheckoutErrorDef {
   source: CheckoutErrorSource;
   failedStep: string;
   stageDisplay: string;
-  filterBatch?: boolean;
+  /**
+   * A verdict about THIS platform ID on THIS product. Running the same ID again
+   * shows the same page, so the job is not re-queued; the next ID in the batch is
+   * the retry. Nothing here ever stops the batch — a product that is out of stock
+   * or undeliverable for one account may still go through on another, and the
+   * operator wants every selected ID attempted, each reporting its own reason.
+   */
+  noRetry?: boolean;
 }
 
 export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
@@ -39,6 +47,7 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "PLATFORM",
     failedStep: "product",
     stageDisplay: "Adding to cart",
+    noRetry: true,
   },
   PRODUCT_NOT_SERVICEABLE: {
     code: "PRODUCT_NOT_SERVICEABLE",
@@ -46,7 +55,7 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "PLATFORM",
     failedStep: "out_of_stock_pincode",
     stageDisplay: "Adding to cart",
-    filterBatch: true,
+    noRetry: true,
   },
   ITEM_NOT_DELIVERABLE: {
     code: "ITEM_NOT_DELIVERABLE",
@@ -54,7 +63,7 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "PLATFORM",
     failedStep: "product",
     stageDisplay: "Adding to cart",
-    filterBatch: true,
+    noRetry: true,
   },
   MAX_UNITS_REACHED: {
     code: "MAX_UNITS_REACHED",
@@ -62,6 +71,8 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "PLATFORM",
     failedStep: "product",
     stageDisplay: "Adding to cart",
+    // The cap is per account: this ID has had its allowance of this product.
+    noRetry: true,
   },
   ADD_TO_CART_FAILED: {
     code: "ADD_TO_CART_FAILED",
@@ -143,15 +154,12 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
   /**
    * Flipkart is asking for a delivery pincode — it has not judged the product yet.
    *
-   * Its own code, because it used to be ITEM_NOT_DELIVERABLE, which carries
-   * filterBatch: true. That turned "we have not told Flipkart the pincode" into
-   * "this product cannot be delivered here", marked the ENTIRE batch filtered and
-   * queued no retry. A fixable, transient page state permanently killed a batch —
-   * exactly what happened on 2026-09-30, where a single job ended the run with
-   * purchased 0.
-   *
-   * filterBatch is deliberately absent (false): this says nothing about
-   * deliverability, so nothing about the other jobs in the batch should change.
+   * Its own code, because it used to be ITEM_NOT_DELIVERABLE. Back when a
+   * deliverability verdict stopped the whole batch, that turned "we have not told
+   * Flipkart the pincode" into "this product cannot be delivered here" and ended
+   * a run with purchased 0 on 2026-09-30. Batches are no longer stopped by any
+   * code, but the distinction still matters: this is a page state a retry fixes,
+   * so the same ID IS re-queued (noRetry absent), unlike a real verdict.
    */
   PINCODE_NOT_SET: {
     code: "PINCODE_NOT_SET",
@@ -159,6 +167,21 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "PLATFORM",
     failedStep: "pincode",
     stageDisplay: "Product",
+  },
+  /**
+   * The payments page lists "Cash on Delivery — Unavailable". Flipkart decides
+   * this per account, product and address, so with payment mode COD it is a
+   * verdict on this platform ID: recorded on this job, not retried on the same
+   * ID, and the batch goes on — another ID may well be offered COD for the same
+   * cart. Was reported as UNABLE_TO_PLACE_ORDER, which hid the actual reason.
+   */
+  COD_UNAVAILABLE: {
+    code: "COD_UNAVAILABLE",
+    display: "Cash on Delivery unavailable for this order",
+    source: "PLATFORM",
+    failedStep: "payment",
+    stageDisplay: "Processing Payment",
+    noRetry: true,
   },
   INSUFFICIENT_BALANCE: {
     code: "INSUFFICIENT_BALANCE",
@@ -204,7 +227,7 @@ export class CheckoutFailure extends Error {
   readonly details: string;
   readonly failedStep: string;
   readonly stageDisplay: string;
-  readonly filterBatch: boolean;
+  readonly noRetry: boolean;
 
   constructor(code: CheckoutErrorCode, details: string, overrides?: Partial<CheckoutErrorDef>) {
     const def = { ...CHECKOUT_ERRORS[code], ...overrides };
@@ -216,7 +239,7 @@ export class CheckoutFailure extends Error {
     this.details = details || def.display;
     this.failedStep = def.failedStep;
     this.stageDisplay = def.stageDisplay;
-    this.filterBatch = Boolean(def.filterBatch);
+    this.noRetry = Boolean(def.noRetry);
   }
 }
 
@@ -389,6 +412,9 @@ export function classifyThrownMessage(message: string, pageText = ""): CheckoutF
   if (/unable to place/i.test(m)) return new CheckoutFailure("UNABLE_TO_PLACE_ORDER", m);
   if (/OTP/i.test(m) && /timeout/i.test(m)) return new CheckoutFailure("OTP_TIMEOUT", m);
   if (/OTP/i.test(m)) return new CheckoutFailure("OTP_NOT_FOUND", m);
+  if (/cash on delivery.*(unavailable|not available)|\bCOD\b.*(unavailable|not available)/i.test(m)) {
+    return new CheckoutFailure("COD_UNAVAILABLE", m);
+  }
   if (/insufficient/i.test(m)) return new CheckoutFailure("INSUFFICIENT_BALANCE", m);
   return new CheckoutFailure("UNKNOWN", m);
 }

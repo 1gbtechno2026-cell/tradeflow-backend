@@ -500,11 +500,15 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
         const available = await fk.isCodAvailable();
         await capture("11-cod-row", `isCodAvailable() = ${available}`);
         console.log(`  isCodAvailable() = ${available}`);
+        // Same verdict the worker gives: with COD chosen, a page that lists Cash
+        // on Delivery as Unavailable is this ID's outcome, whether or not the run
+        // was going to pay.
+        if (!available) {
+          throw new CheckoutFailure("COD_UNAVAILABLE", "Cash on Delivery is unavailable for this cart on this account/pincode");
+        }
         if (stopAfter === "pay") {
           if (!cfg.payLive) {
             console.log("  stopAfter=pay but payLive is not set — NOT placing the order");
-          } else if (!available) {
-            throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "COD is not available for this cart/pincode");
           } else {
             await fk.payWithCod();
             const confirmation = await fk.waitForOrderConfirmation();

@@ -109,8 +109,9 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
     }
     try {
       if (!(await fk.isCodAvailable())) {
-        // Per product AND per pincode, so this is a real outcome rather than a bug.
-        throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "Cash on Delivery is not available for this cart/pincode");
+        // Per account, product and pincode: a real outcome for THIS platform ID,
+        // not a bug and not a reason to stop the batch.
+        throw new CheckoutFailure("COD_UNAVAILABLE", "Cash on Delivery is unavailable for this cart on this account/pincode");
       }
       await fk.payWithCod();
       const confirmation = await fk.waitForOrderConfirmation();

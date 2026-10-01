@@ -228,6 +228,16 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       fs.writeFileSync(`${base}.txt`, `URL: ${page.url()}\nSTEP: ${step}\n\n${text}`, "utf8");
       textFile = `${base}.txt`;
     } catch { /* same */ }
+    try {
+      // The DOM, not just the rendered text. Selector bugs are invisible in a
+      // screenshot and unreproducible from innerText: the GST block failure on
+      // 2026-10-01 was a question about which ANCESTOR contains which children,
+      // which only the markup can answer. Saving it means a selector can be
+      // re-tested offline against the real page instead of by re-running a
+      // 40-second checkout each time.
+      const html = String(await page.evaluate(() => document.documentElement.outerHTML).catch(() => ""));
+      if (html) fs.writeFileSync(`${base}.html`, html, "utf8");
+    } catch { /* same */ }
     artifacts.push({ step, at: new Date().toISOString(), url: page.url(), screenshot, textFile, note });
     publish();
   };

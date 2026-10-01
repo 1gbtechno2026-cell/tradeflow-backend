@@ -2386,27 +2386,34 @@ export class FlipkartCheckout {
       const qtyText = await this.evaluate(() => {
         // Look for quantity near "Qty" text or a number near product info
         const allDivs = Array.from(document.querySelectorAll("div"));
+
+        // PASS 1: the label. "Qty: 1" is unambiguous and is what the page actually
+        // renders, so it is tried before any heuristic.
         for (const d of allDivs) {
           const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
-          // Flipkart often shows "Qty: N" or just the number next to product
-          if (/^[\d]+$/.test(txt) && d.offsetParent !== null) {
-            // Check if this div is near a qty-related parent
-            let el: HTMLElement | null = d.parentElement;
-            let found = false;
-            while (el && el !== document.body) {
-              const parentTxt = (el.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
-              if (parentTxt.includes("qty")) {
-                found = true;
-                break;
-              }
-              el = el.parentElement;
-            }
-            if (found) return txt;
-          }
-          // Also try: look for a div where the text starts with "Qty"
-          if (txt.toLowerCase().startsWith("qty")) {
-            const match = txt.match(/qty[:\s]*(\d+)/i);
-            if (match) return match[1];
+          const match = txt.match(/\bqty\b[:\s]*(\d{1,3})\b/i);
+          if (match) return match[1];
+        }
+
+        // PASS 2: a bare number sitting inside something that mentions qty.
+        //
+        // This used to run FIRST and unbounded, and it read the delivery address's
+        // PHONE NUMBER as the quantity — "7256809635 vs 50 — correcting...". The
+        // phone is a pure-digit div, the order-summary card contains both it and
+        // the Qty row, so walking up from the phone finds an ancestor containing
+        // "qty" and the scan returns it because it comes first in document order.
+        // The flow then tried to "correct" a ten-digit quantity, failed to find
+        // APPLY, and continued at the wrong quantity with only a warning.
+        //
+        // Now bounded three ways: at most 3 digits (Flipkart caps far below 1000),
+        // at most 3 ancestors up (a phone and a Qty row are cousins, not parent and
+        // child), and a plausibility check on the value.
+        for (const d of allDivs) {
+          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
+          if (!/^\d{1,3}$/.test(txt) || d.offsetParent === null) continue;
+          let el: HTMLElement | null = d.parentElement;
+          for (let up = 0; el && el !== document.body && up < 3; up++, el = el.parentElement) {
+            if (/\bqty\b/i.test((el.innerText || "").replace(/\s+/g, " "))) return txt;
           }
         }
         // Fallback: look for any number input or select with quantity

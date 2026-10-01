@@ -106,6 +106,9 @@ export async function launchStealthBrowser(options?: { headless?: boolean }): Pr
   });
 }
 
+/** How tall the emulated phone is. Width stays the device's own — see mobileContext. */
+const MOBILE_VIEWPORT_HEIGHT = Number(process.env.MOBILE_VIEWPORT_HEIGHT || 1400);
+
 /** Desktop Flipkart: account pages, the address book, the cart. */
 export async function desktopContext(browser: Browser): Promise<BrowserContext> {
   const context = await browser.newContext({
@@ -143,6 +146,14 @@ export async function mobileContext(browser: Browser, deviceName?: string): Prom
   if (!device) throw new Error(`Unknown Playwright device "${name}"`);
   const context = await browser.newContext({
     ...device,
+    // TALLER, never wider.
+    //
+    // Flipkart's breakpoint is driven by WIDTH (and the UA). Widening this would
+    // flip it back to the desktop DOM and undo the whole m-site fix. Height is
+    // free: more of the page is on screen at once, so drawers, APPLY buttons and
+    // sticky bars are in view rather than below the fold, and anything that reads
+    // geometry or visibility has more to work with.
+    viewport: { width: device.viewport?.width ?? 412, height: MOBILE_VIEWPORT_HEIGHT },
     locale: "en-IN",
     timezoneId: resolveTimezoneId(),
     colorScheme: "light",

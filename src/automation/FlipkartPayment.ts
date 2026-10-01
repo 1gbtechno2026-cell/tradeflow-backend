@@ -2,6 +2,7 @@ import type { Page } from "playwright";
 import { CheckoutFailure } from "../services/checkoutErrors.js";
 import type { CardDetails } from "../paymentStrategies/types.js";
 import type { LogLevel } from "../types.js";
+import type { PaymentApiWatcher } from "./PaymentApiWatcher.js";
 
 export type PaymentLogger = (level: LogLevel, message: string, step?: string) => void;
 
@@ -15,6 +16,10 @@ export interface OrderConfirmation {
 }
 
 export class FlipkartPayment {
+  /** The payment page's API responses, when a watcher is attached. Optional:
+   *  every use below falls back to the page alone. */
+  api: PaymentApiWatcher | null = null;
+
   constructor(
     private readonly page: Page,
     private readonly log: PaymentLogger
@@ -335,8 +340,14 @@ export class FlipkartPayment {
       .first();
     if (!(await modal.isVisible().catch(() => false))) return null;
     const text = (await modal.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
-    this.log("warn", `[fk-pay] Flipkart payment failure modal: "${text}"`, "payment");
-    return new CheckoutFailure("PAYMENT_FAILED", text || "Your payment couldn't be processed due to a technical error");
+    // The gateway's own code and transaction id, when the watcher saw the
+    // response behind the modal: "[gateway: PAYZIPPY_TECHNICAL_ERROR, txn …]".
+    const tag = this.api?.gatewayTag() ?? "";
+    this.log("warn", `[fk-pay] Flipkart payment failure modal: "${text}"${tag}`, "payment");
+    return new CheckoutFailure(
+      "PAYMENT_FAILED",
+      `${text || "Your payment couldn't be processed due to a technical error"}${tag}`
+    );
   }
 
   async detectCardRejectedByFlipkart(): Promise<CheckoutFailure | null> {

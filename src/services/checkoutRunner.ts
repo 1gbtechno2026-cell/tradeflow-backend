@@ -2,6 +2,7 @@ import type { Page } from "playwright";
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
 import { FlipkartApiWatcher } from "../automation/FlipkartApiWatcher.js";
+import { PaymentApiWatcher } from "../automation/PaymentApiWatcher.js";
 import {
   readBatchProgress,
   releaseBatchReservation,
@@ -329,6 +330,7 @@ async function runClaimedCheckoutJob(
   const deskContext = await desktopContext(deskBrowser);
     apiWatcher.attach(deskContext);
   let mobBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
+  let paymentApi: PaymentApiWatcher | null = null;
   // Reassigned when the job moves to the mobile leg; everything below reads
   // whichever page is current.
   let page: Page = await deskContext.newPage();
@@ -385,6 +387,7 @@ async function runClaimedCheckoutJob(
     mobBrowser = await launchMobileBrowser({ headless: config.headless });
     const mobContext = await mobileContext(mobBrowser);
     apiWatcher.attach(mobContext);
+    paymentApi = new PaymentApiWatcher().attach(mobContext);
     page = await mobContext.newPage();
     await blockFlipkartLogout(page);
     netObserver = FlipkartNetworkObserver.attach(page);
@@ -558,7 +561,7 @@ async function runClaimedCheckoutJob(
     // Reaching payment is no longer the end of the road for a card order. The
     // reservation is held until the payment phase resolves: releasing it here
     // would let a sibling job claim the slot this order is about to spend.
-    const payment = await runPaymentPhase({ page, data, log, dryRun: PAYMENT_DRY_RUN });
+    const payment = await runPaymentPhase({ page, data, log, dryRun: PAYMENT_DRY_RUN, paymentApi });
     if (payment.attempted) {
       if (!payment.ok) throw payment.failure;
       job.status = "paid";

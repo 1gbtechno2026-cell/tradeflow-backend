@@ -1,5 +1,6 @@
 import type { Page } from "playwright";
 import { FlipkartPayment, type OrderConfirmation } from "../automation/FlipkartPayment.js";
+import type { PaymentApiWatcher } from "../automation/PaymentApiWatcher.js";
 import { authenticatePayment, UnsupportedPaymentError } from "../paymentStrategies/index.js";
 import type { AuthType, CardDetails, PaymentResult } from "../paymentStrategies/types.js";
 import { CheckoutFailure } from "./checkoutErrors.js";
@@ -39,6 +40,8 @@ export interface PaymentPhaseInput {
   data: CheckoutJobData;
   log: (level: LogLevel, message: string, step?: string) => void;
   dryRun?: boolean;
+  /** Payment-page API watcher, so a failure carries the gateway's status code. */
+  paymentApi?: PaymentApiWatcher | null;
 }
 
 export type PaymentPhaseOutcome =
@@ -84,6 +87,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
   const { data, log } = input;
   const mode = paymentModeClass(data);
   const fk = new FlipkartPayment(input.page, log);
+  fk.api = input.paymentApi ?? null;
 
   if (mode === "unsupported") {
     return { attempted: false, reason: `payment_mode=${data.paymentMode || "(unset)"} is not handled here` };

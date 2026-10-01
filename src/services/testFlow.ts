@@ -6,6 +6,7 @@ import { config } from "../config.js";
 import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
 import { FlipkartApiWatcher } from "../automation/FlipkartApiWatcher.js";
 import { FlipkartPayment } from "../automation/FlipkartPayment.js";
+import { PaymentApiWatcher } from "../automation/PaymentApiWatcher.js";
 import {
   blockFlipkartLogout,
   desktopContext,
@@ -137,6 +138,20 @@ export interface TestFlowResult {
    * harness has no pool, so nothing is actually paused or retired.
    */
   cardVerdict?: { kind: "keep" | "paused" | "dead"; reason: string; pausedUntil?: string };
+  /**
+   * What the payment gateway itself answered to the Pay press — status code,
+   * message, transaction id — read passively from the page's own API traffic.
+   * The full redacted request/response log is in network/payments.json.
+   */
+  gateway?: {
+    responseStatus: string | null;
+    statusCode: string | null;
+    message: string | null;
+    responseType: string | null;
+    txnId: string | null;
+    calls: number;
+    file: string | null;
+  };
 }
 
 /** Codes that only say WHERE it broke — the page text usually says why. */
@@ -309,6 +324,23 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
   // One watcher for the whole run: the flow spans two browsers and the add-to-cart
   // answer arrives on the mobile leg while the address list arrives on the desktop one.
   const apiWatcher = new FlipkartApiWatcher();
+  // The payment page's own API traffic, redacted, for the run folder. The
+  // gateway's status_code is the only place the reason behind Flipkart's
+  // "technical error" modal is written down.
+  const paymentApi = new PaymentApiWatcher();
+  const gatewaySummary = (): TestFlowResult["gateway"] => {
+    if (!paymentApi.calls.length) return undefined;
+    const g = paymentApi.lastGatewayResult();
+    return {
+      responseStatus: g?.responseStatus ?? null,
+      statusCode: g?.statusCode ?? null,
+      message: g?.message ?? null,
+      responseType: g?.responseType ?? null,
+      txnId: g?.txnId ?? null,
+      calls: paymentApi.calls.length,
+      file: paymentApi.writeTo(dir),
+    };
+  };
   const desktopBrowser = await launchStealthBrowser({ headless: cfg.headless ?? config.headless });
   let mobileBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
   let reachedPayments = false;
@@ -376,6 +408,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
     mobileBrowser = await launchMobileBrowser({ headless: cfg.headless ?? config.headless });
     const mob = await mobileContext(mobileBrowser, cfg.mobileDevice);
     apiWatcher.attach(mob);
+    paymentApi.attach(mob);
     const mobPage = await mob.newPage();
     page = mobPage;
     await blockFlipkartLogout(mobPage);
@@ -496,6 +529,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
     if (reachedPayments && (stopAfter !== "payments" || mode === "cod")) {
       await step(9, `Payment surface (${stopAfter})`);
       const fk = new FlipkartPayment(mobPage, (lvl, msg) => log(lvl, msg));
+      fk.api = paymentApi;
 
       /**
        * The final amount, checked at the only place it is final.
@@ -621,6 +655,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       // snapshot, so a finished run could not say what it was asked to do.
       config: redactConfig(cfg),
       logFile,
+      gateway: gatewaySummary(),
     };
     publish({ ...result, running: false });
     writeResult(dir, result);
@@ -648,7 +683,11 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       };
       console.log(`  card pool verdict: ${v.kind} — ${v.reason}${cardVerdict.pausedUntil ? ` (until ${cardVerdict.pausedUntil})` : ""}`);
     }
-    const result: TestFlowResult = { ...explained, config: redactConfig(cfg), logFile, cardVerdict };
+    const gateway = gatewaySummary();
+    if (gateway?.statusCode || gateway?.message) {
+      console.log(`  gateway said: ${gateway.responseStatus || "?"} ${gateway.statusCode || ""} "${gateway.message || ""}"${gateway.txnId ? ` txn ${gateway.txnId}` : ""}`);
+    }
+    const result: TestFlowResult = { ...explained, config: redactConfig(cfg), logFile, cardVerdict, gateway };
     publish({ ...result, running: false });
     writeResult(dir, result);
     return result;

@@ -622,7 +622,7 @@ async function runClaimedCheckoutJob(
     const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
     log(
       "info",
-      `Stopped at payment page: ${page.url()} — leaving Chrome open so you can watch (batch purchased ${progress.purchasedQuantity}/${totalQuantity}, attempts ${progress.attemptsUsed}/${totalAttempts}${progress.status === "completed" ? ", batch complete" : ""})`,
+      `${payment.attempted ? "Finished on" : "Stopped at payment page:"} ${page.url().split("?")[0]} — leaving Chrome open so you can watch (batch purchased ${progress.purchasedQuantity}/${totalQuantity}, attempts ${progress.attemptsUsed}/${totalAttempts}${progress.status === "completed" ? ", batch complete" : ""})`,
       "payment"
     );
     await sleep(config.keepBrowserOpenMs);

@@ -40,7 +40,10 @@ export interface PaymentGatewayResult {
   at: string;
 }
 
-const PAYMENT_HOST = /^https:\/\/([a-z0-9-]+\.)*(pay\.flipkart\.com|rome\.api\.flipkart\.com)\//i;
+// Any flipkart.com host: the gateway call (paywithdetails) was NOT on
+// pay.flipkart.com or rome — the first recording caught 14 rome calls and
+// missed the one that mattered. XHR/fetch only, so no assets.
+const PAYMENT_HOST = /^https:\/\/([a-z0-9-]+\.)*flipkart\.com\//i;
 
 export function redact(text: string): string {
   return String(text || "")

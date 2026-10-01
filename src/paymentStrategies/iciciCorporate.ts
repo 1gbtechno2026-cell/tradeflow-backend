@@ -1,3 +1,4 @@
+import { CheckoutFailure } from "../services/checkoutErrors.js";
 import { requestAndAwaitOtp, withLeasedPhone } from "./shared/otpEntry.js";
 import type { PaymentContext, PaymentResult, PaymentStrategy } from "./types.js";
 
@@ -10,10 +11,11 @@ import type { PaymentContext, PaymentResult, PaymentStrategy } from "./types.js"
  * lease for the duration of this run, so the SMS webhook can attribute the
  * incoming code to the right order.
  *
- * SELECTORS ARE TODO. Everything around them — lease, correlation, card
- * verification, release — is finished and tested. The ordering inside
- * withLeasedPhone/requestAndAwaitOtp is load-bearing; fill in the four page
- * steps without moving them.
+ * Lease, correlation, card verification and release are finished and tested
+ * (test:otp-plumbing). The identity and OTP-request steps are written from the
+ * page captured on 2026-10-01; the OTP-entry step is written once Run 2 has
+ * captured that page. The ordering inside withLeasedPhone/requestAndAwaitOtp
+ * is load-bearing — see selectCorporateIdentity.
  */
 export const iciciCorporate: PaymentStrategy = {
   cardTypeName: "ICICI_CORP_VIRTUAL",
@@ -98,57 +100,114 @@ export const iciciCorporate: PaymentStrategy = {
 //    confirmed from the page, throw.
 // ---------------------------------------------------------------------------
 
+// ── THE PAGE, as captured on 2026-10-01 (run card-2026-10-01T11-09-09) ──────
+//
+//   https://secure-acs2ui-…wibmo.com/v1/acs/services/browser/creq/…
+//   No iframe. <form id="authPasswordSet2">
+//     Merchant Name / Date / Amount / Unique Reference ID   (read-only rows)
+//     <input type="password" id="corporateId" name="corporateId">
+//     <input type="password" id="employeeId"  name="employeeId">
+//     <a class="btn primary__btn" onclick="submit()">Submit</a>
+//     <a class="btn cancel__btn">Cancel</a>
+//   "This screen will automatically time out after 7 minutes."
+//
+// Wibmo is ICICI's 3-D Secure provider; the page is theirs, not Flipkart's.
+
+const CORPORATE_INPUT = "#corporateId";
+const EMPLOYEE_INPUT = "#employeeId";
+const SUBMIT_CONTROL = 'a.primary__btn, a[onclick*="submit"], button:has-text("Submit"), input[type="submit"]';
+/** Anything the ACS might render to take the code with — the OTP page has not
+ *  been captured yet, so this is deliberately wide and is narrowed after Run 2. */
+const OTP_INPUT =
+  'input[name*="otp" i], input[id*="otp" i], input[type="tel"], input[type="number"], ' +
+  'input[autocomplete="one-time-code"], input[type="password"]:not(#corporateId):not(#employeeId)';
+const IDENTITY_REJECTED =
+  /invalid|incorrect|not (?:valid|found|registered|recogni[sz]ed)|does not (?:exist|match)|wrong (?:corporate|employee)/i;
+
+function pageText(ctx: PaymentContext): Promise<string> {
+  return ctx.page
+    .evaluate(() => document.body?.innerText || "")
+    .then((t) => String(t).replace(/ /g, " "))
+    .catch(() => "");
+}
+
 /**
- * Type the Corporate ID and select the Employee ID.
+ * Type the Corporate ID and the Employee ID — and ONLY type them.
  *
- * NEEDS
- *   - the Corporate ID input
- *   - the Employee ID input or dropdown. If it is a dropdown, match the option by
- *     its VALUE/text equal to `employeeId`, never by position — the lease picks an
- *     arbitrary free employee, so index 0 is almost never the right one.
- *   - confirmation that the identity was accepted (the OTP step becoming available)
- *
- * WATCH FOR
- *   - an iframe around the 3-D Secure form.
- *   - ICICI rejecting the employee id. That means employeephones and the bank
- *     disagree; put the id in the failure detail so it is fixable.
+ * On this page there is no separate "send OTP" button: Submit is what makes
+ * the bank text the handset. So the fields are filled here, before
+ * requestAndAwaitOtp stamps `submittedAt`, and submitted in submitForOtp,
+ * after it. Pressing Submit here would let a fast SMS land before the stamp
+ * and be refused as a code from an earlier transaction.
  */
 async function selectCorporateIdentity(
-  _ctx: PaymentContext,
-  _corporateId: string,
-  _employeeId: string
+  ctx: PaymentContext,
+  corporateId: string,
+  employeeId: string
 ): Promise<void> {
-  throw new Error("iciciCorporate.selectCorporateIdentity not implemented — run with PAYMENT_DRY_RUN=true");
+  const corp = ctx.page.locator(CORPORATE_INPUT).first();
+  try {
+    await corp.waitFor({ state: "visible", timeout: 20_000 });
+  } catch {
+    throw new CheckoutFailure(
+      "UNABLE_TO_PLACE_ORDER",
+      `ICICI's 3-D Secure page did not show the Corporate ID field within 20s (on ${ctx.page.url().split("?")[0]})`
+    );
+  }
+  await corp.fill(corporateId, { timeout: 10_000 });
+  await ctx.page.locator(EMPLOYEE_INPUT).first().fill(employeeId, { timeout: 10_000 });
+  ctx.log("info", `[pay] ICICI: corporate ${corporateId} / employee ${employeeId} entered — not yet submitted`);
 }
 
 /**
- * Press the button that makes ICICI dispatch the OTP.
+ * Press Submit — the request that makes ICICI dispatch the OTP — and return as
+ * soon as the page shows it was accepted: the OTP step rendered. A rejection
+ * of the identity is named with the bank's text and both ids, because it means
+ * employeephones and the bank disagree, which is an onboarding fix.
  *
- * NEEDS
- *   - the send/generate OTP button
- *   - confirmation it was accepted (the OTP input appearing, a "code sent" notice,
- *     a resend timer starting)
- *
- * Return as soon as the request is accepted. Do NOT wait for the SMS here —
- * requestAndAwaitOtp owns that, and it is the only place that can prove a code
- * belongs to this order.
+ * Do NOT wait for the SMS here — requestAndAwaitOtp owns that.
  */
-async function submitForOtp(_ctx: PaymentContext): Promise<void> {
-  throw new Error("iciciCorporate.submitForOtp not implemented");
+async function submitForOtp(ctx: PaymentContext): Promise<void> {
+  const submit = ctx.page.locator(SUBMIT_CONTROL).first();
+  if ((await submit.count()) === 0) {
+    throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "ICICI's 3-D Secure page has no Submit control");
+  }
+  await submit.click({ timeout: 10_000 });
+  ctx.log("info", "[pay] ICICI: identity submitted");
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const text = await pageText(ctx);
+    const rejected = text.split(/\n+/).map((l) => l.trim()).find((l) => l && l.length < 200 && IDENTITY_REJECTED.test(l));
+    if (rejected) {
+      throw new CheckoutFailure(
+        "CARD_AUTH_FAILED",
+        `ICICI rejected the corporate identity (corporate ${ctx.corporateId ?? "?"}): ${rejected}`
+      );
+    }
+    const otpVisible = await ctx.page.locator(OTP_INPUT).first().isVisible().catch(() => false);
+    if (otpVisible || /\bOTP\b|one[- ]time password/i.test(text)) {
+      ctx.log("info", "[pay] ICICI: OTP step is up");
+      return;
+    }
+    await ctx.page.waitForTimeout(500);
+  }
+  throw new CheckoutFailure(
+    "UNABLE_TO_PLACE_ORDER",
+    "ICICI did not show an OTP step within 30s of submitting the corporate identity"
+  );
 }
 
 /**
- * Type the code and confirm.
- *
- * NEEDS
- *   - the OTP input (sometimes several single-digit boxes — then fill them one
- *     character at a time rather than one fill() call)
- *   - the submit button
- *   - a POSITIVE success signal, or the redirect back to Flipkart
- *   - the wording for a rejected OTP, so it is not read as a slow page
+ * Type the code and confirm. NOT YET WRITTEN ON PURPOSE: the OTP page is first
+ * seen on Run 2, which stops here — after the SMS has arrived and been matched
+ * to this run — and captures the page as 14-bank-result. The selectors come
+ * from that capture. Entering the code is what places the real order.
  *
  * NEVER log the code.
  */
 async function enterOtp(_ctx: PaymentContext, _otp: string): Promise<void> {
-  throw new Error("iciciCorporate.enterOtp not implemented");
+  throw new Error(
+    "iciciCorporate.enterOtp not implemented — Run 2 stops here by design, after the OTP was received and matched"
+  );
 }

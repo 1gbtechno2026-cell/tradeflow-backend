@@ -88,9 +88,11 @@ testRouter.post("/flow", (req, res) => {
     authType: body.authType,
     cards: Array.isArray(body.cards) ? body.cards : undefined,
     mobileDevice: body.mobileDevice,
-    // Always headless from the UI: the browser runs on the server, and a headed
-    // window would open on the server's screen where nobody is looking.
-    headless: true,
+    // VISIBLE by default. Trade Flow runs on the operator's own machine while this
+    // is being built, so a headed window is the whole point — you watch the taps
+    // land, see which control the automation actually hit, and spot a drawer that
+    // opened behind something. Pass headless:true explicitly for a server or CI.
+    headless: body.headless === true,
     stopAfter: body.stopAfter || "payments",
     // Both switches required. The UI sends payLive only from an explicit tick.
     payLive: body.stopAfter === "pay" && body.payLive === true,

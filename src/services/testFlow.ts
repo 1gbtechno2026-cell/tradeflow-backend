@@ -552,7 +552,11 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
     return result;
   } finally {
     // Leave the window up briefly when headed, so a failure can be looked at.
-    if (!(cfg.headless ?? config.headless)) await sleep(Math.min(config.keepBrowserOpenMs, 20_000));
+    // Headed runs stay open briefly so the last page can be inspected; a failure
+    // gets longer, because that is the one you actually want to look at.
+    if (!(cfg.headless ?? config.headless)) {
+      await sleep(Math.min(config.keepBrowserOpenMs, reachedPayments ? 15_000 : 45_000));
+    }
     await desktopBrowser.close().catch(() => {});
     await mobileBrowser?.close().catch(() => {});
   }

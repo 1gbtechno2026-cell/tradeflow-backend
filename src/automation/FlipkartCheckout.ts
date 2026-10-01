@@ -17,6 +17,17 @@ const VIEWCHECKOUT_URL =
   "https://www.flipkart.com/viewcheckout?view=FLIPKART&marketplace=FLIPKART&tr_tenant=FLIPKART";
 const PAYMENTS_URL = "https://www.flipkart.com/payments";
 
+/**
+ * Flipkart's per-order cap, in its own words: "You can only purchase 14 units of …
+ * in a single order", "Only 2 units allowed per customer".
+ *
+ * From the reference flow. Matching the wording matters because Flipkart does not
+ * fail an over-limit quantity cleanly — it caps the number silently, or answers
+ * with a bare "Something went wrong", and this toast is the only place it says why.
+ */
+export const QTY_LIMIT_RE =
+  /can only (purchase|buy|order) \d+ (unit|item)s?|only \d+ (unit|item)s?\b.*(allowed|per (customer|order))|max(imum)? (quantity|qty|units?) (is|of|allowed)|quantity limit|can(not|'t) (buy|order) more than/i;
+
 export class OutOfStockPincodeError extends Error {
   readonly failedStep = "out_of_stock_pincode" as const;
   constructor(
@@ -2354,6 +2365,14 @@ export class FlipkartCheckout {
 
         this.log("error", `Order summary verification failed at step "${failedStep}" (completed: ${completedSteps || "none"}): ${errMsg}`, failedStep);
 
+        // A Flipkart-side answer is FINAL: out of stock, "you can only purchase 16
+        // units", not deliverable, invalid GST. Refreshing cannot change any of
+        // them, and without this the loop burns three page loads and then re-wraps
+        // the failure as a plain Error — which classifies as UNKNOWN and discards
+        // both the code and Flipkart's own wording. That is exactly how a
+        // correctly-detected MAX_UNITS_REACHED reached the UI as "UNKNOWN".
+        if (err instanceof CheckoutFailure || err instanceof OutOfStockPincodeError) throw err;
+
         if (retry < MAX_RETRIES - 1) {
           console.log(`Refreshing page and retrying from "${failedStep}" step...`);
           // Refresh the order summary page to get a clean state for the failed step
@@ -2376,242 +2395,155 @@ export class FlipkartCheckout {
   // These run on the intermediate order summary page after Buy Now
   // ================================================================
 
+  /**
+   * Set the quantity on the order summary.
+   *
+   * Ported from the reference flow, which solves two things this did not.
+   *
+   * READING IT. The old reader scanned every pure-digit div and walked up for an
+   * ancestor mentioning "qty" — and the delivery address's PHONE NUMBER is a
+   * pure-digit div inside the same order-summary card, so it read 7256809635 as
+   * the quantity, tried to "correct" it, and silently continued at the wrong
+   * amount. "Qty: N" is the label the page actually renders; nothing else is read.
+   *
+   * CHANGING IT. The old writer clicked a fallback selector and looked for a div
+   * whose text was exactly "APPLY", which does not exist on this layout — so a
+   * quantity above 1 was never applied and the qty scenario could never reach a
+   * limit. Flipkart's picker lists the quantities it will allow, then a "more"
+   * entry for a free-text box. If the wanted number is listed, tap it. If it is
+   * not listed AND there is no "more", the list IS the allowed range and the
+   * request is over the limit — which is the QUANTITY_LIMIT signal, and the only
+   * reliable one, because Flipkart otherwise answers an over-limit quantity by
+   * quietly capping it or showing a bare "Something went wrong".
+   */
   private async verifyQuantityOnOrderSummary(expectedQty: number): Promise<void> {
     console.log(`Verifying quantity on order summary: expected=${expectedQty}`);
     this.summaryQty = expectedQty;
 
-    // Try to find the quantity displayed on the order summary page
-    let displayedQty = 0;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const qtyText = await this.evaluate(() => {
-        // Look for quantity near "Qty" text or a number near product info
-        const allDivs = Array.from(document.querySelectorAll("div"));
-
-        // PASS 1: the label. "Qty: 1" is unambiguous and is what the page actually
-        // renders, so it is tried before any heuristic.
-        for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
-          const match = txt.match(/\bqty\b[:\s]*(\d{1,3})\b/i);
-          if (match) return match[1];
-        }
-
-        // PASS 2: a bare number sitting inside something that mentions qty.
-        //
-        // This used to run FIRST and unbounded, and it read the delivery address's
-        // PHONE NUMBER as the quantity — "7256809635 vs 50 — correcting...". The
-        // phone is a pure-digit div, the order-summary card contains both it and
-        // the Qty row, so walking up from the phone finds an ancestor containing
-        // "qty" and the scan returns it because it comes first in document order.
-        // The flow then tried to "correct" a ten-digit quantity, failed to find
-        // APPLY, and continued at the wrong quantity with only a warning.
-        //
-        // Now bounded three ways: at most 3 digits (Flipkart caps far below 1000),
-        // at most 3 ancestors up (a phone and a Qty row are cousins, not parent and
-        // child), and a plausibility check on the value.
-        for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
-          if (!/^\d{1,3}$/.test(txt) || d.offsetParent === null) continue;
-          let el: HTMLElement | null = d.parentElement;
-          for (let up = 0; el && el !== document.body && up < 3; up++, el = el.parentElement) {
-            if (/\bqty\b/i.test((el.innerText || "").replace(/\s+/g, " "))) return txt;
-          }
-        }
-        // Fallback: look for any number input or select with quantity
-        const selects = document.querySelectorAll("select");
-        for (const s of selects) {
-          const parentTxt = ((s.closest("div")?.innerText) || "").toLowerCase();
-          if (parentTxt.includes("qty")) {
-            return (s as HTMLSelectElement).value;
-          }
-        }
-        // Fallback: look for a visible quantity input
-        const inputs = document.querySelectorAll("input");
-        for (const inp of inputs) {
-          const placeholder = (inp.getAttribute("placeholder") || "").toLowerCase();
-          const name = (inp.getAttribute("name") || "").toLowerCase();
-          if ((placeholder.includes("quantity") || name.includes("quantity")) && inp.value) {
-            return inp.value;
-          }
-        }
-        return null;
+    const readQty = async () =>
+      this.evaluate(() => {
+        const m = (document.body?.innerText || "").match(/Qty:\s*(\d+)/i);
+        return m ? Number(m[1]) : 0;
       });
 
-      if (qtyText) {
-        displayedQty = parseInt(qtyText, 10);
-        if (!isNaN(displayedQty)) break;
-      }
-      await sleep(300);
+    let displayedQty = 0;
+    for (let attempt = 0; attempt < 5 && !displayedQty; attempt++) {
+      displayedQty = await readQty();
+      if (!displayedQty) await sleep(300);
     }
-
-    if (displayedQty > 0) {
-      console.log(`Current quantity on summary: ${displayedQty}`);
-    } else {
-      console.log("Could not detect quantity on order summary page — assuming correct");
-      return;
-    }
-
+    if (!displayedQty) throw new Error('Could not read "Qty: N" on order summary');
+    console.log(`Current quantity on summary: ${displayedQty}`);
     if (displayedQty === expectedQty) {
       console.log("Quantity matches — no change needed");
-      this.summaryQty = displayedQty;
       return;
     }
 
-    console.log(`Quantity mismatch: ${displayedQty} vs ${expectedQty} — correcting...`);
-
-    // Click the Qty selector to open the quantity dropdown/dialog
-    // Pattern from setQuantity(): find div with class css-146c3p1 near "Qty"
-    let qtyClicked = false;
-    for (let attempt = 0; attempt < 3 && !qtyClicked; attempt++) {
-      const result = await this.evaluate(() => {
-        const allDivs = Array.from(document.querySelectorAll("div"));
-        for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
-          if (txt.toLowerCase().startsWith("qty")) {
-            // Walk up to find clickable parent
-            let el: HTMLElement | null = d;
-            while (el && el !== document.body) {
-              const style = el.getAttribute("style") || "";
-              if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
-                el.scrollIntoView({ block: "center" });
-                el.click();
-                return "clicked";
-              }
-              el = el.parentElement;
-            }
-            // Fallback: click the div itself
-            (d as HTMLElement).click();
-            return "clicked_fallback";
-          }
-        }
-        // Alternative: look for div with css-146c3p1 class that is near Qty text
-        for (const d of allDivs) {
-          const cls = d.className || "";
-          if (cls.includes("css-146c3p1")) {
-            let el: HTMLElement | null = d;
-            while (el && el !== document.body) {
-              const style = el.getAttribute("style") || "";
-              if (style.includes("cursor: pointer")) {
-                el.scrollIntoView({ block: "center" });
-                el.click();
-                return "clicked_css_class";
-              }
-              el = el.parentElement;
-            }
-          }
-        }
-        return null;
-      });
-
-      if (result) {
-        qtyClicked = true;
-        console.log(`Qty selector clicked (${result})`);
-        await sleep(300);
-      } else {
-        console.log(`Qty selector not found (attempt ${attempt + 1}/3)`);
-        await sleep(300);
-      }
-    }
-
-    if (!qtyClicked) {
-      console.log("WARNING: Could not open quantity selector — proceeding anyway");
-      return;
-    }
-
-    // Wait for the quantity dialog/dropdown to appear
-    let dialogReady = false;
-    for (let i = 0; i < 5 && !dialogReady; i++) {
-      dialogReady = await this.evaluate(() => {
-        return (
-          !!document.querySelector('input[placeholder*="Quantity" i]') ||
-          !!document.querySelector('input[placeholder*="Qty" i]') ||
-          !!document.querySelector(".css-146c3p1") ||
-          (document.body?.innerText || "").includes("APPLY")
-        );
-      });
-      if (!dialogReady) await sleep(300);
-    }
-
-    if (!dialogReady) {
-      console.log("WARNING: Quantity dialog did not appear — proceeding anyway");
-      return;
-    }
-
-    // Type the desired quantity into the input
-    await this.evaluate((qty: number) => {
-      // Try to find the quantity input
-      const selectors = [
-        'input[placeholder*="Quantity" i]',
-        'input[placeholder*="Qty" i]',
-        'input[name*="quantity" i]',
-      ];
-      for (const sel of selectors) {
-        const inp = document.querySelector(sel) as HTMLInputElement | null;
-        if (inp) {
-          inp.focus();
-          // Clear and type
-          inp.value = "";
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-          if (setter) setter.call(inp, String(qty));
-          else inp.value = String(qty);
-          inp.dispatchEvent(new Event("input", { bubbles: true }));
-          inp.dispatchEvent(new Event("change", { bubbles: true }));
-          return "typed";
-        }
-      }
-      return null;
-    }, expectedQty);
+    console.log(`Quantity mismatch: ${displayedQty} vs ${expectedQty} — opening Qty dropdown`);
+    await this.page.getByText(/^\s*Qty:\s*\d+\s*$/).first().tap({ timeout: 5000 });
     await sleep(500);
 
-    // Click APPLY button
-    let applied = false;
-    for (let attempt = 0; attempt < 3 && !applied; attempt++) {
-      const result = await this.evaluate(() => {
-        const allDivs = Array.from(document.querySelectorAll("div"));
-        for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toUpperCase();
-          if (txt === "APPLY") {
-            let el: HTMLElement | null = d;
-            while (el && el !== document.body) {
-              const style = el.getAttribute("style") || "";
-              if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
-                el.scrollIntoView({ block: "center" });
-                el.click();
-                return "clicked";
-              }
-              el = el.parentElement;
-            }
-            (d as HTMLElement).click();
-            return "clicked_fallback";
-          }
-        }
-        // Also try button
-        const buttons = document.querySelectorAll("button");
-        for (const btn of buttons) {
-          const txt = (btn.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
-          if (txt === "APPLY") {
-            (btn as HTMLElement).click();
-            return "clicked_button";
-          }
-        }
-        return null;
-      });
+    /** The numbers Flipkart is offering right now — the top of that list is the cap. */
+    const listedQtys = async (): Promise<number[]> =>
+      this.evaluate(() =>
+        (Array.from(document.querySelectorAll("div,span")) as HTMLElement[])
+          .filter((n) => n.children.length === 0 && /^\s*\d{1,2}\s*$/.test(n.textContent || ""))
+          .filter((n) => {
+            const r = n.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && r.y > 0 && r.y < window.innerHeight;
+          })
+          .map((n) => Number((n.textContent || "").trim()))
+      );
 
-      if (result) {
-        applied = true;
-        console.log(`Quantity APPLY clicked (${result})`);
-        await sleep(500);
-      } else {
-        console.log(`APPLY button not found (attempt ${attempt + 1}/3)`);
-        await sleep(300);
-      }
+    const quantityLimit = async (): Promise<CheckoutFailure> => {
+      const body = await this.evaluate(() => document.body?.innerText || "");
+      const msg = body
+        .split(/\n+/)
+        .map((l) => l.trim())
+        .find((l) => QTY_LIMIT_RE.test(l) && l.length < 200);
+      const nums = await listedQtys();
+      const max = nums.length ? Math.max(...nums) : 0;
+      return new CheckoutFailure(
+        "MAX_UNITS_REACHED",
+        msg || `Flipkart allows at most ${max || "fewer"} unit(s) of this product per order — requested ${expectedQty}`
+      );
+    };
+
+    const option = this.page.getByText(String(expectedQty), { exact: true });
+    let picked = false;
+    for (let i = (await option.count()) - 1; i >= 0 && !picked; i--) {
+      const el = option.nth(i);
+      if (!(await el.isVisible().catch(() => false))) continue;
+      await el
+        .tap({ timeout: 4000 })
+        .then(() => (picked = true))
+        .catch(() => undefined);
     }
 
-    if (!applied) {
-      console.log("WARNING: Could not click APPLY — quantity may not be updated");
+    if (picked) {
+      console.log(`Picked ${expectedQty} from Qty dropdown`);
     } else {
-      console.log(`Quantity updated to ${expectedQty} on order summary`);
+      const more = this.page.getByText(/^\s*more\s*$/i).first();
+      if (!(await more.isVisible().catch(() => false))) {
+        // No "more" → the listed numbers are the whole allowed range.
+        throw await quantityLimit();
+      }
+      console.log(`${expectedQty} not listed — tapping "more"`);
+      await more.tap({ timeout: 5000 });
+      const input = this.page
+        .locator(
+          'input[placeholder*="Quantity" i], input[placeholder*="Qty" i], input[name*="quantity" i], input[inputmode="numeric"], input[type="number"], input[type="tel"]'
+        )
+        .first();
+      await input.waitFor({ state: "visible", timeout: 8000 });
+      await input.fill(String(expectedQty));
+      await this.page.getByText(/^\s*apply\s*$/i).first().tap({ timeout: 5000 });
+      console.log(`Typed ${expectedQty} and tapped APPLY`);
     }
+
+    const rejected = async () =>
+      this.evaluate(() => /Something went wrong/i.test(document.body?.innerText || ""));
+
+    let ok = false;
+    try {
+      ok = await this.waitUntil(
+        async () => (await readQty()) === expectedQty || (await rejected()),
+        10000,
+        200,
+        `Qty: ${expectedQty} on summary`
+      );
+    } catch (err) {
+      // Over-limit quantities also surface as "out of stock for <pin>" for the
+      // capped amount; the per-order cap is the real reason, so prefer it.
+      if (err instanceof CheckoutFailure) {
+        const limit = await quantityLimit();
+        if (QTY_LIMIT_RE.test(limit.details)) {
+          throw new CheckoutFailure("MAX_UNITS_REACHED", `${limit.details} (also: ${err.details})`);
+        }
+      }
+      throw err;
+    }
+
+    const now = await readQty();
+    if (await rejected()) {
+      const limit = await quantityLimit();
+      if (QTY_LIMIT_RE.test(limit.details)) throw limit;
+      throw new CheckoutFailure(
+        "MAX_UNITS_REACHED",
+        `Flipkart rejected quantity ${expectedQty} ("Something went wrong!" right after setting it) — Qty stays ${now}`
+      );
+    }
+    if (!ok || now !== expectedQty) {
+      const limit = await quantityLimit();
+      const capped = now > displayedQty && now < expectedQty;
+      if (QTY_LIMIT_RE.test(limit.details) || capped) {
+        throw new CheckoutFailure("MAX_UNITS_REACHED", `${limit.details} (Qty shows ${now}, requested ${expectedQty})`);
+      }
+      throw new Error(`Quantity did not update (shows ${now}, want ${expectedQty})`);
+    }
+    this.summaryQty = now;
+    console.log(`Quantity updated to ${now} on order summary`);
   }
+
 
   private async verifyDeliveryAddressOnSummary(address: AddressDetails): Promise<void> {
     const effectivePincode = (address.checkoutPincode || address.pincode).trim();

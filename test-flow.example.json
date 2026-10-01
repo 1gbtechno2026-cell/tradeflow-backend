@@ -30,9 +30,9 @@
   "mobileDevice": "Pixel 7",
   "headless": false,
 
-  "//productUrls": "One per case id. Only `happy` is required. An out-of-stock product does not stay out of stock — keep these current.",
+  "//productUrls": "One per case id. Use a CHEAP, COD-eligible accessory while iterating — a run leaves a real item in the cart, and stopAfter/payLive are the only things between a test and a real charge. One per case id. Only `happy` is required. An out-of-stock product does not stay out of stock — keep these current.",
   "productUrls": {
-    "happy": "https://www.flipkart.com/samsung-galaxy-a06-5g-black-128-gb/p/itm2bf1cd87d2bf7?pid=MOBH9GQKCNWVNM2M",
+    "happy": "https://www.flipkart.com/placido-back-cover-all-phones-suction-sticker-sticks-smooth-surfaces/p/itm782492f835499?pid=ACCHNGXECMC2JD4N",
     "oos": "",
     "pincode": "",
     "qty": ""

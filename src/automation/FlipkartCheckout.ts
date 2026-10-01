@@ -1,4 +1,4 @@
-import type { Page } from "playwright";
+import type { Locator, Page } from "playwright";
 import type { AddressDetails } from "../types.js";
 import {
   evaluate as evalPage,
@@ -985,64 +985,69 @@ export class FlipkartCheckout {
       console.log("Not on viewcart — opening remembered viewcart before Place Order");
       await this.gotoViewCart();
     }
-    // Buying-bot placeOrder: div.css-146c3p1 "Place order" → yellow css-g5y9jx, touchscreen.tap
+    /**
+     * Click the real Place Order control, via a locator.
+     *
+     * This used to find any element whose text was "place order", walk UP for a
+     * styled ancestor, compute a centre point and touchscreen.tap() it. On the
+     * m-site cart that picked the wrong one: the page carries the string twice,
+     * and the tap landed at CSS (206, 387) — mid-page, in the product card —
+     * while the real yellow bar sits at (323, 749) on a 412x839 viewport. The tap
+     * hit nothing, nothing navigated, and the old fallback below then jumped to
+     * the remembered viewcheckout URL, which is exactly what makes Flipkart
+     * answer "Something went wrong! E002". The retry re-tapped the same empty
+     * spot, so it could never recover.
+     *
+     * A locator removes the whole class of problem: Playwright waits for the
+     * element to be visible, stable and hit-testable, scrolls it into view and
+     * clicks its real centre — and throws if something is covering it instead of
+     * silently clicking the overlay.
+     */
     console.log("[Checkout2/Buying-bot] Waiting for Place Order button...");
-    let placeBox: { x: number; y: number } | null = null;
-    for (let attempt = 0; attempt < 20; attempt++) {
-      placeBox = await this.evaluate(() => {
-        const labels = document.querySelectorAll("div.css-146c3p1, div, span, button");
-        for (const label of labels) {
-          const text = (label.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-          if (text === "place order") {
-            let el: HTMLElement | null = label as HTMLElement;
-            while (el) {
-              const style = el.getAttribute("style") || "";
-              if (
-                (el.classList.contains("css-g5y9jx") && style.includes("background-color")) ||
-                style.includes("background-color") ||
-                style.includes("cursor: pointer") ||
-                style.includes("cursor:pointer")
-              ) {
-                el.scrollIntoView({ block: "center" });
-                const rect = el.getBoundingClientRect();
-                if (rect.width >= 40 && rect.height >= 20) {
-                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-                }
-              }
-              el = el.parentElement;
-            }
-            (label as HTMLElement).scrollIntoView({ block: "center" });
-            const rect = label.getBoundingClientRect();
-            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-          }
+    // Ordered most- to least-specific. getByRole first because the real control is
+    // a button; the text forms cover the m-site's div-based buttons.
+    const candidates = [
+      this.page.getByRole("button", { name: /^\s*place\s*order\s*$/i }),
+      this.page.locator('button:has-text("Place Order")'),
+      this.page.getByText(/^\s*place\s*order\s*$/i),
+    ];
+
+    let placeOrder: Locator | null = null;
+    for (let attempt = 0; attempt < 20 && !placeOrder; attempt++) {
+      for (const candidate of candidates) {
+        // .last() because Flipkart renders the sticky bottom bar after the
+        // in-flow copy, and the sticky one is the control a person actually taps.
+        const target = candidate.last();
+        if ((await target.count().catch(() => 0)) > 0 && (await target.isVisible().catch(() => false))) {
+          placeOrder = target;
+          break;
         }
-        return null;
-      });
-      if (placeBox) break;
-      if (attempt % 5 === 4) {
-        console.log(`Still looking for Place Order button (attempt ${attempt + 1}/20)...`);
       }
+      if (placeOrder) break;
+      if (attempt % 5 === 4) console.log(`Still looking for Place Order button (attempt ${attempt + 1}/20)...`);
       await sleep(500);
     }
 
-    if (!placeBox) {
-      console.log("Place Order button not found after 10s — using remembered viewcheckout URL");
-      await this.gotoViewCheckout();
-      return;
+    if (!placeOrder) {
+      // Loud, not silent. gotoViewCheckout() here is what produced E002 for every
+      // run that got this far: opening viewcheckout without a real Place Order
+      // behind it is precisely the state Flipkart rejects.
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        "Place Order button not found on the cart after 10s — refusing to open viewcheckout directly, which Flipkart answers with E002"
+      );
     }
 
-    await sleep(300);
-    try {
-      await this.page.touchscreen.tap(placeBox.x, placeBox.y);
-      console.log(`Tapped Place Order at (${placeBox.x.toFixed(0)}, ${placeBox.y.toFixed(0)})`);
-    } catch {
-      await this.page.mouse.click(placeBox.x, placeBox.y);
-      console.log(`Mouse clicked Place Order at (${placeBox.x.toFixed(0)}, ${placeBox.y.toFixed(0)})`);
-    }
+    const box = await placeOrder.boundingBox().catch(() => null);
+    await placeOrder.click({ timeout: 15_000 });
+    console.log(
+      `Clicked Place Order${box ? ` at (${(box.x + box.width / 2).toFixed(0)}, ${(box.y + box.height / 2).toFixed(0)})` : ""}`
+    );
+
     await sleep(DELAYS.long);
     const moved = await this.waitUntil(
       async () => /viewcheckout|\/payments|checkout|rv\/pay/i.test(this.page.url() || ""),
-      8000,
+      15000,
       120,
       "viewcheckout after Place Order"
     );
@@ -1052,8 +1057,10 @@ export class FlipkartCheckout {
       await this.gotoViewCheckout();
       return;
     }
-    console.log("Place Order did not navigate — using remembered viewcheckout URL");
-    await this.gotoViewCheckout();
+    throw new CheckoutFailure(
+      "UNABLE_TO_PLACE_ORDER",
+      `Place Order was clicked but the page stayed on ${this.page.url()} — not opening viewcheckout directly, which Flipkart answers with E002`
+    );
   }
 
   private async cartIsEmpty(): Promise<boolean> {

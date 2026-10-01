@@ -16,9 +16,11 @@ import {
   restoreFlipkartSession,
   sleep,
 } from "./browser.js";
-import { CheckoutFailure, classifyPageText, classifyThrownMessage } from "./checkoutErrors.js";
+import { CheckoutFailure, classifyBankText, classifyPageText, classifyThrownMessage } from "./checkoutErrors.js";
 import { resolveAddress, resolveLoggedInSession } from "./sessionStore.js";
 import { toCardDetails } from "./paymentCards.js";
+import { verdictFor } from "./cardPool.js";
+import { authenticatePayment } from "../paymentStrategies/index.js";
 import type { AuthType, CardDetails } from "../paymentStrategies/types.js";
 import type { AddressDetails, LogLevel } from "../types.js";
 
@@ -76,6 +78,8 @@ export interface TestFlowConfig {
   paymentMode?: "cod" | "card" | "none";
   cardType?: string;
   authType?: AuthType;
+  /** Required by corporate card types; the OTP goes to that corporate's handset. */
+  corporateId?: string;
   /** Raw CSV-shaped rows; converted with the same mapper the real route uses. */
   cards?: Array<Record<string, unknown>>;
   mobileDevice?: string;
@@ -127,6 +131,12 @@ export interface TestFlowResult {
   /** Everything the run printed, in order — the `[GST] …`, `[API] …` lines that
    *  say which branch ran. Server-side path; the API serves it by run id. */
   logFile?: string;
+  /**
+   * What the card pool would do with this card after this outcome — the same
+   * `verdictFor` the worker applies, computed here so a test run shows it. The
+   * harness has no pool, so nothing is actually paused or retired.
+   */
+  cardVerdict?: { kind: "keep" | "paused" | "dead"; reason: string; pausedUntil?: string };
 }
 
 /** Codes that only say WHERE it broke — the page text usually says why. */
@@ -542,16 +552,51 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       } else if (mode === "card") {
         const cards: CardDetails[] = toCardDetails(cfg.cards);
         if (!cards.length) throw new CheckoutFailure("CARD_AUTH_FAILED", "paymentMode=card but no usable card rows");
+        const cardTypeName = String(cfg.cardType || "").toUpperCase();
+        if (!cardTypeName) throw new CheckoutFailure("CARD_AUTH_FAILED", "cardType is required for a card run");
+        if (!cfg.authType) throw new CheckoutFailure("CARD_AUTH_FAILED", `authType is required for ${cardTypeName}`);
         await fk.selectCardPayment();
         await capture("11-card-form");
-        if (stopAfter === "pay" && cfg.payLive) {
+        if (!(stopAfter === "pay" && cfg.payLive)) {
+          console.log("  card form reached; not filled (set stopAfter=pay and payLive=true to fill it)");
+        } else {
+          // The same four surfaces the worker drives, in the same order, through
+          // the same objects — FlipkartPayment for Flipkart's form, the strategy
+          // registry for the bank's page — so what passes here passes there.
           await fk.fillCardForm(cards[0]);
           await capture("12-card-filled");
           const rejected = await fk.detectCardRejectedByFlipkart();
           if (rejected) throw rejected;
-          console.log("  card form filled. Pay is NOT pressed by the harness — press it yourself to watch the bank page.");
-        } else {
-          console.log("  card form reached; not filled (set stopAfter=pay and payLive=true to fill it)");
+          await fk.submitCardForm();
+          const bankUrl = await fk.waitForBankHandoff();
+          console.log(`  handed off to the bank: ${bankUrl.split("?")[0]}`);
+          // The bank's page as it first renders: the artifact a strategy's
+          // selectors are written from, and the one to compare against when the
+          // bank changes its page.
+          await capture("13-bank-page", bankUrl.split("?")[0]);
+          try {
+            const auth = await authenticatePayment({
+              page: mobPage,
+              runId,
+              jobId: runId,
+              cardTypeName,
+              card: cards[0],
+              authType: cfg.authType,
+              corporateId: cfg.corporateId ?? null,
+              log: (lvl, msg) => log(lvl, msg),
+              dryRun: false,
+            });
+            console.log(`  authenticated ${auth.cardTypeName} (${auth.authType}) on ****${auth.cardLast4}`);
+          } finally {
+            // Captured whether the bank accepted or refused: the refusal page is
+            // the one that explains a failed run.
+            await capture("14-bank-result");
+          }
+          // Back on Flipkart. A bank "yes" is not an order: Flipkart can still
+          // fail it, and that page is the final word.
+          const confirmation = await fk.waitForOrderConfirmation();
+          await capture("15-flipkart-after-bank", `order ${confirmation.orderId || "(no id)"}`);
+          console.log(`  ORDER PLACED: ${confirmation.orderId || "(no id read)"} ${confirmation.amount}`);
         }
       }
     }
@@ -578,18 +623,28 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
     return result;
   } catch (err) {
     await capture("99-failure");
-    const result: TestFlowResult = {
-      ...(await explainFailure(err, page, (cfg.checkoutPincode || "").slice(-6), {
-        runId,
-        caseId: cfg.caseId,
-        step: currentStep,
-        artifacts,
-        startedAt,
-        reachedPayments,
-      })),
-      config: redactConfig(cfg),
-      logFile,
-    };
+    const explained = await explainFailure(err, page, (cfg.checkoutPincode || "").slice(-6), {
+      runId,
+      caseId: cfg.caseId,
+      step: currentStep,
+      artifacts,
+      startedAt,
+      reachedPayments,
+    });
+    // On a card run that got as far as paying, say what the pool would do with
+    // the card. For a ₹1 account the right answer is "paused until midnight IST",
+    // never "dead" — that is what this line is for.
+    let cardVerdict: TestFlowResult["cardVerdict"];
+    if (cfg.paymentMode === "card" && explained.code && artifacts.some((a) => a.step.startsWith("12-"))) {
+      const v = verdictFor(explained.code, explained.detail || "");
+      cardVerdict = {
+        kind: v.kind,
+        reason: v.reason,
+        pausedUntil: v.kind === "paused" ? new Date(v.untilMs).toISOString() : undefined,
+      };
+      console.log(`  card pool verdict: ${v.kind} — ${v.reason}${cardVerdict.pausedUntil ? ` (until ${cardVerdict.pausedUntil})` : ""}`);
+    }
+    const result: TestFlowResult = { ...explained, config: redactConfig(cfg), logFile, cardVerdict };
     publish({ ...result, running: false });
     writeResult(dir, result);
     return result;
@@ -680,6 +735,11 @@ async function explainFailure(
     return pack(err.code, err.display, err.details);
   }
   if (url && flipkartLoginUrl(url)) return pack("SESSION_EXPIRED", "Flipkart showed the login page");
+  // Off Flipkart means on the bank's page: its vocabulary, not Flipkart's.
+  if (url && !/flipkart\.com/i.test(url)) {
+    const bank = classifyBankText(text);
+    if (bank) return pack(bank.code, bank.display, bank.details);
+  }
   const fromPage = text ? classifyPageText(text, pincode) : null;
   if (fromPage) return pack(fromPage.code, fromPage.display, fromPage.details);
   if (err instanceof CheckoutFailure) return pack(err.code, err.display, err.details);

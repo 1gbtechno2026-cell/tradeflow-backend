@@ -378,6 +378,34 @@ export function classifyPageText(
 }
 
 /** Map a thrown message (and optional page text) to a catalog entry. */
+/**
+ * The BANK's page (3-D Secure / ACS), not Flipkart's: what it says when it
+ * refuses. Kept apart from classifyPageText because the two vocabularies do not
+ * overlap and a Flipkart rule must never fire on a bank page or vice versa.
+ *
+ * Order matters. Insufficient funds is named first because it is the one
+ * outcome that must PAUSE a card rather than retire it (cardPool.verdictFor
+ * keys on the code). A wrong credential is retired — same CSV row, same result
+ * every time — and an "attempts remaining" warning is reported verbatim because
+ * it is the only advance notice of a lockout.
+ */
+export function classifyBankText(text: string): CheckoutFailure | null {
+  const compact = String(text || "").replace(/ /g, " ").replace(/\s+/g, " ");
+  if (/insufficient (?:funds|balance)|not enough (?:funds|balance)|exceeds (?:your |the )?(?:available )?(?:balance|limit)|limit exceeded/i.test(compact)) {
+    return new CheckoutFailure("INSUFFICIENT_BALANCE", lineMatching(text, /insufficient|not enough|exceeds|limit exceeded/i));
+  }
+  if (/attempts? (?:remaining|left)|remaining attempts?|will be (?:blocked|locked)/i.test(compact)) {
+    return new CheckoutFailure("CARD_AUTH_FAILED", lineMatching(text, /attempts?|blocked|locked/i));
+  }
+  if (/(?:incorrect|invalid|wrong) (?:password|pin|otp)|(?:password|pin|otp) (?:is )?(?:incorrect|invalid|wrong)|authentication (?:failed|unsuccessful)/i.test(compact)) {
+    return new CheckoutFailure("CARD_AUTH_FAILED", lineMatching(text, /password|pin|otp|authentication/i));
+  }
+  if (/transaction (?:declined|failed|unsuccessful|could not be (?:completed|processed))|payment (?:declined|failed|unsuccessful)|declined by (?:the )?(?:bank|issuer)/i.test(compact)) {
+    return new CheckoutFailure("CARD_AUTH_FAILED", lineMatching(text, /declined|failed|unsuccessful|could not be/i));
+  }
+  return null;
+}
+
 export function classifyThrownMessage(message: string, pageText = ""): CheckoutFailure {
   const fromPage = pageText ? classifyPageText(pageText) : null;
   if (fromPage) return fromPage;

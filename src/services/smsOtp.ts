@@ -303,9 +303,17 @@ export async function waitForPaymentOtp(opts: {
   const userId = workspaceUserId();
   const redis = getRedis();
 
+  // The cancellation check is by Mongo id. The test harness waits with its run
+  // id (a UUID) — findById on that threw "Cast to ObjectId failed" the moment
+  // the wait began, so the first ICICI run requested the OTP, released the
+  // handset and died before a single poll. No job id means nothing to cancel.
+  const checkCancel = Types.ObjectId.isValid(jobId);
+
   while (Date.now() - start < timeoutMs) {
-    const job = await CheckoutJob.findById(jobId).select("status").lean();
-    if (job?.status === "cancelled") throw new OtpJobCancelledError(`Job ${jobId} cancelled while waiting for OTP`);
+    if (checkCancel) {
+      const job = await CheckoutJob.findById(jobId).select("status").lean();
+      if (job?.status === "cancelled") throw new OtpJobCancelledError(`Job ${jobId} cancelled while waiting for OTP`);
+    }
 
     // Per-run mailbox first. Non-blocking LPOP rather than BLPOP: a blocking
     // read would occupy this connection for its whole timeout, and the loop

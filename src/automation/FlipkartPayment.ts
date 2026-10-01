@@ -373,21 +373,40 @@ export class FlipkartPayment {
 
   // ─────────────────────────── After the bank ─────────────────────────────────
 
+  /**
+   * After the bank: Flipkart's own verdict on the order, read from the page.
+   *
+   * Polls page text instead of waiting on a URL pattern. The earlier version
+   * waited for a guessed URL and read the order id from placeholder selectors,
+   * so a placed order would have reported as a 120s timeout. Flipkart's order
+   * ids are "OD" followed by digits — the one reliable thing on a confirmation
+   * page — with "Order placed / confirmed / Thank you" as the wording around it.
+   */
   async waitForOrderConfirmation(timeoutMs = 120_000): Promise<OrderConfirmation> {
     try {
-      // Wait for the success page URL pattern
-      await this.page.waitForURL(/order-confirmation|order-success|checkout\/success/, { timeout: timeoutMs });
-
-      // NOTE: Since we don't have the confirmation page DOM, these are placeholders.
-      // You will need to inspect the success page and replace these selectors.
-      const orderIdElement = this.page.locator('.order-id, [data-testid="order-id"]').first();
-      const amountElement = this.page.locator('.order-amount, [data-testid="order-amount"]').first();
-
-      return {
-        orderId: await orderIdElement.count() > 0 ? await orderIdElement.innerText() : '',
-        amount: await amountElement.count() > 0 ? await amountElement.innerText() : ''
-      };
-
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        let host = "";
+        try {
+          host = new URL(this.page.url()).hostname;
+        } catch {
+          /* navigating */
+        }
+        if (/flipkart\.com$/i.test(host)) {
+          const text = String(await this.page.evaluate(() => document.body?.innerText || "").catch(() => "")).replace(/ /g, " ");
+          const orderId = text.match(/\bOD\d{12,}\b/)?.[0] || "";
+          const placed = /order (?:placed|confirmed|successful)|thank you for (?:shopping|your order)|order id/i.test(text);
+          if (orderId || placed) {
+            const amount = text.match(/(?:total|amount|paid)[^₹\n]{0,30}₹\s?([\d,]+(?:\.\d{1,2})?)/i)?.[1] || "";
+            this.log("info", `[fk-pay] order confirmed${orderId ? ` — ${orderId}` : ""}${amount ? ` ₹${amount}` : ""}`, "payment");
+            return { orderId, amount: amount ? `₹${amount}` : "" };
+          }
+          const failed = await this.detectPaymentFailedModal();
+          if (failed) throw failed;
+        }
+        await this.page.waitForTimeout(1000);
+      }
+      throw new Error(`No order confirmation within ${Math.round(timeoutMs / 1000)}s (page: ${this.page.url().split("?")[0]})`);
     } catch (error) {
       // A CheckoutFailure raised inside the try (or by a nested call) must pass
       // straight through — re-wrapping it here would discard its code and detail,

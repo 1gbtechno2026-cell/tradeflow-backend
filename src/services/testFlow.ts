@@ -154,6 +154,8 @@ export interface TestFlowResult {
     calls: number;
     file: string | null;
   };
+  /** Set when Flipkart confirmed an order: this run spent real money. */
+  order?: { orderId: string; amount: string };
 }
 
 /** Codes that only say WHERE it broke — the page text usually says why. */
@@ -346,6 +348,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
   const desktopBrowser = await launchStealthBrowser({ headless: cfg.headless ?? config.headless });
   let mobileBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
   let reachedPayments = false;
+  let order: { orderId: string; amount: string } | undefined;
 
   try {
     // ---- session, before any browser work is wasted -----------------------
@@ -636,8 +639,14 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
           }
           // Back on Flipkart. A bank "yes" is not an order: Flipkart can still
           // fail it, and that page is the final word.
-          const confirmation = await fk.waitForOrderConfirmation();
-          await capture("15-flipkart-after-bank", `order ${confirmation.orderId || "(no id)"}`);
+          let confirmation: { orderId: string; amount: string };
+          try {
+            confirmation = await fk.waitForOrderConfirmation();
+          } finally {
+            await capture("15-flipkart-after-bank");
+          }
+          order = confirmation;
+          await capture("16-order-confirmed", `order ${confirmation.orderId || "(no id)"} ${confirmation.amount}`);
           console.log(`  ORDER PLACED: ${confirmation.orderId || "(no id read)"} ${confirmation.amount}`);
         }
       }
@@ -660,6 +669,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       config: redactConfig(cfg),
       logFile,
       gateway: gatewaySummary(),
+      order,
     };
     publish({ ...result, running: false });
     writeResult(dir, result);

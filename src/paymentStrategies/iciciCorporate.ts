@@ -198,16 +198,62 @@ async function submitForOtp(ctx: PaymentContext): Promise<void> {
   );
 }
 
+// ── THE OTP PAGE, as captured on Run 2 (card-2026-10-01T11-19-52) ───────────
+//
+//   same ACS host. <form id="enterOtpForm" onsubmit="return ValidateForm()">
+//     "A one time password (OTP) has been sent to your registered mobile number
+//      XXXXXX1297. Please enter the received OTP and submit…"
+//     <input class="input-field" type="password" name="otpValue" maxlength="6">
+//     <button id="submitBtn" onclick="enterOTP()">SUBMIT</button>
+//     <button id="otpResend" onclick="resendOTP()">RESEND</button>
+//     <button id="otpReset"  onclick="cancel()">CANCEL</button>
+//   "This screen will automatically time out after 7 minutes."
+
+const OTP_VALUE_INPUT = 'input[name="otpValue"], #enterOtpForm input[type="password"]';
+const OTP_SUBMIT = "#submitBtn, #enterOtpForm button[type=submit]";
+const OTP_REJECTED = /(?:invalid|incorrect|wrong|expired) (?:otp|one[- ]time|code)|otp (?:is )?(?:invalid|incorrect|expired)|authentication (?:failed|unsuccessful)|attempts? (?:left|remaining)/i;
+
 /**
- * Type the code and confirm. NOT YET WRITTEN ON PURPOSE: the OTP page is first
- * seen on Run 2, which stops here — after the SMS has arrived and been matched
- * to this run — and captures the page as 14-bank-result. The selectors come
- * from that capture. Entering the code is what places the real order.
+ * Type the code and confirm.
  *
- * NEVER log the code.
+ * Returning MEANS authenticated: the ACS has left the page (the redirect back
+ * through the gateway to Flipkart), which is the only positive signal this page
+ * gives. A rejection is named with the bank's text; "attempts remaining" is
+ * included verbatim as the one warning of a lockout. NEVER logs the code.
  */
-async function enterOtp(_ctx: PaymentContext, _otp: string): Promise<void> {
-  throw new Error(
-    "iciciCorporate.enterOtp not implemented — Run 2 stops here by design, after the OTP was received and matched"
+async function enterOtp(ctx: PaymentContext, otp: string): Promise<void> {
+  const box = ctx.page.locator(OTP_VALUE_INPUT).first();
+  try {
+    await box.waitFor({ state: "visible", timeout: 15_000 });
+  } catch {
+    throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "ICICI's OTP input was not on the page when the code arrived");
+  }
+  await box.fill(otp, { timeout: 10_000 });
+  const acsHost = new URL(ctx.page.url()).hostname;
+  await ctx.page.locator(OTP_SUBMIT).first().click({ timeout: 10_000 });
+  ctx.log("info", "[pay] ICICI: OTP submitted");
+
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    let host = "";
+    try {
+      host = new URL(ctx.page.url()).hostname;
+    } catch {
+      /* mid-navigation */
+    }
+    if (host && host !== acsHost) {
+      ctx.log("info", `[pay] ICICI: authenticated — ACS handed back to ${host}`);
+      return;
+    }
+    const text = await pageText(ctx);
+    const rejected = text.split(/\n+/).map((l) => l.trim()).find((l) => l && l.length < 240 && OTP_REJECTED.test(l));
+    if (rejected) {
+      throw new CheckoutFailure("CARD_AUTH_FAILED", `ICICI rejected the OTP: ${rejected}`);
+    }
+    await ctx.page.waitForTimeout(500);
+  }
+  throw new CheckoutFailure(
+    "UNABLE_TO_PLACE_ORDER",
+    `ICICI's page did not move on within 90s of submitting the OTP (still on ${acsHost})`
   );
 }

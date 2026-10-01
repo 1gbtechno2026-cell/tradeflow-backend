@@ -3,6 +3,7 @@ import express from "express";
 import { config } from "./config.js";
 import { connectDb } from "./db.js";
 import { jobsRouter } from "./routes/jobs.js";
+import { testRouter } from "./routes/test.js";
 import { orderFetchRouter } from "./routes/orderFetch.js";
 import { smsRouter } from "./routes/sms.js";
 
@@ -46,6 +47,12 @@ async function main() {
 
   app.use("/api/jobs", jobsRouter);
   app.use("/api/orders", orderFetchRouter);
+  // Only when explicitly enabled: these drive real Flipkart pages with a real
+  // logged-in account, so they must not be reachable by default.
+  if (config.enableTestRoutes) {
+    app.use("/api/test", testRouter);
+    console.log("[trade-flow] test routes ENABLED at /api/test (ENABLE_TEST_ROUTES=1)");
+  }
 
   app.listen(config.port, "0.0.0.0", () => {
     console.log(`[trade-flow] ${stamp()} API listening on http://0.0.0.0:${config.port}`);

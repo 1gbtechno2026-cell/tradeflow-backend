@@ -108,13 +108,88 @@ export interface TestFlowResult {
   startedAt: string;
   finishedAt: string;
   seconds: number;
+  /** True while the run is still going — the UI polls on this. */
+  running?: boolean;
+  /** Echoed back so a run can be re-run or understood later. Cards redacted. */
+  config?: Record<string, unknown>;
 }
 
 /** Codes that only say WHERE it broke — the page text usually says why. */
 const GENERIC_CODES = new Set(["UNABLE_TO_PLACE_ORDER", "ADD_TO_CART_FAILED", "UNKNOWN"]);
 
-export async function runTestFlow(cfg: TestFlowConfig): Promise<TestFlowResult> {
+/**
+ * In-flight runs, so the UI has something to show during the 40–160s a run takes.
+ *
+ * A run is far too slow to answer a request synchronously, so the tab starts one
+ * and polls. Finished runs are served from their result.json on disk instead —
+ * this map only needs to cover the window where that file is not final yet.
+ */
+const liveRuns = new Map<string, TestFlowResult>();
+
+/**
+ * One at a time. Two concurrent runs would share one Flipkart account and fight
+ * over the same cart: run A empties it at step 3 while run B is adding to it, and
+ * both fail for reasons neither log explains.
+ */
+let runningId: string | null = null;
+
+export function currentRunId(): string | null {
+  return runningId;
+}
+
+export function getLiveRun(runId: string): TestFlowResult | null {
+  return liveRuns.get(runId) || null;
+}
+
+export class TestRunInProgressError extends Error {
+  constructor(public readonly runId: string) {
+    super(`A test run is already in progress (${runId}). Wait for it, or cancel it.`);
+    this.name = "TestRunInProgressError";
+  }
+}
+
+/**
+ * Start a run and return its id immediately; the work continues in the background
+ * and the caller polls getLiveRun / the artifact directory.
+ */
+export function startTestFlow(cfg: TestFlowConfig): string {
+  if (runningId) throw new TestRunInProgressError(runningId);
   const runId = randomUUID();
+  // Seeded before the promise starts, so a poll landing in the same tick as the
+  // POST still finds the run rather than a 404.
+  liveRuns.set(runId, {
+    runId,
+    caseId: cfg.caseId,
+    status: "failed",
+    step: "queued",
+    url: "",
+    reachedPayments: false,
+    artifacts: [],
+    startedAt: new Date().toISOString(),
+    finishedAt: "",
+    seconds: 0,
+    running: true,
+    config: redactConfig(cfg),
+  });
+  runningId = runId;
+  void runTestFlow(cfg, runId)
+    .catch(() => undefined)
+    .finally(() => {
+      runningId = null;
+      // Keep the finished record around briefly; result.json is the durable copy.
+      setTimeout(() => liveRuns.delete(runId), 10 * 60 * 1000).unref?.();
+    });
+  return runId;
+}
+
+/** Card numbers and CVVs must not reach the UI or result.json. */
+function redactConfig(cfg: TestFlowConfig): Record<string, unknown> {
+  const { cards, ...rest } = cfg;
+  return { ...rest, cards: Array.isArray(cards) ? `${cards.length} card row(s) (redacted)` : undefined };
+}
+
+export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): Promise<TestFlowResult> {
+  const runId = existingRunId || randomUUID();
   const startedAt = new Date();
   const dir = path.resolve(config.testArtifactDir, `${cfg.caseId}-${startedAt.toISOString().replace(/[:.]/g, "-")}`);
   fs.mkdirSync(dir, { recursive: true });
@@ -143,11 +218,37 @@ export async function runTestFlow(cfg: TestFlowConfig): Promise<TestFlowResult> 
       textFile = `${base}.txt`;
     } catch { /* same */ }
     artifacts.push({ step, at: new Date().toISOString(), url: page.url(), screenshot, textFile, note });
+    publish();
+  };
+
+  /** Push the current state to the live map and result.json, so a poll mid-run
+   *  sees the steps that have already happened instead of an empty page. */
+  const publish = (final?: Partial<TestFlowResult>) => {
+    const snapshot: TestFlowResult = {
+      runId,
+      caseId: cfg.caseId,
+      status: "failed",
+      step: currentStep,
+      url: page && !page.isClosed() ? page.url() : "",
+      reachedPayments,
+      artifacts,
+      startedAt: startedAt.toISOString(),
+      finishedAt: "",
+      seconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
+      running: true,
+      config: redactConfig(cfg),
+      ...final,
+    };
+    liveRuns.set(runId, snapshot);
+    try {
+      fs.writeFileSync(path.join(dir, "result.json"), JSON.stringify(snapshot, null, 2), "utf8");
+    } catch { /* a run must not die because an artifact write failed */ }
   };
 
   const step = async (n: number, title: string) => {
     currentStep = `${n}. ${title}`;
     console.log(`\n========== STEP ${n}: ${title} ==========`);
+    publish();
   };
 
   const desktopBrowser = await launchStealthBrowser({ headless: cfg.headless ?? config.headless });
@@ -352,6 +453,7 @@ export async function runTestFlow(cfg: TestFlowConfig): Promise<TestFlowResult> 
       finishedAt: finishedAt.toISOString(),
       seconds: Math.round((finishedAt.getTime() - startedAt.getTime()) / 1000),
     };
+    publish({ ...result, running: false });
     writeResult(dir, result);
     return result;
   } catch (err) {
@@ -364,6 +466,7 @@ export async function runTestFlow(cfg: TestFlowConfig): Promise<TestFlowResult> 
       startedAt,
       reachedPayments,
     });
+    publish({ ...result, running: false });
     writeResult(dir, result);
     return result;
   } finally {

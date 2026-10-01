@@ -138,6 +138,21 @@ testRouter.get("/runs/:runId", (req, res) => {
   });
 });
 
+/** The run's full console log — which GST branch ran, what the API watcher saw. */
+testRouter.get("/runs/:runId/log", (req, res) => {
+  const run = findRun(String(req.params.runId));
+  if (!run?.logFile) {
+    res.status(404).json({ error: "No log for this run" });
+    return;
+  }
+  const resolved = path.resolve(run.logFile);
+  if (!resolved.startsWith(ARTIFACT_ROOT + path.sep) || !fs.existsSync(resolved)) {
+    res.status(404).json({ error: "Log file is missing" });
+    return;
+  }
+  res.type("text/plain").sendFile(resolved);
+});
+
 /** One artifact: `?kind=text` for the page text, otherwise the screenshot. */
 testRouter.get("/runs/:runId/art/:index", (req, res) => {
   const run = findRun(String(req.params.runId));

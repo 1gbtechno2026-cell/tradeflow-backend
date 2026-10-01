@@ -124,6 +124,9 @@ export interface TestFlowResult {
   running?: boolean;
   /** Echoed back so a run can be re-run or understood later. Cards redacted. */
   config?: Record<string, unknown>;
+  /** Everything the run printed, in order — the `[GST] …`, `[API] …` lines that
+   *  say which branch ran. Server-side path; the API serves it by run id. */
+  logFile?: string;
 }
 
 /** Codes that only say WHERE it broke — the page text usually says why. */
@@ -205,6 +208,22 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
   const startedAt = new Date();
   const dir = path.resolve(config.testArtifactDir, `${cfg.caseId}-${startedAt.toISOString().replace(/[:.]/g, "-")}`);
   fs.mkdirSync(dir, { recursive: true });
+
+  // Everything the run prints goes to run.log in its artifact folder. The
+  // checkout classes write with console.log directly, so wrapping it is the only
+  // way to see the `[GST] …` / `[API] …` lines that say which branch actually
+  // ran — the screenshots show what the page looked like, not what the code
+  // decided. One run at a time (startTestFlow enforces it), so the swap cannot
+  // interleave two runs; restored in `finally`.
+  const logFile = path.join(dir, "run.log");
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => {
+    originalLog(...args);
+    try {
+      const line = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
+      fs.appendFileSync(logFile, `${new Date().toISOString().slice(11, 23)} ${line}\n`);
+    } catch { /* the log must never fail the run it describes */ }
+  };
 
   const artifacts: StepArtifact[] = [];
   let currentStep = "starting";
@@ -455,10 +474,14 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
 
     // ================= PAYMENT =================
     const stopAfter = cfg.stopAfter || "payments";
-    if (stopAfter !== "payments" && reachedPayments) {
+    const mode = cfg.paymentMode || "none";
+    // With COD chosen, the payments page IS the verdict — "Cash on Delivery:
+    // Unavailable" is this ID's outcome — so it is read even when the run was
+    // only asked to reach payments. A run that stopped at the page and reported
+    // "success" over a greyed-out COD row is what this used to do.
+    if (reachedPayments && (stopAfter !== "payments" || mode === "cod")) {
       await step(9, `Payment surface (${stopAfter})`);
       const fk = new FlipkartPayment(mobPage, (lvl, msg) => log(lvl, msg));
-      const mode = cfg.paymentMode || "none";
 
       /**
        * The final amount, checked at the only place it is final.
@@ -545,24 +568,33 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       startedAt: startedAt.toISOString(),
       finishedAt: finishedAt.toISOString(),
       seconds: Math.round((finishedAt.getTime() - startedAt.getTime()) / 1000),
+      // Kept on the final record too. It used to live only in the mid-run
+      // snapshot, so a finished run could not say what it was asked to do.
+      config: redactConfig(cfg),
+      logFile,
     };
     publish({ ...result, running: false });
     writeResult(dir, result);
     return result;
   } catch (err) {
     await capture("99-failure");
-    const result = await explainFailure(err, page, (cfg.checkoutPincode || "").slice(-6), {
-      runId,
-      caseId: cfg.caseId,
-      step: currentStep,
-      artifacts,
-      startedAt,
-      reachedPayments,
-    });
+    const result: TestFlowResult = {
+      ...(await explainFailure(err, page, (cfg.checkoutPincode || "").slice(-6), {
+        runId,
+        caseId: cfg.caseId,
+        step: currentStep,
+        artifacts,
+        startedAt,
+        reachedPayments,
+      })),
+      config: redactConfig(cfg),
+      logFile,
+    };
     publish({ ...result, running: false });
     writeResult(dir, result);
     return result;
   } finally {
+    console.log = originalLog;
     // Leave the window up briefly when headed, so a failure can be looked at.
     // Headed runs stay open briefly so the last page can be inspected; a failure
     // gets longer, because that is the one you actually want to look at.

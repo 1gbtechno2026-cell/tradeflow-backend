@@ -5,6 +5,8 @@ import { config } from "../config.js";
 import { authenticatePayment, UnsupportedPaymentError } from "../paymentStrategies/index.js";
 import type { AuthType, CardDetails, PaymentResult } from "../paymentStrategies/types.js";
 import { CheckoutFailure } from "./checkoutErrors.js";
+import { NoPhoneAvailableError } from "./employeePhoneLease.js";
+import { OtpTimeoutError } from "./smsOtp.js";
 import {
   acquireCard,
   cardId,
@@ -250,6 +252,11 @@ export function remainingBudgetMs(payPressedAt: number): number {
 function asFailure(err: unknown): CheckoutFailure {
   if (err instanceof CheckoutFailure) return err;
   if (err instanceof UnsupportedPaymentError) return new CheckoutFailure("CARD_AUTH_FAILED", err.message);
+  // No code inside the 2-minute budget is its own outcome — the handset or the
+  // bank's SMS, not the card. It has had a code since the catalog was written;
+  // it was reaching the job as CARD_AUTH_FAILED because this mapping missed it.
+  if (err instanceof OtpTimeoutError) return new CheckoutFailure("OTP_TIMEOUT", err.message);
+  if (err instanceof NoPhoneAvailableError) return new CheckoutFailure("OTP_NOT_FOUND", err.message);
   return new CheckoutFailure("CARD_AUTH_FAILED", err instanceof Error ? err.message : String(err));
 }
 

@@ -35,9 +35,23 @@ interface CaseDef {
  */
 const CASES: CaseDef[] = [
   { id: "happy", title: "In stock + deliverable → payments page", patch: {}, expect: "success" },
+  // Every case below runs at the quantity in test-flow.json. Set it to what you
+  // actually want to order; the `qty` case only makes sense when that number is
+  // above the product's per-order cap.
   { id: "oos", title: "Out of stock product", patch: {}, expect: "PRODUCT_NOT_SERVICEABLE" },
   { id: "pincode", title: "Not deliverable to this pincode", patch: {}, expect: "ITEM_NOT_DELIVERABLE" },
-  { id: "qty", title: "Quantity above Flipkart's per-order limit", patch: { quantity: 50 }, expect: "MAX_UNITS_REACHED" },
+  {
+    id: "qty",
+    title: "Desired quantity is not available",
+    // No quantity override. The quantity under test is whatever the operator asked
+    // for — hardcoding 50 made the case read as "test the number 50", which is not
+    // the scenario. The scenario is "I asked for N and Flipkart will not give me
+    // N", and N is a real business input, different per product and per batch.
+    // Flipkart's own cap varies by product (16 on the Samsung M06), so a fixed
+    // number would also stop being over the limit the moment a cap went above it.
+    patch: {},
+    expect: "MAX_UNITS_REACHED",
+  },
 ];
 
 interface BaseConfig extends Omit<TestFlowConfig, "caseId" | "productUrl"> {

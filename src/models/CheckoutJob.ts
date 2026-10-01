@@ -167,6 +167,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       gstCompany: { type: String, default: "" },
       paymentUrl: { type: String, default: "" },
       flipkartOrderId: { type: String, default: "" },
+      flipkartReferenceId: { type: String, default: "" },
       transactionAmount: { type: String, default: "" },
       cartAfterCardOffer: { type: String, default: "" },
       cartAfterOfferPrelim: { type: String, default: "" },

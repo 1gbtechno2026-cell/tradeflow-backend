@@ -636,6 +636,7 @@ async function runClaimedCheckoutJob(
             }
           : {}),
         ...(payment.confirmation?.orderId ? { flipkartOrderId: payment.confirmation.orderId } : {}),
+        ...(payment.confirmation?.referenceId ? { flipkartReferenceId: payment.confirmation.referenceId } : {}),
         ...(payment.confirmation?.amount ? { transactionAmount: payment.confirmation.amount } : {}),
         ...orderDetailFields(payment.confirmation?.details),
         ...(payment.cardUsed ?? {}),

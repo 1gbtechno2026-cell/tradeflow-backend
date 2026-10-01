@@ -13,6 +13,7 @@
     "test:otp": "tsx src/scripts/otpParseTest.ts",
     "test:flow": "tsx src/scripts/testFlowCli.ts",
     "test:otp-plumbing": "tsx src/scripts/otpPlumbingTest.ts",
+    "backfill:order-ids": "tsx src/scripts/backfillOrderIds.ts",
     "test:classify": "tsx src/scripts/classifyTest.ts"
   },
   "dependencies": {

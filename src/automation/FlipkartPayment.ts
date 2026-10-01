@@ -2,7 +2,7 @@ import type { Page } from "playwright";
 import { CheckoutFailure } from "../services/checkoutErrors.js";
 import type { CardDetails } from "../paymentStrategies/types.js";
 import type { LogLevel } from "../types.js";
-import type { PaymentApiWatcher, PlacedOrderDetails } from "./PaymentApiWatcher.js";
+import { fullOrderId, shortOrderId, type PaymentApiWatcher, type PlacedOrderDetails } from "./PaymentApiWatcher.js";
 
 export type PaymentLogger = (level: LogLevel, message: string, step?: string) => void;
 
@@ -11,7 +11,10 @@ function last4(value: string): string {
 }
 
 export interface OrderConfirmation {
+  /** Full form, "OD" + 18 digits — what Flipkart's order pages use. */
   orderId: string;
+  /** Short form, "OD" + 16 digits — what the confirmation URL carries. */
+  referenceId?: string;
   amount: string;
   /** Present when the payment-page watcher saw Flipkart's own responses. */
   details?: PlacedOrderDetails | null;
@@ -422,7 +425,9 @@ export class FlipkartPayment {
             }
             // The numbers live in Flipkart's responses, not on this page.
             const details = this.api?.placedOrderDetails() ?? null;
-            const orderId = fromUrl || details?.orderId || text.match(/\bOD\d{12,}\b/)?.[0] || "";
+            // Full 20-character form, the one Flipkart's order pages use; the
+            // URL's reference_id is the short form (see fullOrderId).
+            const orderId = fullOrderId(details?.orderId || fromUrl || text.match(/\bOD\d{12,}\b/)?.[0] || "");
             const amount =
               details?.transactionAmount ||
               text.match(/(?:total|amount|paid)[^₹\n]{0,30}₹\s?([\d,]+(?:\.\d{1,2})?)/i)?.[1] ||
@@ -434,7 +439,7 @@ export class FlipkartPayment {
                 `${details?.bankName ? ` · ${details.bankName} ${details.cardBrand || ""}`.trimEnd() : ""}`,
               "payment"
             );
-            return { orderId, amount: amount ? `₹${amount}` : "", details };
+            return { orderId, referenceId: shortOrderId(orderId), amount: amount ? `₹${amount}` : "", details };
           }
           const failed = await this.detectPaymentFailedModal();
           if (failed) throw failed;

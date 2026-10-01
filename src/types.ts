@@ -89,7 +89,10 @@ export interface JobResultSnapshot {
   gstNumber: string;
   gstCompany: string;
   paymentUrl: string;
+  /** Full form, "OD" + 18 digits (…00) — what Flipkart's order pages use. */
   flipkartOrderId: string;
+  /** Short form, "OD" + 16 digits — what the confirmation URL carries. */
+  flipkartReferenceId?: string;
   transactionAmount: string;
   cartAfterCardOffer: string;
   cartAfterOfferPrelim: string;

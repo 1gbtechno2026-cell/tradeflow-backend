@@ -66,6 +66,25 @@ export interface PlacedOrderDetails {
   instrument?: string;
 }
 
+/**
+ * Flipkart's order id has two forms: the confirmation URL's reference_id
+ * ("OD" + 16 digits, e.g. OD4387716536843181) and the full id on the order
+ * pages, in the gateway's merchant_reference_id and in the confirmation data
+ * ("OD" + 18 digits — the same digits plus "00": OD438771653684318100). The
+ * full form is what the rest of the system keys on; the short one is derived
+ * by Flipkart from it, never the other way around.
+ */
+export function fullOrderId(id: string): string {
+  const s = String(id || "").trim().toUpperCase();
+  return /^OD\d{16}$/.test(s) ? `${s}00` : s;
+}
+
+/** The short form, as the confirmation URL writes it. */
+export function shortOrderId(id: string): string {
+  const s = String(id || "").trim().toUpperCase();
+  return /^OD\d{18}$/.test(s) && s.endsWith("00") ? s.slice(0, -2) : s;
+}
+
 /** Depth-first search for a key anywhere in a parsed JSON value. */
 function findKey(value: unknown, key: string, depth = 0): unknown {
   if (depth > 12 || value == null || typeof value !== "object") return null;
@@ -223,7 +242,13 @@ export class PaymentApiWatcher {
           const charges = (JSON.parse(pp.payment_handling_fees_details || "{}") as { applied_charges?: Array<{ amount?: number }> }).applied_charges ?? [];
           fee = paise(charges.reduce((n, ch) => n + Number(ch.amount || 0), 0));
         } catch { /* absent */ }
-        out.orderId = out.orderId || (pp.merchant_transaction_id || "").match(/OD\d{12,}/)?.[0] || "";
+        // merchant_reference_id is the FULL order id ("OD…00", 20 chars) —
+        // the form Flipkart's order pages use. merchant_transaction_id is the
+        // short form with "-TX-00" appended; only a fallback.
+        out.orderId =
+          out.orderId ||
+          (pp.merchant_reference_id || "").match(/OD\d{12,}/)?.[0] ||
+          fullOrderId((pp.merchant_transaction_id || "").match(/OD\d{12,}/)?.[0] || "");
         out.transactionAmount = paise(pp.transaction_amount);
         out.cartAfterCardOffer = primary;
         out.paymentFee = fee;

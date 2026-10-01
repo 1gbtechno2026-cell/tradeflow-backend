@@ -3,6 +3,7 @@ import { CheckoutJob } from "../models/CheckoutJob.js";
 import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
 import { FlipkartApiWatcher } from "../automation/FlipkartApiWatcher.js";
 import { PaymentApiWatcher, type PlacedOrderDetails } from "../automation/PaymentApiWatcher.js";
+import { closeReporter, openReporter, reporterFor } from "./jobReporter.js";
 import {
   readBatchProgress,
   releaseBatchReservation,
@@ -30,7 +31,15 @@ import {
 } from "./checkoutErrors.js";
 import type { CheckoutJobData, JobRequestSnapshot, JobResultSnapshot, JobStatus, LogLevel } from "../types.js";
 
+/** Inside a run, lines go through the job's JobReporter (batched: one write per
+ *  flush instead of one per line). Outside one — claim-time messages before the
+ *  reporter exists — they are written directly, as before. */
 async function appendLog(jobId: string, level: LogLevel, message: string, step?: string) {
+  const reporter = reporterFor(jobId);
+  if (reporter) {
+    reporter.log(level, message, step);
+    return;
+  }
   console.log(`[${jobId}] [${level}]${step ? ` [${step}]` : ""} ${message}`);
     const update: Record<string, unknown> = {
       $push: { logs: { at: new Date(), level, step, message } },
@@ -40,6 +49,11 @@ async function appendLog(jobId: string, level: LogLevel, message: string, step?:
 }
 
 async function patchResult(jobId: string, patch: Partial<JobResultSnapshot>) {
+  const reporter = reporterFor(jobId);
+  if (reporter) {
+    reporter.patch(patch);
+    return;
+  }
   const set: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(patch)) {
     if (value === undefined) continue;
@@ -89,6 +103,7 @@ async function finishWithoutChrome(
   extra?: { failedStep?: string; failure?: CheckoutFailure }
 ) {
   const mapped = extra?.failure;
+  await reporterFor(jobId)?.beforeTerminal();
   await CheckoutJob.updateOne(
     { _id: jobId, status: { $ne: "cancelled" } },
     {
@@ -254,10 +269,16 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     ).catch(() => undefined);
   }, HEARTBEAT_MS);
   heartbeat.unref?.();
+  // All of this job's log lines and result fields go to Mongo through one
+  // batched reporter from here on (see jobReporter.ts); closed, with a final
+  // flush, whatever way the run ends.
+  const reporter = openReporter(data.jobId);
   try {
     return await runClaimedCheckoutJob(data, job);
   } finally {
     clearInterval(heartbeat);
+    await closeReporter(data.jobId);
+    console.log(`[${data.jobId}] [info] [reporter] ${reporter.writes} batched write(s) for this job`);
   }
 }
 
@@ -593,6 +614,7 @@ async function runClaimedCheckoutJob(
         if (payment.cardUsed) await patchResult(data.jobId, payment.cardUsed);
         throw payment.failure;
       }
+      await reporterFor(data.jobId)?.beforeTerminal();
       job.status = "paid";
       job.step = "paid";
       job.completedAt = new Date();
@@ -660,6 +682,7 @@ async function runClaimedCheckoutJob(
     if (!failure) failure = classifyThrownMessage(rawMessage);
     const failedStep = failure.failedStep;
     log("error", `${failure.display}: ${failure.details}`, failedStep);
+    await reporterFor(data.jobId)?.beforeTerminal();
     await CheckoutJob.updateOne(
       { _id: data.jobId, status: { $ne: "cancelled" } },
       {

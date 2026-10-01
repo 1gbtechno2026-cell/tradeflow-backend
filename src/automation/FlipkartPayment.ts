@@ -393,10 +393,32 @@ export class FlipkartPayment {
           /* navigating */
         }
         if (/flipkart\.com$/i.test(host)) {
-          const text = String(await this.page.evaluate(() => document.body?.innerText || "").catch(() => "")).replace(/ /g, " ");
-          const orderId = text.match(/\bOD\d{12,}\b/)?.[0] || "";
+          const readText = () =>
+            this.page
+              .evaluate(() => document.body?.innerText || "")
+              .then((t) => String(t).replace(/ /g, " "))
+              .catch(() => "");
+          let text = await readText();
+          // The id is in the URL before it is on the page:
+          // /rv/orderConfirmation/orderresponse?reference_id=OD4387711732098711&…
+          const fromUrl = this.page.url().match(/[?&]reference_id=(OD\d{12,})/i)?.[1] || "";
           const placed = /order (?:placed|confirmed|successful)|thank you for (?:shopping|your order)|order id/i.test(text);
-          if (orderId || placed) {
+          if (fromUrl || placed) {
+            // The first paint says only "Order Placed / You saved ₹…" (seen on
+            // OD4387711732098711); the delivery date and the rest arrive a few
+            // seconds later. Wait for the text to grow and settle, up to 15s, so
+            // the capture and the fields below come from the finished page.
+            const settleBy = Date.now() + 15_000;
+            let last = text.length;
+            let stable = 0;
+            while (Date.now() < settleBy && stable < 2) {
+              await this.page.waitForTimeout(1000);
+              text = await readText();
+              if (text.length === last && text.length > 60) stable += 1;
+              else stable = 0;
+              last = text.length;
+            }
+            const orderId = fromUrl || text.match(/\bOD\d{12,}\b/)?.[0] || "";
             const amount = text.match(/(?:total|amount|paid)[^₹\n]{0,30}₹\s?([\d,]+(?:\.\d{1,2})?)/i)?.[1] || "";
             this.log("info", `[fk-pay] order confirmed${orderId ? ` — ${orderId}` : ""}${amount ? ` ₹${amount}` : ""}`, "payment");
             return { orderId, amount: amount ? `₹${amount}` : "" };

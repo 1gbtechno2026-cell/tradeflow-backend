@@ -174,6 +174,18 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       authType: { type: String, default: "" },
       employeeId: { type: String, default: "" },
       authenticatedAt: { type: Date, default: null },
+      // From Flipkart's gateway / order-confirmation responses after a placed
+      // order. Declared, or strict mode drops them silently on save.
+      paymentFee: { type: String, default: "" },
+      bankTransactionId: { type: String, default: "" },
+      pgTransactionId: { type: String, default: "" },
+      bankName: { type: String, default: "" },
+      cardBrand: { type: String, default: "" },
+      supercoinsApplied: { type: String, default: "" },
+      promiseDays: { type: Number },
+      promiseDate: { type: Date, default: null },
+      orderStatus: { type: String, default: "" },
+      sellerName: { type: String, default: "" },
     },
     logs: { type: [JobLogSchema], default: [] },
     bullmqJobId: { type: String },

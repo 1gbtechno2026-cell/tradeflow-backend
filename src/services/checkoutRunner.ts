@@ -2,7 +2,7 @@ import type { Page } from "playwright";
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
 import { FlipkartApiWatcher } from "../automation/FlipkartApiWatcher.js";
-import { PaymentApiWatcher } from "../automation/PaymentApiWatcher.js";
+import { PaymentApiWatcher, type PlacedOrderDetails } from "../automation/PaymentApiWatcher.js";
 import {
   readBatchProgress,
   releaseBatchReservation,
@@ -46,6 +46,31 @@ async function patchResult(jobId: string, patch: Partial<JobResultSnapshot>) {
     set[`result.${key}`] = value;
   }
   if (Object.keys(set).length) await CheckoutJob.updateOne({ _id: jobId }, { $set: set });
+}
+
+/**
+ * The placed order's numbers, as result fields. From Flipkart's own gateway
+ * and confirmation responses (PaymentApiWatcher.placedOrderDetails) — the
+ * confirmation PAGE says only "Order Placed" behind a scratch card.
+ */
+export function orderDetailFields(d: PlacedOrderDetails | null | undefined, placedAt = new Date()): Partial<JobResultSnapshot> {
+  if (!d) return {};
+  const promiseDate =
+    d.promiseDays != null ? new Date(placedAt.getTime() + d.promiseDays * 24 * 60 * 60 * 1000) : undefined;
+  return {
+    ...(d.transactionAmount ? { transactionAmount: d.transactionAmount } : {}),
+    ...(d.cartAfterCardOffer ? { cartAfterCardOffer: d.cartAfterCardOffer } : {}),
+    ...(d.paymentFee ? { paymentFee: d.paymentFee } : {}),
+    ...(d.bankTransactionId ? { bankTransactionId: d.bankTransactionId } : {}),
+    ...(d.pgTransactionId ? { pgTransactionId: d.pgTransactionId } : {}),
+    ...(d.bankName ? { bankName: d.bankName } : {}),
+    ...(d.cardBrand ? { cardBrand: d.cardBrand } : {}),
+    ...(d.supercoinsApplied ? { supercoinsApplied: d.supercoinsApplied } : {}),
+    ...(d.giftCardApplied ? { giftCardApplied: d.giftCardApplied } : {}),
+    ...(d.promiseDays != null ? { promiseDays: d.promiseDays, promiseDate } : {}),
+    ...(d.orderStatus ? { orderStatus: d.orderStatus } : {}),
+    ...(d.sellerName ? { sellerName: d.sellerName } : {}),
+  };
 }
 
 function batchLimits(data: CheckoutJobData) {
@@ -581,6 +606,7 @@ async function runClaimedCheckoutJob(
           : {}),
         ...(payment.confirmation?.orderId ? { flipkartOrderId: payment.confirmation.orderId } : {}),
         ...(payment.confirmation?.amount ? { transactionAmount: payment.confirmation.amount } : {}),
+        ...orderDetailFields(payment.confirmation?.details),
       });
       log(
         "info",

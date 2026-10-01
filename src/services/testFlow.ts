@@ -23,6 +23,8 @@ import { toCardDetails } from "./paymentCards.js";
 import { verdictFor } from "./cardPool.js";
 import { authenticatePayment } from "../paymentStrategies/index.js";
 import { remainingBudgetMs } from "./paymentPhase.js";
+import { orderDetailFields } from "./checkoutRunner.js";
+import type { JobResultSnapshot } from "../types.js";
 import type { AuthType, CardDetails } from "../paymentStrategies/types.js";
 import type { AddressDetails, LogLevel } from "../types.js";
 
@@ -155,8 +157,9 @@ export interface TestFlowResult {
     calls: number;
     file: string | null;
   };
-  /** Set when Flipkart confirmed an order: this run spent real money. */
-  order?: { orderId: string; amount: string };
+  /** Set when Flipkart confirmed an order: this run spent real money. The
+   *  details are what the worker stores on the job (orderDetailFields). */
+  order?: { orderId: string; amount: string; details?: Partial<JobResultSnapshot> };
 }
 
 /** Codes that only say WHERE it broke — the page text usually says why. */
@@ -349,7 +352,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
   const desktopBrowser = await launchStealthBrowser({ headless: cfg.headless ?? config.headless });
   let mobileBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
   let reachedPayments = false;
-  let order: { orderId: string; amount: string } | undefined;
+  let order: TestFlowResult["order"];
 
   try {
     // ---- session, before any browser work is wasted -----------------------
@@ -642,15 +645,17 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
           }
           // Back on Flipkart. A bank "yes" is not an order: Flipkart can still
           // fail it, and that page is the final word.
-          let confirmation: { orderId: string; amount: string };
+          let confirmation: Awaited<ReturnType<typeof fk.waitForOrderConfirmation>>;
           try {
             confirmation = await fk.waitForOrderConfirmation();
           } finally {
             await capture("15-flipkart-after-bank");
           }
-          order = confirmation;
+          const details = orderDetailFields(confirmation.details);
+          order = { orderId: confirmation.orderId, amount: confirmation.amount, details };
           await capture("16-order-confirmed", `order ${confirmation.orderId || "(no id)"} ${confirmation.amount}`);
           console.log(`  ORDER PLACED: ${confirmation.orderId || "(no id read)"} ${confirmation.amount}`);
+          if (Object.keys(details).length) console.log(`  order details: ${JSON.stringify(details)}`);
         }
       }
     }

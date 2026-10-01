@@ -94,6 +94,19 @@ export interface JobResultSnapshot {
   cartAfterCardOffer: string;
   cartAfterOfferPrelim: string;
   giftCardApplied: string;
+  /** From Flipkart's gateway response and order-confirmation data, read
+   *  passively after a placed order. Rupees as strings; see PaymentApiWatcher. */
+  paymentFee?: string;
+  bankTransactionId?: string;
+  pgTransactionId?: string;
+  bankName?: string;
+  cardBrand?: string;
+  supercoinsApplied?: string;
+  /** Flipkart's delivery promise in days from the order (sla.maxSla). */
+  promiseDays?: number;
+  promiseDate?: Date;
+  orderStatus?: string;
+  sellerName?: string;
   /** Which card type and credential arm actually authenticated. Last 4 only —
    *  no full PAN is ever written to a persisted document. */
   cardTypeName?: string;

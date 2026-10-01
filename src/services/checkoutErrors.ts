@@ -16,6 +16,7 @@ export type CheckoutErrorCode =
   | "SLA_EXCEEDED"
   | "CART_AMOUNT_LIMIT"
   | "SESSION_EXPIRED"
+  | "PINCODE_NOT_SET"
   | "INSUFFICIENT_BALANCE"
   | "CARD_AUTH_FAILED"
   | "OTP_TIMEOUT"
@@ -139,6 +140,26 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     failedStep: "session",
     stageDisplay: "Session",
   },
+  /**
+   * Flipkart is asking for a delivery pincode — it has not judged the product yet.
+   *
+   * Its own code, because it used to be ITEM_NOT_DELIVERABLE, which carries
+   * filterBatch: true. That turned "we have not told Flipkart the pincode" into
+   * "this product cannot be delivered here", marked the ENTIRE batch filtered and
+   * queued no retry. A fixable, transient page state permanently killed a batch —
+   * exactly what happened on 2026-09-30, where a single job ended the run with
+   * purchased 0.
+   *
+   * filterBatch is deliberately absent (false): this says nothing about
+   * deliverability, so nothing about the other jobs in the batch should change.
+   */
+  PINCODE_NOT_SET: {
+    code: "PINCODE_NOT_SET",
+    display: "Delivery pincode was not set on the page",
+    source: "PLATFORM",
+    failedStep: "pincode",
+    stageDisplay: "Product",
+  },
   INSUFFICIENT_BALANCE: {
     code: "INSUFFICIENT_BALANCE",
     display: "Insufficient bank account balance",
@@ -209,11 +230,30 @@ function lineMatching(text: string, re: RegExp): string {
 }
 
 /** Scan Flipkart page text for a known blocker. */
-export function classifyPageText(raw: string, pincode = ""): CheckoutFailure | null {
+export function classifyPageText(
+  raw: string,
+  pincode = "",
+  opts: { purchasable?: boolean } = {}
+): CheckoutFailure | null {
   const text = raw.replace(/\u00a0/g, " ");
   const compact = text.replace(/\s+/g, " ").trim();
   const pin = pincode.replace(/\D/g, "").slice(-6);
-  const hasNotify = /\bNotify Me\b/i.test(compact);
+
+  /**
+   * Does this page still offer to sell us the thing?
+   *
+   * A Flipkart PDP is full of other people's stock: colour variants, "similar
+   * products", recently-viewed tiles. Any of them can say "Out of stock" while the
+   * product we actually want is perfectly buyable \u2014 and a plain text scan then
+   * reports PRODUCT_UNAVAILABLE for a page with a live Buy Now button on it.
+   *
+   * So when a top-level "Buy now" / "Add to cart" is present, stock wording is
+   * treated as belonging to something else on the page. Auto-detected rather than
+   * passed in, because there are many call sites and one that forgets gets a
+   * confident wrong answer; a caller can still force it either way.
+   */
+  const purchasable = opts.purchasable ?? /^\s*(buy now|add to cart)\b/im.test(text);
+  const hasNotify = !purchasable && /\bNotify Me\b/i.test(compact);
 
   if (/you'?ve reached the maximum units allowed/i.test(compact)) {
     return new CheckoutFailure("MAX_UNITS_REACHED", lineMatching(text, /maximum units/i));
@@ -228,11 +268,14 @@ export function classifyPageText(raw: string, pincode = ""): CheckoutFailure | n
     /enter pincode to see if the product is in stock/i.test(compact) ||
     /enter delivery pincode/i.test(compact)
   ) {
+    // PINCODE_NOT_SET, not ITEM_NOT_DELIVERABLE: Flipkart is ASKING for a pincode,
+    // which means it has not judged deliverability at all. Classifying it as
+    // "not deliverable" filtered the whole batch over a page state a retry fixes.
     return new CheckoutFailure(
-      "ITEM_NOT_DELIVERABLE",
+      "PINCODE_NOT_SET",
       pin
-        ? `Enter pincode to see if the product is in stock (${pin})`
-        : "Enter pincode to see if the product is in stock"
+        ? `Flipkart is still asking for a delivery pincode (${pin} not applied yet)`
+        : "Flipkart is still asking for a delivery pincode"
     );
   }
   if (
@@ -265,17 +308,39 @@ export function classifyPageText(raw: string, pincode = ""): CheckoutFailure | n
       pin ? `This product is not available on this pin (${pin})` : lineMatching(text, /not deliverable/i)
     );
   }
+  // A seller that will not ship here is a DELIVERY problem, not a stock one. The
+  // generic rules above only match "…to your address"; Flipkart also writes the
+  // pincode, or names the seller.
+  if (
+    /seller does ?n[o']t deliver/i.test(compact) ||
+    /no sellers? (deliver|ships?)/i.test(compact) ||
+    (/not deliverable/i.test(compact) && /\d{6}/.test(compact))
+  ) {
+    return new CheckoutFailure(
+      "ITEM_NOT_DELIVERABLE",
+      lineMatching(text, /not deliverable|does ?n[o']t deliver|no sellers? (deliver|ships?)/i)
+    );
+  }
   const oos = compact.match(
-    /(?:currently\s+)?(?:out of stock|not serviceable|not available|not deliverable|currently unavailable)\s+(?:for|to)\s+(\d{6})/i
+    /(?:currently\s+)?(?:out of stock|not serviceable|not available|currently unavailable)\s+(?:for|to)\s+(\d{6})/i
   );
   if (oos) {
-    return new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", lineMatching(text, /out of stock|not serviceable|not available|not deliverable/i));
+    return new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", lineMatching(text, /out of stock|not serviceable|not available/i));
   }
-  if (pin && /out of stock/i.test(compact) && compact.includes(pin)) {
+  if (!purchasable && pin && /out of stock/i.test(compact) && compact.includes(pin)) {
     return new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", `Currently out of stock for ${pin}`);
   }
   if (hasNotify) {
     return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
+  }
+  // A sold-out PDP that offers no Notify Me and names no pincode. Guarded by
+  // `purchasable`, so a live page whose colour variants are out of stock is not
+  // caught by it — that is the whole reason the guard exists.
+  if (!purchasable && /\bsold out\b|\bcurrently out of stock\b|\bcurrently unavailable\b/i.test(compact)) {
+    return new CheckoutFailure(
+      "PRODUCT_UNAVAILABLE",
+      lineMatching(text, /sold out|currently out of stock|currently unavailable/i)
+    );
   }
   if (/insufficient (funds|balance)|insufficient bank/i.test(compact)) {
     return new CheckoutFailure("INSUFFICIENT_BALANCE", lineMatching(text, /insufficient/i));
@@ -296,7 +361,7 @@ export function classifyThrownMessage(message: string, pageText = ""): CheckoutF
     return new CheckoutFailure("PRODUCT_UNAVAILABLE", m);
   }
   if (/enter pincode to see if the product is in stock|enter delivery pincode/i.test(m)) {
-    return new CheckoutFailure("ITEM_NOT_DELIVERABLE", m);
+    return new CheckoutFailure("PINCODE_NOT_SET", m);
   }
   if (/out of stock|not serviceable/i.test(m)) return new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", m);
   if (/not deliverable/i.test(m)) return new CheckoutFailure("ITEM_NOT_DELIVERABLE", m);

@@ -231,6 +231,10 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
     originalLog(...args);
     try {
       const line = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
+      // The harness runs inside the API process, whose request logger shares
+      // console.log; the UI's 2s polling would otherwise outnumber the run's
+      // own lines three to one.
+      if (line.startsWith("[trade-flow]")) return;
       fs.appendFileSync(logFile, `${new Date().toISOString().slice(11, 23)} ${line}\n`);
     } catch { /* the log must never fail the run it describes */ }
   };

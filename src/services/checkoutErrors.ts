@@ -18,6 +18,7 @@ export type CheckoutErrorCode =
   | "SESSION_EXPIRED"
   | "PINCODE_NOT_SET"
   | "COD_UNAVAILABLE"
+  | "PAYMENT_FAILED"
   | "INSUFFICIENT_BALANCE"
   | "CARD_AUTH_FAILED"
   | "OTP_TIMEOUT"
@@ -182,6 +183,19 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     failedStep: "payment",
     stageDisplay: "Processing Payment",
     noRetry: true,
+  },
+  /**
+   * Flipkart's own payment failure, before or instead of the bank: the modal
+   * "Your payment couldn't be processed due to a technical error. Please try
+   * again." over the card form after Pay. Flipkart's side, so the card is kept
+   * and the same ID may be retried — the modal itself says to.
+   */
+  PAYMENT_FAILED: {
+    code: "PAYMENT_FAILED",
+    display: "Flipkart could not process the payment",
+    source: "PLATFORM",
+    failedStep: "payment",
+    stageDisplay: "Processing Payment",
   },
   INSUFFICIENT_BALANCE: {
     code: "INSUFFICIENT_BALANCE",
@@ -368,6 +382,9 @@ export function classifyPageText(
   if (hasNotify) {
     return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
   }
+  if (/payment (?:couldn'?t|could not|cannot) be processed|due to a technical error/i.test(compact)) {
+    return new CheckoutFailure("PAYMENT_FAILED", lineMatching(text, /couldn'?t be processed|could not be processed|technical error/i));
+  }
   if (/insufficient (funds|balance)|insufficient bank/i.test(compact)) {
     return new CheckoutFailure("INSUFFICIENT_BALANCE", lineMatching(text, /insufficient/i));
   }
@@ -442,6 +459,9 @@ export function classifyThrownMessage(message: string, pageText = ""): CheckoutF
   if (/OTP/i.test(m)) return new CheckoutFailure("OTP_NOT_FOUND", m);
   if (/cash on delivery.*(unavailable|not available)|\bCOD\b.*(unavailable|not available)/i.test(m)) {
     return new CheckoutFailure("COD_UNAVAILABLE", m);
+  }
+  if (/payment (?:couldn'?t|could not|cannot) be processed|due to a technical error/i.test(m)) {
+    return new CheckoutFailure("PAYMENT_FAILED", m);
   }
   if (/insufficient/i.test(m)) return new CheckoutFailure("INSUFFICIENT_BALANCE", m);
   return new CheckoutFailure("UNKNOWN", m);

@@ -184,20 +184,82 @@ export class FlipkartPayment {
     // Selector: button inside form#cards with text starting with "Pay"
     // DOM: <form id="cards"> ... <button ...>Pay ₹166 </button>
     // This is robust because it ignores the exact amount (which changes per order).
-    const payButton = this.page.locator('form#cards button:has-text("Pay")').first();
+    const payButton = () => this.page.locator('form#cards button:has-text("Pay")').first();
 
-    if (await payButton.count() === 0) {
+    if ((await payButton().count()) === 0) {
       throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "Pay button not found in card form");
     }
 
-    if (!(await payButton.isEnabled())) {
+    if (!(await payButton().isEnabled())) {
       throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "Pay button is disabled");
     }
 
-    await payButton.click({ timeout: 10_000 });
-    
-    // Give the page a moment to register the click and show a spinner/disable the button
-    await this.page.waitForTimeout(2000);
+    await payButton().click({ timeout: 10_000 });
+    this.log("info", "[fk-pay] Pay pressed", "payment");
+
+    // The first Pay on a card Flipkart has not seen does NOT go to the bank.
+    // Measured on the 2026-10-01 run: Flipkart answered it with an RBI
+    // tokenisation step — a bottom sheet ("Secure your card as per RBI
+    // guidelines": Yes, secure my card / Maybe later), an inline "Secure my
+    // card as per RBI guidelines" checkbox that is NOT in the DOM before this
+    // moment, a ₹54 payment handling fee, and a re-rendered Pay button at the
+    // new amount. The hand-off only happens after that consent and a second
+    // Pay. Without this the run waited 60s for a bank page that never came.
+    //
+    // The operator's instruction is to secure (tokenise) the card, so the sheet
+    // gets "Yes" and the checkbox gets ticked. The second Pay is pressed at most
+    // once, and only when the consent checkbox is present — the one signal that
+    // the first press was intercepted rather than slowly submitted — so a slow
+    // redirect can never be double-charged.
+    // <button data-testid="secure-card-primary-btn">Yes, secure my card</button>
+    const consentYes = this.page
+      .locator('[data-testid="secure-card-primary-btn"]')
+      .or(this.page.getByText(/^\s*Yes, secure my card\s*$/i))
+      .first();
+    const rbiLabel = this.page.getByText(/^\s*Secure my card as per RBI guidelines\s*$/i).first();
+    const rbiBox = this.page.locator('label:has-text("Secure my card as per RBI guidelines") input[type="checkbox"]').first();
+    let secondPay = false;
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      if (!/flipkart\.com$/i.test(new URL(this.page.url()).hostname)) return; // handed off to the bank
+      // Flipkart's own failure modal ends it here, with its sentence — not
+      // after a 60s wait for a bank page that is not coming.
+      const failed = await this.detectPaymentFailedModal();
+      if (failed) throw failed;
+      if (await consentYes.isVisible().catch(() => false)) {
+        await consentYes.click({ timeout: 5000 });
+        this.log("info", "[fk-pay] RBI consent sheet — chose 'Yes, secure my card'", "payment");
+        await this.page.waitForTimeout(1500);
+        continue;
+      }
+      const hasBox = (await rbiBox.count()) > 0;
+      if (hasBox && !(await rbiBox.isChecked().catch(() => true))) {
+        // The input is a styled control; check() fails when it is not the
+        // visible element, so fall back to the label text, which is.
+        try {
+          await rbiBox.check({ timeout: 3000 });
+        } catch {
+          await rbiLabel.click({ timeout: 5000 });
+        }
+        this.log("info", "[fk-pay] ticked 'Secure my card as per RBI guidelines'", "payment");
+        await this.page.waitForTimeout(800);
+        continue;
+      }
+      if (hasBox && !secondPay) {
+        const btn = payButton();
+        if ((await btn.count()) > 0 && (await btn.isEnabled().catch(() => false))) {
+          const label = (await btn.innerText().catch(() => "Pay")).replace(/\s+/g, " ").trim();
+          await btn.click({ timeout: 10_000 });
+          secondPay = true;
+          this.log("info", `[fk-pay] consent given — pressed '${label}' again (fee may have been added)`, "payment");
+          await this.page.waitForTimeout(1500);
+          continue;
+        }
+      }
+      await this.page.waitForTimeout(500);
+    }
+    // Still on Flipkart after the consent dance: waitForBankHandoff decides,
+    // with its own timeout and inline-rejection check.
   }
 
   async waitForBankHandoff(timeoutMs = 60_000): Promise<string> {
@@ -222,7 +284,24 @@ export class FlipkartPayment {
     }
   }
 
+  /**
+   * The modal Flipkart shows over the card form when its own side fails after
+   * Pay: "Your payment couldn't be processed due to a technical error. Please
+   * try again." + a "Retry payment" button. Seen 2026-10-01 on the POCO C85
+   * run. Not the bank and not the card — reported as PAYMENT_FAILED with
+   * Flipkart's sentence, and the card stays in the pool.
+   */
+  async detectPaymentFailedModal(): Promise<CheckoutFailure | null> {
+    const modal = this.page.getByText(/payment (?:couldn'?t|could not|cannot) be processed|due to a technical error/i).first();
+    if (!(await modal.isVisible().catch(() => false))) return null;
+    const text = (await modal.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+    this.log("warn", `[fk-pay] Flipkart payment failure modal: "${text}"`, "payment");
+    return new CheckoutFailure("PAYMENT_FAILED", text || "Your payment couldn't be processed due to a technical error");
+  }
+
   async detectCardRejectedByFlipkart(): Promise<CheckoutFailure | null> {
+    const failed = await this.detectPaymentFailedModal();
+    if (failed) return failed;
     // Look for inline error text on the card form.
     // Since we don't have the exact DOM for the error state, we look for common error classes/text.
     const errorElement = this.page.locator('.error-message, .inline-error, [data-testid="error-message"], span:has-text("Invalid Card")').first();

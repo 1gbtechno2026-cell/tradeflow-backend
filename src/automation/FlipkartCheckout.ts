@@ -422,11 +422,17 @@ export class FlipkartCheckout {
       }
       return { notifyBtn, body: document.body?.innerText || "" };
     });
-    if (scan.notifyBtn) {
-      return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
-    }
+    // Page text first: it ranks "out of stock for <pincode>" above a sold-out
+    // product, and ignores stock words when the page still offers Buy now / Add
+    // to cart (variant tiles and "similar products" say "Out of stock" all the
+    // time). The visible-button scan only decides when the text found nothing,
+    // and never on a page that is still purchasable — a "Notify Me" on some
+    // other tile is not a verdict on this product.
     const fromText = classifyPageText(scan.body, pincode);
     if (fromText) return fromText;
+    if (scan.notifyBtn && !/^\s*(buy now|add to cart)\b/im.test(scan.body)) {
+      return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
+    }
     const pdp = await this.scanFlipkartPdp();
     if (pdp.locationSliderOpen || pdp.notDeliverable) {
       if (pdp.locationSliderOpen) {

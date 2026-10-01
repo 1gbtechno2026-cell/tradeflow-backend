@@ -330,17 +330,20 @@ export function classifyPageText(
   if (!purchasable && pin && /out of stock/i.test(compact) && compact.includes(pin)) {
     return new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", `Currently out of stock for ${pin}`);
   }
-  if (hasNotify) {
-    return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
-  }
-  // A sold-out PDP that offers no Notify Me and names no pincode. Guarded by
-  // `purchasable`, so a live page whose colour variants are out of stock is not
-  // caught by it — that is the whole reason the guard exists.
-  if (!purchasable && /\bsold out\b|\bcurrently out of stock\b|\bcurrently unavailable\b/i.test(compact)) {
+  // A sold-out PDP that names no pincode. Guarded by `purchasable`, so a live
+  // page whose colour variants are out of stock is not caught by it — that is
+  // the whole reason the guard exists. Checked before Notify Me so the failure
+  // carries Flipkart's own words ("Out of stock") rather than ours: a real
+  // sold-out iPhone 16 page says exactly "Out of stock" beside the variant, with
+  // a Notify Me button under it.
+  if (!purchasable && /\bsold out\b|\bout of stock\b|\bcurrently unavailable\b/i.test(compact)) {
     return new CheckoutFailure(
       "PRODUCT_UNAVAILABLE",
-      lineMatching(text, /sold out|currently out of stock|currently unavailable/i)
+      lineMatching(text, /sold out|out of stock|currently unavailable/i)
     );
+  }
+  if (hasNotify) {
+    return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
   }
   if (/insufficient (funds|balance)|insufficient bank/i.test(compact)) {
     return new CheckoutFailure("INSUFFICIENT_BALANCE", lineMatching(text, /insufficient/i));

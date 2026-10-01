@@ -38,7 +38,10 @@ const CASES: CaseDef[] = [
   // Every case below runs at the quantity in test-flow.json. Set it to what you
   // actually want to order; the `qty` case only makes sense when that number is
   // above the product's per-order cap.
-  { id: "oos", title: "Out of stock product", patch: {}, expect: "PRODUCT_NOT_SERVICEABLE" },
+  // A sold-out product page ("Out of stock" + Notify Me, no pincode named) is
+  // PRODUCT_UNAVAILABLE. PRODUCT_NOT_SERVICEABLE is reserved for "out of stock
+  // for <pincode>", which is a different page and filters the batch.
+  { id: "oos", title: "Out of stock / sold out product", patch: {}, expect: "PRODUCT_UNAVAILABLE" },
   { id: "pincode", title: "Not deliverable to this pincode", patch: {}, expect: "ITEM_NOT_DELIVERABLE" },
   {
     id: "qty",

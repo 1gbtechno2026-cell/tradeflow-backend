@@ -123,23 +123,26 @@ async function enterPassword(ctx: PaymentContext, password: string): Promise<voi
       );
     }
   }
-  await box.fill(password, { timeout: 10_000 });
+  // The page's scripts (timer, the TS_Injection iframe) initialise AFTER the
+  // field is visible. On the worker run of 2026-10-02 the hand-off was caught
+  // on PayU's intermediate page, the ACS loaded underneath, the password went
+  // in 2s later and the Submit click was swallowed — 90s of nothing. So: let
+  // the page settle, make sure the value is still in the field, and submit
+  // three ways if the first does not move the page.
+  await ctx.page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
+  await ctx.page.waitForTimeout(800);
   const acsHost = new URL(ctx.page.url()).hostname;
-  await ctx.page.locator(SUBMIT_CONTROL).first().click({ timeout: 10_000 });
-  ctx.log("info", "[pay] HDFC Virtual: password submitted");
 
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    let host = "";
+  const hostNow = () => {
     try {
-      host = new URL(ctx.page.url()).hostname;
+      return new URL(ctx.page.url()).hostname;
     } catch {
-      /* mid-navigation */
+      return "";
     }
-    if (host && host !== acsHost) {
-      ctx.log("info", `[pay] HDFC Virtual: authenticated — ACS handed back to ${host}`);
-      return;
-    }
+  };
+  const movedOrRefused = async (): Promise<"moved" | "stay"> => {
+    const host = hostNow();
+    if (host && host !== acsHost) return "moved";
     const text = await pageText(ctx);
     const bank = classifyBankText(text);
     if (bank && bank.code === "INSUFFICIENT_BALANCE") throw bank;
@@ -147,8 +150,45 @@ async function enterPassword(ctx: PaymentContext, password: string): Promise<voi
       .split(/\n+/)
       .map((l) => l.trim())
       .find((l) => l && l.length < 240 && PASSWORD_REJECTED.test(l));
-    if (rejected) {
-      throw new CheckoutFailure("CARD_AUTH_FAILED", `HDFC rejected the password: ${rejected}`);
+    if (rejected) throw new CheckoutFailure("CARD_AUTH_FAILED", `HDFC rejected the password: ${rejected}`);
+    return "stay";
+  };
+  const settle = async (ms: number): Promise<"moved" | "stay"> => {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      if ((await movedOrRefused()) === "moved") return "moved";
+      await ctx.page.waitForTimeout(500);
+    }
+    return "stay";
+  };
+
+  const attempts: Array<[string, () => Promise<void>]> = [
+    ["Submit click", () => ctx.page.locator(SUBMIT_CONTROL).first().click({ timeout: 10_000 })],
+    ["Enter in the field", () => box.press("Enter", { timeout: 5_000 })],
+    ["page's authSubmit()", () => ctx.page.evaluate(() => (window as unknown as { authSubmit?: () => void }).authSubmit?.())],
+  ];
+  let submitted = false;
+  for (const [how, go] of attempts) {
+    // Re-fill if the page's init cleared the field.
+    if (((await box.inputValue().catch(() => "")) || "").length !== password.length) {
+      await box.fill(password, { timeout: 10_000 });
+    }
+    await go().catch((err: unknown) => {
+      ctx.log("warn", `[pay] HDFC Virtual: ${how} failed: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`);
+    });
+    ctx.log("info", `[pay] HDFC Virtual: password submitted (${how})`);
+    submitted = true;
+    if ((await settle(8_000)) === "moved") break;
+    if (hostNow() !== acsHost) break;
+    ctx.log("warn", `[pay] HDFC Virtual: page did not move after ${how} — trying the next way`);
+  }
+  if (!submitted) throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "HDFC's page offered no way to submit the password");
+
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    if ((await movedOrRefused()) === "moved") {
+      ctx.log("info", `[pay] HDFC Virtual: authenticated — ACS handed back to ${hostNow()}`);
+      return;
     }
     await ctx.page.waitForTimeout(500);
   }

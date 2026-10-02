@@ -122,11 +122,32 @@ export class FlipkartPayment {
     // spacing silently matches nothing.
     const cardTab = this.page.getByText(/^Credit\s*\/\s*Debit\s*\/\s*ATM Card$/i).first();
 
-    if ((await cardTab.count()) === 0) {
+    try {
+      await cardTab.waitFor({ state: "visible", timeout: 15_000 });
+    } catch {
       throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "Credit/Debit Card option not found on page");
     }
 
-    await cardTab.click({ timeout: 10_000 });
+    // Open the card section and PROVE it opened: the card-number input is the
+    // signal, not the click resolving. A worker run on 2026-10-02 hung inside
+    // click() for 10s ("performing click action") on a page still settling
+    // after a 75s checkout; a tap with a short timeout, checked against the
+    // form, and tried again is what survives that.
+    const cardInput = this.page.locator("#cc-input").first();
+    let opened = false;
+    for (let attempt = 1; attempt <= 3 && !opened; attempt++) {
+      if (await cardInput.isVisible().catch(() => false)) {
+        opened = true;
+        break;
+      }
+      await cardTab.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => undefined);
+      await cardTab.tap({ timeout: 4000 }).catch(() => cardTab.click({ timeout: 4000, force: true }).catch(() => undefined));
+      opened = await cardInput.waitFor({ state: "visible", timeout: 6000 }).then(() => true).catch(() => false);
+      if (!opened) this.log("warn", `[fk-pay] card section did not open on tap ${attempt}/3`, "payment");
+    }
+    if (!opened) {
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "Credit/Debit Card section did not open (no card-number field after 3 taps)");
+    }
 
     // Trap #2: escape the saved-card panel if it opens.
     //

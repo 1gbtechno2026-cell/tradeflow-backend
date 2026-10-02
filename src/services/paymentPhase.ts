@@ -233,6 +233,19 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
   } catch (err) {
     const failure = asFailure(err);
 
+    // What the gateway itself answered, on the job log: the only place the
+    // reason behind "Payment Failed" is written down, and the thing to take
+    // to Flipkart or the bank.
+    const g = input.paymentApi?.lastGatewayResult() ?? null;
+    if (g) {
+      log(
+        "warn",
+        `[pay] gateway said: ${g.responseStatus || "?"}${g.statusCode ? ` ${g.statusCode}` : ""}` +
+          `${g.message ? ` "${g.message}"` : ""}${g.txnId ? ` txn ${g.txnId}` : ""}`,
+        "payment"
+      );
+    }
+
     // Decide what this says about the CARD, as opposed to about the order. Only a
     // verdict of dead/paused removes it from the pool; anything ambiguous keeps
     // it, because wrongly retiring a card costs the whole batch a card while

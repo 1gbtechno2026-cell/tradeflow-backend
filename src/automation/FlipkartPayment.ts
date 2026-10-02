@@ -464,6 +464,19 @@ export class FlipkartPayment {
           }
           const failed = await this.detectPaymentFailedModal();
           if (failed) throw failed;
+          // Flipkart's "Payment Failed" / "Order Failed" page, read the moment it
+          // appears — not after the confirmation timeout, which is what left a
+          // worker job sitting two minutes on a refusal it had already been
+          // shown. The gateway's own verdict is appended when the watcher saw it.
+          const failLine = text
+            .split(/\n+/)
+            .map((l) => l.trim())
+            .find((l) => l && l.length < 200 && /payment failed|order failed|order could not be placed|transaction (?:failed|declined)|payment (?:was )?(?:declined|unsuccessful)/i.test(l));
+          if (failLine) {
+            const g = this.api?.lastGatewayResult() ?? null;
+            const why = g?.message && g.message !== failLine ? ` — ${g.message}` : "";
+            throw new CheckoutFailure("PAYMENT_FAILED", `${failLine}${why}${this.api?.gatewayTag() ?? ""}`);
+          }
         }
         await this.page.waitForTimeout(1000);
       }

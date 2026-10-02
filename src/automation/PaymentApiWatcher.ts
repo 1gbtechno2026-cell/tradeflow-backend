@@ -184,9 +184,32 @@ export class PaymentApiWatcher {
   lastGatewayResult(): PaymentGatewayResult | null {
     for (let i = this.calls.length - 1; i >= 0; i--) {
       const c = this.calls[i];
-      if (!/\/(?:paywithdetails|pay|pgResponse|submitpayment)(?:[/?#]|$)/i.test(c.url)) continue;
       const r = (c.response ?? {}) as Record<string, unknown>;
       if (typeof r !== "object" || r === null) continue;
+      // The post-bank verdict: pgresponsehandler's action.postbackParams carry
+      // transaction_status / transaction_response_code and the bank's text.
+      // Two HDFC worker jobs on 2026-10-02 ended "Payment Failed" with this
+      // response on the wire and nothing of it on the job, because only the
+      // pre-bank call matched below.
+      if (/pgresponsehandler/i.test(c.url)) {
+        const action = (r.action ?? {}) as Record<string, unknown>;
+        const pp = (action.postbackParams ?? {}) as Record<string, string>;
+        let irisText = "";
+        try {
+          irisText = String((JSON.parse(pp.iris_transaction_response_message || "{}") as { default_text?: string }).default_text || "");
+        } catch { /* absent */ }
+        const display = (r.displayInfo ?? {}) as Record<string, unknown>;
+        return {
+          responseStatus: pp.transaction_status || (r.responseStatus != null ? String(r.responseStatus) : null),
+          statusCode: pp.transaction_response_code || pp.bank_response_code || null,
+          message: irisText || (display.message != null ? String(display.message) : null),
+          responseType: r.responseStatus != null ? String(r.responseStatus) : null,
+          txnId: pp.pg_trackid || pp.payzippy_transaction_id || null,
+          url: c.url,
+          at: c.at,
+        };
+      }
+      if (!/\/(?:paywithdetails|pay|pgresponse\w*|submitpayment)(?:[/?#]|$)/i.test(c.url)) continue;
       const messages = Array.isArray(r.messages) ? (r.messages as Array<Record<string, unknown>>) : [];
       const first = messages[0] ?? {};
       if (!("response_status" in r) && !messages.length && !("status_code" in first)) continue;

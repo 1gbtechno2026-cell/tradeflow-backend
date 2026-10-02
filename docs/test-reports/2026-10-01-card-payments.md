@@ -10,7 +10,7 @@ worker). Account `actwrysum@bobbhai.in` / `actbogtee@bobbhai.in`, address 19
 | card type | bank step | outcome |
 |---|---|---|
 | **ICICI Corporate Virtual** (OTP via leased employee handset) | works | **3 real orders placed** — 2 from the harness, 1 from Submit Order |
-| **HDFC Virtual** (password) | works (2 Oct) | **1 real order placed** from the harness, after the card-side block was cleared |
+| **HDFC Virtual** (password) | works (2 Oct) | **2 real orders placed** — 1 from the harness, 1 from Submit Order (worker) — after the card-side block was cleared |
 
 ## ICICI Corporate Virtual — placed orders
 
@@ -55,8 +55,22 @@ for every card type: only the bank page differs per method.
 | order | via | charged | bank txn | gateway txn | Pay → confirmation |
 |---|---|---|---|---|---|
 | OD438780031777963100 | Test tab | ₹189 (no handling fee on this card) | 31046828862 | PZT2610021813122YN01 | 20 s |
+| **OD438780503746531100** | **Submit Order → worker** | ₹189 | 31048609079 | PZT26100219321KHSW01 | 24 s (100 s claim → confirmation) |
 
-Card `****2311`, cart ₹189 (keychain, 14 % off MRP ₹599), promise 5 days → 7 Oct.
+Cards `****2311` (harness) and `****2212` (worker), cart ₹189 (keychain, 14 % off
+MRP ₹599), promise 5 days → 7 Oct. The worker job carries every per-order field.
+
+Between those two, five worker attempts on this product failed for reasons that
+were each fixed on the spot and are worth knowing:
+
+| job | what happened | fix |
+|---|---|---|
+| 13:06 | Continue not found after an E002 retry → old code jumped to a hard-coded www.flipkart.com/payments (no card form) | fallback removed; Continue tapped via locator, token URL required |
+| 13:11 | hand-off caught on PayU's intermediate page, password typed during the ACS's init, Submit click swallowed | let the ACS settle; submit three ways |
+| 13:18 | click on "Credit / Debit / ATM Card" hung 10 s | tap + prove the form opened, retry |
+| 13:30, 13:42 | ACS accepted the password, then "Payment Failed" — same `****2311` card that had just paid ₹189 | not code: the card. Gateway's post-bank verdict now logged on the job |
+| 13:49 | `GST_NOT_FOUND` with GST mandatory ON | correct: the keychain says "GST … will not be applicable"; now reported as GST_NOT_APPLICABLE with that note |
+| 13:54 | payment token issued with no landing URL; page stayed on viewcheckout | open Flipkart's own token URL; screenshot + page text on failure |
 Password accepted by HDFC's ACS in 3 s; the ACS handed back through
 `2.uiscoop.flipkart.com` ("Please wait while we are confirming your payment")
 to the same confirmation page as ICICI. Everything after the bank page is the
@@ -114,8 +128,9 @@ unavailable) are not retried on the same ID.
 ## Open
 
 - Not-deliverable scenario still needs a product Flipkart refuses for 122017.
-- HDFC through Submit Order (worker) has not been run yet — same code path as
-  the harness, as ICICI showed.
+- Only one worker may run at a time on this machine (concurrency is per
+  process; two processes both take jobs). Restarts are needed after every
+  code change — the worker does not watch files.
 
 ## Where the evidence is
 

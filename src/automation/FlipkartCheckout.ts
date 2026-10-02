@@ -2734,6 +2734,16 @@ export class FlipkartCheckout {
     }, 8000, 120, "GST Invoice on viewcheckout");
     if (!gstVisible) {
       if (gstMandatory) {
+        // Flipkart says so itself on low-value items: "Note: GST and No cost
+        // EMI will not be applicable" (the ₹189 keychain, 2026-10-02). Quote
+        // it, so the halt reads as Flipkart's rule rather than a missing block.
+        const note = await this.evaluate(() => {
+          const t = (document.body?.innerText || "").replace(/ /g, " ");
+          return t.split(/\n+/).map((l) => l.trim()).find((l) => /GST[^.\n]{0,40}not (?:be )?applicable/i.test(l)) || "";
+        }).catch(() => "");
+        if (note) {
+          throw new CheckoutFailure("GST_NOT_APPLICABLE", `${note} — GST Invoice is mandatory for this order, so it was not placed`);
+        }
         throw new CheckoutFailure(
           "GST_NOT_FOUND",
           "GST is not found on page — GST Invoice is required on viewcheckout to process this order"

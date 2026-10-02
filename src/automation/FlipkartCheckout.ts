@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { Locator, Page } from "playwright";
 import type { AddressDetails } from "../types.js";
 import {
@@ -3152,12 +3154,13 @@ export class FlipkartCheckout {
     console.log("=== Confirm GST tapped ===");
   }
 
-  /** The real payment page: pay.flipkart.com with a token. Anything else — in
-   *  particular the generic www.flipkart.com/payments — has no card form. */
+  /** The real payment page: /payments WITH a checkout token, on pay.flipkart.com
+   *  or www.flipkart.com. The generic www.flipkart.com/payments without a token
+   *  is what the old fallback opened, and it has no card form. */
   private onPaymentPage(): boolean {
     try {
       const u = new URL(this.page.url());
-      return /^pay\.flipkart\.com$/i.test(u.hostname) && /\/payments/i.test(u.pathname);
+      return /flipkart\.com$/i.test(u.hostname) && /\/payments/i.test(u.pathname) && u.searchParams.has("token");
     } catch {
       return false;
     }
@@ -3230,19 +3233,40 @@ export class FlipkartCheckout {
       }
     }
 
-    let reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, "pay.flipkart.com after Continue");
+    let reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, "payment page after Continue");
+    if (!reached && pay?.landingUrl && /token=/.test(pay.landingUrl)) {
+      // Flipkart issued the token but the page did not navigate (seen on
+      // 2026-10-02: success=true, no landing action). The token URL is
+      // Flipkart's own for THIS checkout — not a remembered one — so opening
+      // it is the same thing the page would have done.
+      console.log("Payment token issued but the page stayed on viewcheckout — opening the token URL Flipkart returned");
+      await navigateWithRetry(this.page, pay.landingUrl, { timeoutMs: 15000, maxRetries: 2 }).catch(() => undefined);
+      reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 10_000, 150, "payment page via token URL");
+    }
     if (!reached && /viewcheckout/i.test(this.page.url())) {
       // Still on checkout: the tap may have landed during a re-render. One
       // more tap, then the verdict.
       console.log("Still on viewcheckout after Continue — tapping once more");
       const again = labels.last();
       await again.tap({ timeout: 4000 }).catch(() => undefined);
-      reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, "pay.flipkart.com after second Continue");
+      reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, "payment page after second Continue");
     }
     if (!reached) {
+      // Say what the page is showing, and keep a picture of it: a worker has
+      // no artifacts, and "did not open" on its own was unanswerable.
+      const shown = await this.evaluate(() => {
+        const sheet = document.getElementById("msite-bottomsheet");
+        const t = (sheet && (sheet as HTMLElement).innerText) || document.body?.innerText || "";
+        return t.replace(/\s+/g, " ").trim().slice(0, 240);
+      }).catch(() => "");
+      const shot = path.join("debug", "failures", `${new Date().toISOString().replace(/[:.]/g, "-")}-continue.png`);
+      await fs.promises.mkdir(path.dirname(shot), { recursive: true }).catch(() => undefined);
+      await this.page.screenshot({ path: shot, fullPage: true, timeout: 10_000 }).catch(() => undefined);
       throw new CheckoutFailure(
         "UNABLE_TO_PLACE_ORDER",
-        `Continue did not open the payment page (still on ${this.page.url().split("?")[0]})`
+        `Continue did not open the payment page (still on ${this.page.url().split("?")[0]}; ` +
+          `token ${pay ? (pay.landingUrl ? "issued with URL" : "issued without URL") : "not seen"}; ` +
+          `page says: "${shown}"; screenshot ${shot})`
       );
     }
     console.log(`Continue navigation complete — ${this.page.url().split("?")[0]}`);

@@ -123,6 +123,13 @@ export class FlipkartApiWatcher {
             const actionCtx = (R?.actionResponseContext ?? {}) as Record<string, unknown>;
             const reqCtx = (reqBody?.actionRequestContext ?? {}) as Record<string, unknown>;
             const landing = actionCtx.landingPageAction as { originalUrl?: string } | undefined;
+            // A payment token response does not always carry landingPageAction
+            // (worker job 6abfb799, 2026-10-02: success=true, no landing, and
+            // the page never navigated). The token URL is in the body all the
+            // same — find it anywhere in the response as a last resort.
+            const anyPaymentsUrl =
+              JSON.stringify(R ?? {}).match(/https?:\\?\/\\?\/[^"\s]*?\/payments\?[^"\s]*token=[^"&\s]+/)?.[0]?.replace(/\\\//g, "/") ??
+              null;
             this.actions.push({
               type: String(reqCtx.type ?? actionCtx.type ?? "UNKNOWN"),
               // Flipkart leaves actionSuccess undefined on success, so only an
@@ -131,7 +138,7 @@ export class FlipkartApiWatcher {
               messages: ((actionCtx.actionMessages ?? []) as Array<{ text?: string }>)
                 .map((m) => String(m?.text ?? ""))
                 .filter(Boolean),
-              landingUrl: landing?.originalUrl ?? null,
+              landingUrl: landing?.originalUrl ?? anyPaymentsUrl,
               request: reqCtx,
               at: Date.now(),
             });

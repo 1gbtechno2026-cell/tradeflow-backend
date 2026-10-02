@@ -10,7 +10,7 @@ worker). Account `actwrysum@bobbhai.in` / `actbogtee@bobbhai.in`, address 19
 | card type | bank step | outcome |
 |---|---|---|
 | **ICICI Corporate Virtual** (OTP via leased employee handset) | works | **3 real orders placed** — 2 from the harness, 1 from Submit Order |
-| **HDFC Virtual** (password) | never reached | blocked at Flipkart's gateway: `PAYZIPPY_TECHNICAL_ERROR` — specific to this card |
+| **HDFC Virtual** (password) | works (2 Oct) | **1 real order placed** from the harness, after the card-side block was cleared |
 
 ## ICICI Corporate Virtual — placed orders
 
@@ -50,7 +50,26 @@ the `ORDER_CONFIRMATION_PAGE` data (`sla.maxSla`, `cnc.coinComponent`,
 seller, order status) — read passively by `PaymentApiWatcher`. This is the same
 for every card type: only the bank page differs per method.
 
-## HDFC Virtual — blocked before the bank
+## HDFC Virtual — placed on 2 Oct
+
+| order | via | charged | bank txn | gateway txn | Pay → confirmation |
+|---|---|---|---|---|---|
+| OD438780031777963100 | Test tab | ₹189 (no handling fee on this card) | 31046828862 | PZT2610021813122YN01 | 20 s |
+
+Card `****2311`, cart ₹189 (keychain, 14 % off MRP ₹599), promise 5 days → 7 Oct.
+Password accepted by HDFC's ACS in 3 s; the ACS handed back through
+`2.uiscoop.flipkart.com` ("Please wait while we are confirming your payment")
+to the same confirmation page as ICICI. Everything after the bank page is the
+shared code; only `enterPassword` was new.
+
+### The HDFC bank page (HDFC's own ACS, no iframe)
+
+`#staticPassword` (name `passCode`), Submit link whose `authSubmit()` hashes the
+password before posting, a "Static Password" tab beside an OTP tab, 3-minute
+timeout: "Please enter your Master Card 3D Secure PIN … This information will
+not be shared with the merchant."
+
+## HDFC Virtual on 1 Oct — blocked before the bank (resolved on the card side)
 
 | run | after Pay | reported |
 |---|---|---|
@@ -84,13 +103,19 @@ Batches are never stopped by any of these; each platform ID runs and reports
 its own reason. Per-ID verdicts (out of stock, not deliverable, unit cap, COD
 unavailable) are not retried on the same ID.
 
+## Since this report was first written (1–2 Oct)
+
+- Four ICICI orders in total, the later ones through Submit Order → worker;
+  per-order data now includes the full `OD…00` id, the card used, billing
+  phone, fee breakdown, shipping, MRP, unit price, discount.
+- Worker reporting batched: ~13 writes per job instead of ~60.
+- HDFC Virtual placed (above).
+
 ## Open
 
-- HDFC Virtual: card-side fix (see above), then one discovery run to capture
-  the password page.
-- `listingAmount` is empty on the worker's result for the keychain — product
-  page price capture, unrelated to payment.
 - Not-deliverable scenario still needs a product Flipkart refuses for 122017.
+- HDFC through Submit Order (worker) has not been run yet — same code path as
+  the harness, as ICICI showed.
 
 ## Where the evidence is
 

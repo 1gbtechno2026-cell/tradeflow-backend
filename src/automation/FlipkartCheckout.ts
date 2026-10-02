@@ -16,7 +16,6 @@ import type { FlipkartApiWatcher } from "./FlipkartApiWatcher.js";
 const VIEWCART_URL = "https://www.flipkart.com/viewcart?exploreMode=TRUE&preference=FLIPKART";
 const VIEWCHECKOUT_URL =
   "https://www.flipkart.com/viewcheckout?view=FLIPKART&marketplace=FLIPKART&tr_tenant=FLIPKART";
-const PAYMENTS_URL = "https://www.flipkart.com/payments";
 
 /**
  * Flipkart's per-order cap, in its own words: "You can only purchase 14 units of …
@@ -3153,103 +3152,65 @@ export class FlipkartCheckout {
     console.log("=== Confirm GST tapped ===");
   }
 
+  /** The real payment page: pay.flipkart.com with a token. Anything else — in
+   *  particular the generic www.flipkart.com/payments — has no card form. */
+  private onPaymentPage(): boolean {
+    try {
+      const u = new URL(this.page.url());
+      return /^pay\.flipkart\.com$/i.test(u.hostname) && /\/payments/i.test(u.pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Tap Continue on viewcheckout and wait for the payment page.
+   *
+   * Ported from the reference flow, and with every "remembered URL" fallback
+   * removed. The old version, when Continue was not found or did not navigate
+   * within 8s, jumped to a hard-coded https://www.flipkart.com/payments — a
+   * page with no card form — and the job then failed as "Credit/Debit Card
+   * option not found", blaming the payment step for a checkout problem (the
+   * HDFC Submit Order run of 2026-10-02 did exactly this). A payment page that
+   * Continue did not open is not a payment page; the job fails here, saying so.
+   */
   private async clickContinueToCheckout(): Promise<void> {
-    console.log("Clicking Continue to proceed to checkout...");
+    console.log("Tapping Continue to proceed to payment...");
     const contSince = Date.now();
 
-    // Wait for the Continue button to appear
-    let buttonFound = false;
-    for (let attempt = 0; attempt < 3 && !buttonFound; attempt++) {
-      try {
-        await this.waitForFunction(
-          () => {
-            const allDivs = Array.from(document.querySelectorAll("div"));
-            for (const d of allDivs) {
-              const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
-              // Flipkart Continue button often has "continue" text with green styling
-              if (txt === "continue" || txt === "continue ") {
-                return true;
-              }
-            }
-            // Also check buttons
-            const buttons = Array.from(document.querySelectorAll("button"));
-            for (const b of buttons) {
-              const txt = (b.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-              if (txt === "continue" || txt === "continue ") return true;
-            }
-            return false;
-          },
-          { timeout: 15000 }
-        );
-        buttonFound = true;
-      } catch (err) {
-        const msg = (err as Error).message;
-        if (msg.includes("detached") || msg.includes("Frame")) {
-          console.log("Frame detached while waiting for Continue (attempt " + (attempt + 1) + "/3)");
-          await sleep(500);
-        } else {
-          console.log("Continue button not found: " + msg);
+    // Two "Continue" labels can exist (one in a sticky footer); tap the one
+    // that is on screen, trying for up to ~20s while the page settles after
+    // the GST / address work.
+    const labels = this.page.getByText("Continue", { exact: true });
+    let tapped = false;
+    for (let attempt = 0; attempt < 40 && !tapped; attempt++) {
+      const vh = this.page.viewportSize()?.height ?? 900;
+      const cands: Array<{ i: number; onScreen: boolean; y: number }> = [];
+      const n = await labels.count().catch(() => 0);
+      for (let i = 0; i < n; i++) {
+        const el = labels.nth(i);
+        if (!(await el.isVisible().catch(() => false))) continue;
+        const b = await el.boundingBox().catch(() => null);
+        if (b) cands.push({ i, onScreen: b.y >= 0 && b.y + b.height <= vh, y: b.y });
+      }
+      cands.sort((a, b) => Number(b.onScreen) - Number(a.onScreen) || b.y - a.y);
+      for (const c of cands) {
+        try {
+          await labels.nth(c.i).tap({ timeout: 4000 });
+          tapped = true;
+          console.log(`Tapped Continue #${c.i + 1} (onScreen=${c.onScreen})`);
           break;
+        } catch {
+          /* try the next candidate */
         }
       }
+      if (!tapped) await sleep(500);
     }
-
-    if (!buttonFound) {
-      console.log("Continue not on this page — opening remembered payments URL");
-      await this.gotoPayments();
-      return;
-    }
-
-    // Click the Continue button
-    let result: string | null = null;
-    for (let attempt = 0; attempt < 3 && !result; attempt++) {
-      result = await this.evaluate(() => {
-        // Try buttons first (most reliable)
-        const buttons = Array.from(document.querySelectorAll("button"));
-        for (const b of buttons) {
-          const txt = (b.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-          if (txt === "continue" || txt === "continue ") {
-            (b as HTMLElement).click();
-            return "clicked_button";
-          }
-        }
-        // Try divs
-        const allDivs = Array.from(document.querySelectorAll("div"));
-        for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
-          if (txt === "continue" || txt === "continue ") {
-            // Walk up to find clickable parent
-            let el: HTMLElement | null = d;
-            while (el && el !== document.body) {
-              const style = el.getAttribute("style") || "";
-              if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
-                el.scrollIntoView({ block: "center" });
-                el.click();
-                return "clicked_div";
-              }
-              el = el.parentElement;
-            }
-            // Fallback: click div itself
-            (d as HTMLElement).click();
-            return "clicked_div_fallback";
-          }
-        }
-        return null;
-      });
-
-      if (result) {
-        console.log(`Continue clicked (${result})`);
-        break;
-      } else {
-        console.log(`Continue not found (attempt ${attempt + 1}/3)`);
-        await sleep(300);
-      }
-    }
-
-    if (!result) {
-      console.log("Could not click Continue — opening remembered payments URL");
-      await this.gotoPayments();
-      return;
+    if (!tapped) {
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        `Continue button not found on viewcheckout within 20s (on ${this.page.url().split("?")[0]})`
+      );
     }
 
     // CHECKOUT_PAYMENT_TOKEN_GENERATE is Flipkart deciding whether a payment page
@@ -3269,33 +3230,22 @@ export class FlipkartCheckout {
       }
     }
 
-    console.log("Waiting for Continue → /payments ...");
-    const reached = await this.waitUntil(
-      async () => /\/payments/i.test(this.page.url() || "") || !/viewcheckout/i.test(this.page.url() || ""),
-      8000,
-      120,
-      "payments after Continue"
-    );
-    if (/\/payments/i.test(this.page.url() || "")) {
-      console.log(`Continue navigation complete — ${this.page.url()}`);
-      return;
+    let reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, "pay.flipkart.com after Continue");
+    if (!reached && /viewcheckout/i.test(this.page.url())) {
+      // Still on checkout: the tap may have landed during a re-render. One
+      // more tap, then the verdict.
+      console.log("Still on viewcheckout after Continue — tapping once more");
+      const again = labels.last();
+      await again.tap({ timeout: 4000 }).catch(() => undefined);
+      reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, "pay.flipkart.com after second Continue");
     }
-    if (reached && !/viewcheckout/i.test(this.page.url() || "")) {
-      console.log(`Left viewcheckout — ${this.page.url()}`);
-      return;
+    if (!reached) {
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        `Continue did not open the payment page (still on ${this.page.url().split("?")[0]})`
+      );
     }
-    console.log("Continue did not open payments — using remembered /payments URL");
-    await this.gotoPayments();
-  }
-
-  private async gotoPayments(): Promise<void> {
-    if (/\/payments/i.test(this.page.url() || "")) {
-      console.log(`Already on payments ${this.page.url()}`);
-      return;
-    }
-    console.log(`Jumping to remembered payments ${PAYMENTS_URL}`);
-    await navigateWithRetry(this.page, PAYMENTS_URL, { timeoutMs: 12000, maxRetries: 2 });
-    console.log(`On payments ${this.page.url()}`);
+    console.log(`Continue navigation complete — ${this.page.url().split("?")[0]}`);
   }
 
   private async ensureGstCheckboxTicked(): Promise<void> {

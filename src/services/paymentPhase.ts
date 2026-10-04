@@ -245,11 +245,22 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
     // reason behind "Payment Failed" is written down, and the thing to take
     // to Flipkart or the bank.
     const g = input.paymentApi?.lastGatewayResult() ?? null;
-    if (g) {
+    if (g && g.phase === "post-bank") {
       log(
         "warn",
         `[pay] gateway said: ${g.responseStatus || "?"}${g.statusCode ? ` ${g.statusCode}` : ""}` +
           `${g.message ? ` "${g.message}"` : ""}${g.txnId ? ` txn ${g.txnId}` : ""}`,
+        "payment"
+      );
+    } else if (g) {
+      // paywithdetails answers SUCCESS on every run — it is Flipkart accepting
+      // the Pay press and sending the page to the bank, not a captured payment.
+      // Logged as such, so "SUCCESS txn PZT…" on a failed job is never read as
+      // money having moved (it was, on 2026-10-04).
+      log(
+        "warn",
+        `[pay] gateway accepted the Pay request (${g.responseStatus || "?"}${g.txnId ? `, txn ${g.txnId}` : ""}) — ` +
+          "no post-bank verdict was seen: the bank never handed back",
         "payment"
       );
     }

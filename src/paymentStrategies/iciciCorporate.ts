@@ -1,3 +1,5 @@
+import fs from "fs";
+import path from "path";
 import { CheckoutFailure } from "../services/checkoutErrors.js";
 import { requestAndAwaitOtp, withLeasedPhone } from "./shared/otpEntry.js";
 import type { PaymentContext, PaymentResult, PaymentStrategy } from "./types.js";
@@ -167,16 +169,31 @@ async function selectCorporateIdentity(
  *
  * Do NOT wait for the SMS here — requestAndAwaitOtp owns that.
  */
-async function submitForOtp(ctx: PaymentContext): Promise<void> {
+async function submitForOtp(ctx: PaymentContext): Promise<void | "authenticated"> {
   const submit = ctx.page.locator(SUBMIT_CONTROL).first();
   if ((await submit.count()) === 0) {
     throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "ICICI's 3-D Secure page has no Submit control");
   }
+  const acsHost = hostOf(ctx);
   await submit.click({ timeout: 10_000 });
   ctx.log("info", "[pay] ICICI: identity submitted");
 
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
+  // Every successful run has shown the OTP step within about a second of
+  // Submit (0.5s on OD438798583788928100). On 2026-10-04 one job sat on the
+  // identity page for the whole 30s and the bank never dispatched a code: the
+  // click had not registered. So if nothing has changed RECLICK_AFTER_MS after
+  // Submit, press it once more, and keep a picture if the page still does not
+  // move — a worker has no other artifact of this page.
+  const started = Date.now();
+  let reclicked = false;
+  while (Date.now() - started < OTP_STEP_TIMEOUT_MS) {
+    const host = hostOf(ctx);
+    if (host && host !== acsHost) {
+      // Frictionless 3-D Secure: the bank let the transaction through without
+      // asking for a code. Waiting for an SMS here would time the order out.
+      ctx.log("info", `[pay] ICICI: no OTP step — ACS handed straight back to ${host} (authenticated without a code)`);
+      return "authenticated";
+    }
     const text = await pageText(ctx);
     const rejected = text.split(/\n+/).map((l) => l.trim()).find((l) => l && l.length < 200 && IDENTITY_REJECTED.test(l));
     if (rejected) {
@@ -190,12 +207,52 @@ async function submitForOtp(ctx: PaymentContext): Promise<void> {
       ctx.log("info", "[pay] ICICI: OTP step is up");
       return;
     }
+    if (!reclicked && Date.now() - started > RECLICK_AFTER_MS) {
+      reclicked = true;
+      const again = ctx.page.locator(SUBMIT_CONTROL).first();
+      if (await again.isVisible().catch(() => false)) {
+        await again.click({ timeout: 5_000 }).catch(() => undefined);
+        ctx.log(
+          "warn",
+          `[pay] ICICI: identity page unchanged ${Math.round(RECLICK_AFTER_MS / 1000)}s after Submit — pressed Submit again`
+        );
+      }
+    }
     await ctx.page.waitForTimeout(500);
   }
+  const shot = await failureShot(ctx, "icici-identity");
+  const shown = (await pageText(ctx)).replace(/\s+/g, " ").trim().slice(0, 200);
   throw new CheckoutFailure(
     "UNABLE_TO_PLACE_ORDER",
-    "ICICI did not show an OTP step within 30s of submitting the corporate identity"
+    `ICICI did not show an OTP step within ${Math.round(OTP_STEP_TIMEOUT_MS / 1000)}s of submitting the corporate identity ` +
+      `(still on ${acsHost}; page says: "${shown}"${shot ? `; screenshot ${shot}` : ""})`
   );
+}
+
+/** How long the identity page may take to turn into the OTP page. Bounded well
+ *  inside the 2-minute payment budget so the SMS wait keeps most of it. */
+const OTP_STEP_TIMEOUT_MS = 45_000;
+/** With no change this long after Submit, the click is treated as lost. */
+const RECLICK_AFTER_MS = 10_000;
+
+function hostOf(ctx: PaymentContext): string {
+  try {
+    return new URL(ctx.page.url()).hostname;
+  } catch {
+    return ""; // mid-navigation
+  }
+}
+
+/** Full-page screenshot under debug/failures/, or null if it could not be taken. */
+async function failureShot(ctx: PaymentContext, tag: string): Promise<string | null> {
+  const shot = path.join("debug", "failures", `${new Date().toISOString().replace(/[:.]/g, "-")}-${tag}.png`);
+  try {
+    await fs.promises.mkdir(path.dirname(shot), { recursive: true });
+    await ctx.page.screenshot({ path: shot, fullPage: true, timeout: 10_000 });
+    return shot;
+  } catch {
+    return null;
+  }
 }
 
 // ── THE OTP PAGE, as captured on Run 2 (card-2026-10-01T11-19-52) ───────────

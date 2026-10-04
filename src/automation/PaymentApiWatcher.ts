@@ -31,6 +31,11 @@ export interface PaymentApiCall {
 
 /** What the gateway said about the payment attempt, from its own response. */
 export interface PaymentGatewayResult {
+  /** pre-bank: the answer to the Pay press itself (paywithdetails), where
+   *  SUCCESS only means "accepted, go to the bank". post-bank: the verdict
+   *  after the bank handed back (pgresponsehandler) — the one that says
+   *  whether money moved. */
+  phase: "pre-bank" | "post-bank";
   responseStatus: string | null;
   statusCode: string | null;
   message: string | null;
@@ -200,6 +205,7 @@ export class PaymentApiWatcher {
         } catch { /* absent */ }
         const display = (r.displayInfo ?? {}) as Record<string, unknown>;
         return {
+          phase: "post-bank",
           responseStatus: pp.transaction_status || (r.responseStatus != null ? String(r.responseStatus) : null),
           statusCode: pp.transaction_response_code || pp.bank_response_code || null,
           message: irisText || (display.message != null ? String(display.message) : null),
@@ -214,6 +220,7 @@ export class PaymentApiWatcher {
       const first = messages[0] ?? {};
       if (!("response_status" in r) && !messages.length && !("status_code" in first)) continue;
       return {
+        phase: "pre-bank",
         responseStatus: r.response_status != null ? String(r.response_status) : null,
         statusCode: first.status_code != null ? String(first.status_code) : null,
         message: first.message != null ? String(first.message) : null,

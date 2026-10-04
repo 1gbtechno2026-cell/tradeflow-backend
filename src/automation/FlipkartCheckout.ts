@@ -3253,6 +3253,26 @@ export class FlipkartCheckout {
       await navigateWithRetry(this.page, pay.landingUrl, { timeoutMs: 15000, maxRetries: 2 }).catch(() => undefined);
       reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 10_000, 150, "payment page via token URL");
     }
+    // Flipkart's own "Something went wrong! Please try again later. [Retry]"
+    // sheet in place of the payment page (actbogtee, 2026-10-04 21:46 IST: the
+    // token call never happened). Its Retry re-fires that call, so press it —
+    // at most twice — before deciding the page is stuck.
+    for (let retry = 0; !reached && retry < 2; retry++) {
+      const wentWrong = await this.evaluate(() => /Something went wrong/i.test(document.body?.innerText || "")).catch(() => false);
+      const retryBtn = this.page.getByText("Retry", { exact: true }).last();
+      if (!wentWrong || !(await retryBtn.isVisible().catch(() => false))) break;
+      console.log(`"Something went wrong" sheet after Continue — tapping its Retry (${retry + 1}/2)`);
+      const retrySince = Date.now();
+      await retryBtn.tap({ timeout: 4000 }).catch(() => undefined);
+      reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, `payment page after Retry ${retry + 1}`);
+      if (!reached && this.api) {
+        const p2 = await this.api.waitForAction("CHECKOUT_PAYMENT_TOKEN_GENERATE", retrySince, 2000);
+        if (p2?.landingUrl && /token=/.test(p2.landingUrl)) {
+          await navigateWithRetry(this.page, p2.landingUrl, { timeoutMs: 15000, maxRetries: 2 }).catch(() => undefined);
+          reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 10_000, 150, "payment page via token URL after Retry");
+        }
+      }
+    }
     if (!reached && /viewcheckout/i.test(this.page.url())) {
       // Still on checkout: the tap may have landed during a re-render. One
       // more tap, then the verdict.

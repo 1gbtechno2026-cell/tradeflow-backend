@@ -42,6 +42,9 @@ function publicJob(job: {
   errorSource?: string;
   errorDetails?: string;
   errorStage?: string;
+  /** Set the instant before Pay was pressed; a job with this and no order id
+   *  must be reconciled against Flipkart's orders, never re-run blindly. */
+  paymentStartedAt?: Date | null;
   filterReason?: string;
   failedAt?: Date | null;
   batchStatus?: string;
@@ -79,6 +82,7 @@ function publicJob(job: {
     errorSource: job.errorSource || undefined,
     errorDetails: job.errorDetails || undefined,
     errorStage: job.errorStage || undefined,
+    paymentStartedAt: job.paymentStartedAt ?? null,
     filterReason: job.filterReason || undefined,
     failedAt: job.failedAt,
     batchStatus: job.batchStatus || undefined,

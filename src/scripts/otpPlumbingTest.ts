@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import mongoose, { Types } from "mongoose";
 import { connectDb } from "../db.js";
 import { leaseOtpPhone, releaseOtpPhone } from "../services/employeePhoneLease.js";
-import { OtpTimeoutError, recordIncomingSms, waitForPaymentOtp } from "../services/smsOtp.js";
+import { OtpCardMismatchError, OtpTimeoutError, recordIncomingSms, waitForPaymentOtp } from "../services/smsOtp.js";
 
 const CARD_TYPE = "ICICI_CORP_VIRTUAL";
 const PARENT_LAST4 = "8002";
@@ -52,8 +52,10 @@ async function main() {
   console.log(`  leased ${lease.employeeId} (${lease.phoneNumber.slice(0, 2)}****${lease.phoneNumber.slice(-4)}) until ${lease.leasedUntil.toISOString()}`);
 
   try {
-    // 1. A code for a DIFFERENT parent card must not be accepted.
-    console.log("\n1. SMS naming another card (XX1234) — must be ignored");
+    // 1. A code for a DIFFERENT parent card must not be accepted. Since
+    //    2026-10-04 it is reported at once as OtpCardMismatchError rather than
+    //    waited out as a timeout; either way the code is never handed over.
+    console.log("\n1. SMS naming another card (XX1234) — must be refused");
     const wrongWait = waitForPaymentOtp({
       jobId,
       runId,
@@ -68,7 +70,8 @@ async function main() {
     try {
       await wrongWait;
     } catch (err) {
-      ignored = err instanceof OtpTimeoutError;
+      ignored = err instanceof OtpTimeoutError || err instanceof OtpCardMismatchError;
+      if (err instanceof OtpCardMismatchError) console.log(`  refused immediately: ${err.message}`);
     }
     check("code for XX1234 was not handed to a run paying with XX8002", ignored);
 

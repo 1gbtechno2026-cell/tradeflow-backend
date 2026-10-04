@@ -6,7 +6,7 @@ import { authenticatePayment, UnsupportedPaymentError } from "../paymentStrategi
 import type { AuthType, CardDetails, PaymentResult } from "../paymentStrategies/types.js";
 import { CheckoutFailure } from "./checkoutErrors.js";
 import { NoPhoneAvailableError } from "./employeePhoneLease.js";
-import { OtpTimeoutError } from "./smsOtp.js";
+import { OtpCardMismatchError, OtpTimeoutError } from "./smsOtp.js";
 import {
   acquireCard,
   cardId,
@@ -303,6 +303,7 @@ function asFailure(err: unknown): CheckoutFailure {
   // bank's SMS, not the card. It has had a code since the catalog was written;
   // it was reaching the job as CARD_AUTH_FAILED because this mapping missed it.
   if (err instanceof OtpTimeoutError) return new CheckoutFailure("OTP_TIMEOUT", err.message);
+  if (err instanceof OtpCardMismatchError) return new CheckoutFailure("OTP_CARD_MISMATCH", err.message);
   if (err instanceof NoPhoneAvailableError) return new CheckoutFailure("OTP_NOT_FOUND", err.message);
   return new CheckoutFailure("CARD_AUTH_FAILED", err instanceof Error ? err.message : String(err));
 }

@@ -258,7 +258,7 @@ export function verdictFor(code: string, detail = ""): CardVerdict {
   }
   // Explicitly not the card: the OTP never arrived (that is the handset or the
   // bank's SMS), the session died, the page timed out. Keep it in the pool.
-  if (code === "OTP_TIMEOUT" || code === "OTP_NOT_FOUND" || code === "SESSION_EXPIRED") {
+  if (code === "OTP_TIMEOUT" || code === "OTP_NOT_FOUND" || code === "OTP_CARD_MISMATCH" || code === "SESSION_EXPIRED") {
     return { kind: "keep", reason: detail || code };
   }
   // CARD_AUTH_FAILED with nothing more specific is genuinely ambiguous — a wrong

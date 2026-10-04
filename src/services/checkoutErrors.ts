@@ -23,6 +23,7 @@ export type CheckoutErrorCode =
   | "CARD_AUTH_FAILED"
   | "OTP_TIMEOUT"
   | "OTP_NOT_FOUND"
+  | "OTP_CARD_MISMATCH"
   | "UNKNOWN";
 
 export interface CheckoutErrorDef {
@@ -224,6 +225,25 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "BANK",
     failedStep: "payment",
     stageDisplay: "Processing Payment",
+  },
+  /**
+   * An OTP DID arrive on the leased handset, inside the window, but the bank's
+   * SMS named a different parent card than the Cards CSV row claims (job
+   * 6ac286…cba360, 2026-10-04: the row had ****0313 in both columns, ICICI
+   * texted "Card XX7009"). The code is not typed — it is only provably ours
+   * when the card matches — and waiting longer cannot help, so the job fails
+   * at once instead of burning the budget as OTP_TIMEOUT with no explanation.
+   * A data problem on the CSV row: parent_card_number must be the card the
+   * bank names in its SMS. The same row fails identically on every ID, so the
+   * batch moves on rather than re-queuing.
+   */
+  OTP_CARD_MISMATCH: {
+    code: "OTP_CARD_MISMATCH",
+    display: "OTP was sent for a different card than the Cards CSV says",
+    source: "USER",
+    failedStep: "payment",
+    stageDisplay: "Processing Payment",
+    noRetry: true,
   },
   UNKNOWN: {
     code: "UNKNOWN",

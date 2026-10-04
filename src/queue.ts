@@ -4,7 +4,7 @@ import { JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import type { CheckoutJobData } from "./types.js";
 
 /**
- * One queue per concurrency class (see jobClass.ts), named `checkout:<class>`.
+ * One queue per concurrency class (see jobClass.ts), named `checkout-<class>`.
  * A worker process subscribes to the classes it is configured for, each with
  * its own concurrency, so a shortage of handsets for `otp-phone` never holds
  * up `card` or `cod`, and each class can be scaled to its own cap.
@@ -14,8 +14,9 @@ import type { CheckoutJobData } from "./types.js";
  */
 export const LEGACY_QUEUE = "checkout";
 
+/** BullMQ forbids ":" in a queue name (it is its own key separator). */
 export function queueNameFor(cls: JobClass): string {
-  return `checkout:${cls}`;
+  return `checkout-${cls}`;
 }
 
 function redisConnection() {

@@ -4,6 +4,7 @@ import { z } from "zod";
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import { CheckoutBatch } from "../models/CheckoutBatch.js";
 import { getCheckoutQueue } from "../queue.js";
+import { jobClassFor } from "../services/jobClass.js";
 import { effectiveAttemptsFor, parseCreateJobBody, requiredOrdersFor } from "../services/jobRequest.js";
 import { initBatchCounters, readBatchProgress } from "../services/batchCounters.js";
 import { enqueueCheckoutJob } from "../services/checkoutEnqueue.js";
@@ -266,6 +267,7 @@ jobsRouter.post("/", async (req, res) => {
         cardType: data.cardType,
         authType,
         corporateId: data.corporateId,
+        cardMaxUsage: data.cardMaxUsage,
         cards,
       });
       if (!data.dryRun) {
@@ -372,7 +374,9 @@ jobsRouter.post("/:id/cancel", async (req, res) => {
     job.status === "dry_run" ||
     job.status === "completed_target_reached" ||
     job.status === "failed_attempt_budget_exhausted" ||
-    job.status === "filtered"
+    job.status === "filtered" ||
+    // Parked after Pay was pressed: cancelling would hide a possible charge.
+    job.status === "needs_reconciliation"
   ) {
     res.json(publicJob(job));
     return;
@@ -383,9 +387,17 @@ jobsRouter.post("/:id/cancel", async (req, res) => {
   job.logs.push({ at: new Date(), level: "warn", step: "cancelled", message: "Cancelled by API" });
   await job.save();
   try {
-    const queue = getCheckoutQueue();
+    // The job sits on its class's queue (and, if it was requeued while
+    // waiting for capacity, under a suffixed id on the same queue).
+    const req = job.request;
+    const queue = getCheckoutQueue(
+      jobClassFor({ paymentMode: req?.paymentMode, authType: req?.authType, corporateId: req?.corporateId })
+    );
     const queued = await queue.getJob(String(job._id));
     if (queued) await queued.remove();
+    for (const j of await queue.getDelayed()) {
+      if (String(j.id || "").startsWith(`${String(job._id)}:w`)) await j.remove().catch(() => undefined);
+    }
   } catch {
     /* ignore */
   }

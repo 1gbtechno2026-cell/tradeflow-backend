@@ -15,7 +15,11 @@ export type JobStatus =
   | "dry_run"
   | "completed_target_reached"
   | "failed_attempt_budget_exhausted"
-  | "filtered";
+  | "filtered"
+  /** The worker died AFTER pressing Pay and before Flipkart confirmed. Money
+   *  may have moved. Nobody re-runs this; a person (or reconciliation against
+   *  Flipkart's orders) decides. */
+  | "needs_reconciliation";
 
 export type LogLevel = "info" | "warn" | "error";
 
@@ -66,6 +70,8 @@ export interface JobRequestSnapshot {
    *  "otp" needs a handset from the shared pool, password/pin do not. */
   authType?: string;
   corporateId?: string;
+  /** Orders one card may place in this batch; absent = no cap. */
+  cardMaxUsage?: number;
   sellerName: string;
   listingId: string;
   deliverySlaDays?: number;
@@ -152,6 +158,8 @@ export interface CheckoutJobData {
   isRetry?: boolean;
   /** COD | card | ... — decides whether a card is needed at all. */
   paymentMode?: string;
+  /** Orders one card may place in this batch before the pool skips it. */
+  cardMaxUsage?: number;
   cardType?: string;
   authType?: AuthType;
   corporateId?: string | null;
@@ -170,10 +178,10 @@ export interface CheckoutJobData {
    * them for 7/14 days:
    *   - plaintext card data exists in Redis for the lifetime of the job
    *   - it crosses the network if Redis is not on the same host
-   * To be replaced by an encrypted cards collection plus a reference here,
-   * matching the rule sessionVerifyQueue.ts already states for cookies: the
-   * payload carries a Mongo reference, never the secret. Until then: never log
-   * a member of this array, and never copy it onto a persisted document.
+   * SUPERSEDED: the batch's cards now live once per batch in Redis, encrypted
+   * (cardPool.storeCardPool, CARD_POOL_KEY), and a job carries only its
+   * batchId. This field is read only for payloads queued before that change,
+   * and never written by enqueueCheckoutJob any more.
    */
   cards?: CardDetails[];
 }

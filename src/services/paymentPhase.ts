@@ -45,6 +45,12 @@ export interface PaymentPhaseInput {
   dryRun?: boolean;
   /** Payment-page API watcher, so a failure carries the gateway's status code. */
   paymentApi?: PaymentApiWatcher | null;
+  /**
+   * Awaited the instant before money can move (Pay pressed / COD placed). The
+   * runner uses it to write paymentStartedAt durably, so a worker that dies
+   * after this point is never re-run on the same order automatically.
+   */
+  onBeforePay?: () => Promise<void>;
 }
 
 export type PaymentPhaseOutcome =
@@ -135,6 +141,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
         // not a bug and not a reason to stop the batch.
         throw new CheckoutFailure("COD_UNAVAILABLE", "Cash on Delivery is unavailable for this cart on this account/pincode");
       }
+      await input.onBeforePay?.();
       await fk.payWithCod();
       const confirmation = await fk.waitForOrderConfirmation();
       log("info", `[pay] COD order placed${confirmation.orderId ? ` — ${confirmation.orderId}` : ""}`, "payment");
@@ -162,7 +169,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
 
   let claimed: Awaited<ReturnType<typeof acquireCard>>;
   try {
-    claimed = await acquireCard(data.batchId, cards);
+    claimed = await acquireCard(data.batchId, cards, data.cardMaxUsage);
   } catch (err) {
     if (err instanceof NoCardAvailableError) {
       // Every card is dead or paused. Not this order's fault and not retryable by
@@ -185,6 +192,7 @@ export async function runPaymentPhase(input: PaymentPhaseInput): Promise<Payment
       // rather than about a hand-off that never happened.
       const rejected = await fk.detectCardRejectedByFlipkart();
       if (rejected) throw rejected;
+      await input.onBeforePay?.();
       payPressedAt = Date.now();
       await fk.submitCardForm();
       const bankUrl = await fk.waitForBankHandoff();

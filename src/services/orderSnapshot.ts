@@ -40,6 +40,7 @@ export function requestSnapshot(data: NormalizedCreateJob): JobRequestSnapshot {
     // below stay masked; that is the line this snapshot does not cross.
     authType: data.authType || "",
     corporateId: data.corporateId || "",
+    cardMaxUsage: data.cardMaxUsage,
     sellerName: data.sellerName || "",
     listingId: data.listingId || "",
     deliverySlaDays: data.deliverySlaDays,

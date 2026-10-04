@@ -30,6 +30,7 @@ export interface ICheckoutJob {
   errorSource?: string;
   errorDetails?: string;
   errorStage?: string;
+  paymentStartedAt?: Date | null;
   filterReason?: string;
   failedAt?: Date | null;
   batchStatus?: string;
@@ -103,6 +104,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
         "completed_target_reached",
         "failed_attempt_budget_exhausted",
         "filtered",
+        "needs_reconciliation",
       ],
       default: "queued",
       index: true,
@@ -116,6 +118,10 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
     errorSource: { type: String, default: "" },
     errorDetails: { type: String, default: "" },
     errorStage: { type: String, default: "" },
+    /** Written durably the instant before Pay is pressed (or COD placed). A
+     *  job with this set and no order id must never be re-run automatically:
+     *  money may already have moved. See claimCheckoutJob. */
+    paymentStartedAt: { type: Date, default: null },
     filterReason: { type: String, default: "" },
     failedAt: { type: Date, default: null },
     batchStatus: { type: String, default: "" },
@@ -135,6 +141,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       // phase depends on for explaining itself after the fact.
       authType: { type: String, default: "" },
       corporateId: { type: String, default: "" },
+      cardMaxUsage: { type: Number },
       sellerName: { type: String, default: "" },
       listingId: { type: String, default: "" },
       deliverySlaDays: { type: Number },

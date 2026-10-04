@@ -114,11 +114,13 @@ export class NoCardAvailableError extends Error {}
  * Walks the preference list and returns the first card that is neither dead nor
  * still paused, expiring lapsed pauses as it goes.
  */
-export async function acquireCard(batchId: string, cards: CardDetails[]): Promise<AcquiredCard> {
+export async function acquireCard(batchId: string, cards: CardDetails[], maxUsage?: number): Promise<AcquiredCard> {
   if (!cards.length) throw new NoCardAvailableError("No cards were supplied with this order");
   const redis = getRedis();
   await seedCardPool(batchId, cards);
 
+  // maxUsage: orders one card may place in this batch (0 = unlimited). A card
+  // at its cap is skipped like a paused one — it is not dead, it is done.
   const picked = (await redis.eval(
     `
     local orderKey  = KEYS[1]
@@ -126,18 +128,22 @@ export async function acquireCard(batchId: string, cards: CardDetails[]): Promis
     local pausedKey = KEYS[3]
     local usedKey   = KEYS[4]
     local now = tonumber(ARGV[1])
+    local maxUsage = tonumber(ARGV[2]) or 0
 
     local ids = redis.call('LRANGE', orderKey, 0, -1)
     for i = 1, #ids do
       local id = ids[i]
       if redis.call('HEXISTS', deadKey, id) == 0 then
-        local until_ms = redis.call('HGET', pausedKey, id)
-        if until_ms == false then
-          return {id, redis.call('HGET', usedKey, id) or '0'}
-        elseif tonumber(until_ms) <= now then
-          -- Pause has lapsed: clear it so later passes stop re-checking.
-          redis.call('HDEL', pausedKey, id)
-          return {id, redis.call('HGET', usedKey, id) or '0'}
+        local used = tonumber(redis.call('HGET', usedKey, id) or '0')
+        if maxUsage == 0 or used < maxUsage then
+          local until_ms = redis.call('HGET', pausedKey, id)
+          if until_ms == false then
+            return {id, tostring(used)}
+          elseif tonumber(until_ms) <= now then
+            -- Pause has lapsed: clear it so later passes stop re-checking.
+            redis.call('HDEL', pausedKey, id)
+            return {id, tostring(used)}
+          end
         end
       end
     end
@@ -148,7 +154,8 @@ export async function acquireCard(batchId: string, cards: CardDetails[]): Promis
     deadKey(batchId),
     pausedKey(batchId),
     usedKey(batchId),
-    String(Date.now())
+    String(Date.now()),
+    String(maxUsage && maxUsage > 0 ? Math.floor(maxUsage) : 0)
   )) as [string, string] | null;
 
   if (!picked) {
@@ -261,6 +268,53 @@ export function verdictFor(code: string, detail = ""): CardVerdict {
 }
 
 /** Operational view for the batch endpoint — never includes a card number. */
+/**
+ * Can this batch pay right now? Used for ADMISSION, before a job reserves an
+ * attempt: a batch whose cards are all paused should wait, not burn budget.
+ *   usable      cards neither dead, paused nor at their cap
+ *   resumeAtMs  when the earliest pause lapses (null if none paused)
+ */
+export async function cardPoolAdmission(
+  batchId: string,
+  cardCount: number,
+  maxUsage?: number
+): Promise<{ usable: number; dead: number; paused: number; capped: number; resumeAtMs: number | null }> {
+  const redis = getRedis();
+  const [order, dead, paused, used] = await Promise.all([
+    redis.lrange(orderKey(batchId), 0, -1),
+    redis.hgetall(deadKey(batchId)),
+    redis.hgetall(pausedKey(batchId)),
+    redis.hgetall(usedKey(batchId)),
+  ]);
+  // Not seeded yet means nothing has been tried: every card is usable.
+  if (!order.length) return { usable: cardCount, dead: 0, paused: 0, capped: 0, resumeAtMs: null };
+  const now = Date.now();
+  const cap = maxUsage && maxUsage > 0 ? maxUsage : 0;
+  let usable = 0;
+  let deadN = 0;
+  let pausedN = 0;
+  let capped = 0;
+  let resumeAtMs: number | null = null;
+  for (const id of order) {
+    if (dead[id]) {
+      deadN += 1;
+      continue;
+    }
+    if (cap && Number(used[id] || 0) >= cap) {
+      capped += 1;
+      continue;
+    }
+    const until = Number(paused[id] || 0);
+    if (until > now) {
+      pausedN += 1;
+      resumeAtMs = resumeAtMs == null ? until : Math.min(resumeAtMs, until);
+      continue;
+    }
+    usable += 1;
+  }
+  return { usable, dead: deadN, paused: pausedN, capped, resumeAtMs };
+}
+
 export async function cardPoolState(batchId: string) {
   const redis = getRedis();
   const [order, dead, paused, used] = await Promise.all([

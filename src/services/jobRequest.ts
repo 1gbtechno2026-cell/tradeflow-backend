@@ -62,6 +62,8 @@ const normalizedSchema = z.object({
   corporateId: z.string().optional(),
   deliverySlaDays: z.number().int().positive(),
   cards: z.array(z.record(z.unknown())).optional(),
+  /** Orders one card may place in this batch; absent = no cap. */
+  cardMaxUsage: z.number().int().positive().optional(),
   dryRun: z.boolean().default(false),
 });
 
@@ -101,6 +103,10 @@ export function parseCreateJobBody(raw: unknown): NormalizedCreateJob {
     corporateId: (asString(b.corporateId) ?? asString(b.corporate_id))?.toUpperCase(),
     deliverySlaDays: asNumber(b.deliverySlaDays) ?? asNumber(b.delivery_sla_days),
     cards: Array.isArray(b.cards) ? b.cards : undefined,
+    cardMaxUsage:
+      asNumber(b.cardMaxUsage) ??
+      asNumber(b.card_max_usage) ??
+      (asBool(b.smart_cards_max_usage_enabled) ? asNumber(b.smart_cards_max_usage) : undefined),
     dryRun:
       asBool(b.dry_run) ??
       asBool(b.dryRun) ??

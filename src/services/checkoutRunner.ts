@@ -20,7 +20,11 @@ import {
   sleep,
 } from "./browser.js";
 import { config } from "../config.js";
-import { enqueueCheckoutJob } from "./checkoutEnqueue.js";
+import { enqueueCheckoutJob, requeueCheckoutJob } from "./checkoutEnqueue.js";
+import { jobClassFor } from "./jobClass.js";
+import { availablePhoneCapacity } from "./employeePhoneLease.js";
+import { cardPoolAdmission } from "./cardPool.js";
+import { getRedis } from "../lib/redis.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
 import { runPaymentPhase } from "./paymentPhase.js";
 import { FlipkartNetworkObserver } from "../automation/FlipkartNetworkObserver.js";
@@ -173,6 +177,7 @@ async function maybeEnqueueRetry(
     cardType: data.cardType,
     authType: data.authType,
     corporateId: data.corporateId,
+    cardMaxUsage: data.cardMaxUsage,
     cards: data.cards,
   });
   console.log(
@@ -207,6 +212,29 @@ async function checkoutShowsE002(page: Page): Promise<boolean> {
  *  it. Comfortably longer than HEARTBEAT_MS so a slow page never looks dead. */
 const CLAIM_STALE_MS = Number(process.env.CHECKOUT_CLAIM_STALE_MS || 10 * 60 * 1000);
 const HEARTBEAT_MS = Number(process.env.CHECKOUT_HEARTBEAT_MS || 60 * 1000);
+/** How long an otp-phone job waits before asking again when no handset is free. */
+const PHONE_WAIT_MS = Number(process.env.PHONE_WAIT_MS || 20 * 1000);
+/** Upper bound on one job's hold of a Flipkart account; released on exit. */
+const ACCOUNT_LOCK_MS = Number(process.env.ACCOUNT_LOCK_MS || 15 * 60 * 1000);
+
+/**
+ * One job per Flipkart account at a time. The cart is shared per account and
+ * the first step of every job EMPTIES it — two concurrent jobs on one login
+ * would each throw away the other's item. Never a problem at concurrency 1;
+ * the first thing that breaks at 2. Redis SET NX with a TTL, released by the
+ * holder only (compare-and-delete), so a dead worker's hold lapses on its own.
+ */
+async function lockAccount(email: string, holder: string): Promise<(() => Promise<void>) | null> {
+  const redis = getRedis();
+  const key = `account:lock:${String(email || "").trim().toLowerCase()}`;
+  const ok = await redis.set(key, holder, "PX", ACCOUNT_LOCK_MS, "NX");
+  if (ok !== "OK") return null;
+  return async () => {
+    await redis
+      .eval(`if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0`, 1, key, holder)
+      .catch(() => undefined);
+  };
+}
 
 /**
  * Take exclusive ownership of a job, or report that someone else has it.
@@ -232,8 +260,11 @@ async function claimCheckoutJob(jobId: string, runId: string) {
         { status: "queued" },
         // Reclaim only a *silent* running job. heartbeatAt null means it was
         // claimed before this field existed, or claimed and never beat once.
-        { status: "running", heartbeatAt: { $lt: staleBefore } },
-        { status: "running", heartbeatAt: null, startedAt: { $lt: staleBefore } },
+        // NEVER one that had already pressed Pay (paymentStartedAt set): money
+        // may have moved, and a second run would buy the product twice. Those
+        // go to needs_reconciliation in runCheckoutJob instead.
+        { status: "running", heartbeatAt: { $lt: staleBefore }, paymentStartedAt: null },
+        { status: "running", heartbeatAt: null, startedAt: { $lt: staleBefore }, paymentStartedAt: null },
       ],
     },
     {
@@ -257,6 +288,37 @@ export async function runCheckoutJob(data: CheckoutJobData) {
 
   const job = await claimCheckoutJob(data.jobId, runId);
   if (!job) {
+    // A worker that died AFTER pressing Pay leaves a silent `running` job with
+    // paymentStartedAt set. It must not be re-run — the bank may have charged
+    // and Flipkart may have placed the order — so it is parked for a person or
+    // for reconciliation against Flipkart's orders, with whatever is known.
+    const staleBefore = new Date(Date.now() - CLAIM_STALE_MS);
+    const parked = await CheckoutJob.findOneAndUpdate(
+      {
+        _id: data.jobId,
+        status: "running",
+        paymentStartedAt: { $ne: null },
+        $or: [{ heartbeatAt: { $lt: staleBefore } }, { heartbeatAt: null, startedAt: { $lt: staleBefore } }],
+      },
+      {
+        $set: { status: "needs_reconciliation", step: "needs_reconciliation", completedAt: new Date() },
+        $push: {
+          logs: {
+            at: new Date(),
+            level: "error",
+            step: "needs_reconciliation",
+            message:
+              "Worker went silent after Pay was pressed and before Flipkart confirmed. NOT re-run: " +
+              "check the account's My Orders / the bank for this attempt before doing anything with this job.",
+          },
+        },
+      },
+      { new: true }
+    ).select("result.flipkartOrderId");
+    if (parked) {
+      console.log(`[${data.jobId}] [error] [claim] silent after Pay — parked as needs_reconciliation (order id known: ${parked.result?.flipkartOrderId || "no"})`);
+      return;
+    }
     // Already finished, or another worker is actively on it. Either way this
     // delivery must not open a browser — dropping it is the correct outcome, not
     // an error, so the message is acknowledged and no attempt is consumed.
@@ -295,6 +357,39 @@ async function runClaimedCheckoutJob(
 ) {
 
   const { quantityPerOrder, totalQuantity, totalAttempts } = batchLimits(data);
+
+  // ADMISSION, before an attempt is reserved: a job that cannot pay right now
+  // — no handset free under its corporate, every card paused — waits, it does
+  // not fail, and the batch's attempt budget is untouched. Failing here used to
+  // cost an attempt per wait, which at 50 phones and 1,000 orders would have
+  // spent the budget on nothing.
+  const cls = jobClassFor(data);
+  if (cls === "otp-phone" && data.cardType) {
+    const cap = await availablePhoneCapacity({ cardTypeName: data.cardType, corporateId: data.corporateId || undefined }).catch(() => null);
+    if (cap && cap.claimable <= 0) {
+      await requeueCheckoutJob(
+        data,
+        PHONE_WAIT_MS,
+        `No free handset under ${data.corporateId || data.cardType} (${cap.totalOnboarded} onboarded` +
+          `${cap.onlineOnly ? ", online only" : ""})`
+      );
+      return;
+    }
+  }
+  if (cls !== "cod" && data.cards?.length) {
+    const pool = await cardPoolAdmission(data.batchId, data.cards.length, data.cardMaxUsage).catch(() => null);
+    if (pool && pool.usable <= 0 && pool.paused > 0) {
+      const wait = Math.min(Math.max((pool.resumeAtMs ?? 0) - Date.now(), 30_000), 10 * 60 * 1000);
+      await requeueCheckoutJob(data, wait, `Every usable card is paused (${pool.paused} paused, ${pool.dead} dead, ${pool.capped} at their cap)`);
+      return;
+    }
+  }
+  const unlockAccount = await lockAccount(data.email, job.claimedBy || String(job._id));
+  if (!unlockAccount) {
+    await requeueCheckoutJob(data, 15_000, `${data.email} already has an order in progress (one job per account at a time)`);
+    return;
+  }
+
   const slot = await reserveBatchSlot({
     batchId: data.batchId,
     quantityPerOrder,
@@ -308,6 +403,7 @@ async function runClaimedCheckoutJob(
       "batch",
       `Batch target already reached (purchased ${slot.purchasedQuantity}/${totalQuantity}) — Chrome not opened`
     );
+    await unlockAccount();
     return;
   }
   if (slot.kind === "skip_exhausted") {
@@ -318,6 +414,7 @@ async function runClaimedCheckoutJob(
       `Attempt budget exhausted (${slot.attemptsUsed}/${totalAttempts}, purchased ${slot.purchasedQuantity}/${totalQuantity}) — Chrome not opened`,
       "error"
     );
+    await unlockAccount();
     return;
   }
 
@@ -619,7 +716,18 @@ async function runClaimedCheckoutJob(
     // Reaching payment is no longer the end of the road for a card order. The
     // reservation is held until the payment phase resolves: releasing it here
     // would let a sibling job claim the slot this order is about to spend.
-    const payment = await runPaymentPhase({ page, data, log, dryRun: PAYMENT_DRY_RUN, paymentApi });
+    const payment = await runPaymentPhase({
+      page,
+      data,
+      log,
+      dryRun: PAYMENT_DRY_RUN,
+      paymentApi,
+      // Durable, direct, awaited — not through the batched reporter — because
+      // this is the line between "safe to re-run" and "money may have moved".
+      onBeforePay: async () => {
+        await CheckoutJob.updateOne({ _id: data.jobId }, { $set: { paymentStartedAt: new Date() } });
+      },
+    });
     if (payment.attempted) {
       if (!payment.ok) {
         // Which card the failed attempt went on, before the failure is recorded.
@@ -720,5 +828,6 @@ async function runClaimedCheckoutJob(
     await mobBrowser?.close().catch(() => undefined);
     const latest = await CheckoutJob.findById(data.jobId).select("status");
     if (latest?.status === "cancelled") await releaseReservation();
+    await unlockAccount();
   }
 }

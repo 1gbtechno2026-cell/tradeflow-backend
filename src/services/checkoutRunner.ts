@@ -6,9 +6,11 @@ import { PaymentApiWatcher, type PlacedOrderDetails } from "../automation/Paymen
 import { closeReporter, openReporter, reporterFor } from "./jobReporter.js";
 import {
   readBatchProgress,
+  refundBatchAttempt,
   releaseBatchReservation,
   reserveBatchSlot,
 } from "./batchCounters.js";
+import { claimProxyForWorker, isProxyError, probeExitIp, recordProxyUse, reportProxyFailure } from "./proxyPool.js";
 import {
   blockFlipkartLogout,
   desktopContext,
@@ -474,9 +476,27 @@ async function runClaimedCheckoutJob(
    * Proven by scripts/testFlowCli.ts: `npm run test:flow -- happy` reaches
    * pay.flipkart.com with the item in the cart.
    */
+  // Egress: this worker's proxy from the pool, re-read per job so a change in
+  // the dashboard applies to the next order. In `required` mode a job with no
+  // proxy waits rather than leaving from this machine's own address — and the
+  // attempt it reserved is given back, because Flipkart never saw it.
+  let egress: Awaited<ReturnType<typeof claimProxyForWorker>> = null;
+  try {
+    egress = await claimProxyForWorker(config.workerId);
+  } catch (err) {
+    console.warn(`[${data.jobId}] [warn] [proxy] pool unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!egress && config.proxyMode === "required") {
+    await releaseReservation();
+    await refundBatchAttempt(data.batchId);
+    await requeueCheckoutJob(data, config.proxyWaitMs, `no free proxy for worker ${config.workerId} (PROXY_MODE=required)`);
+    await unlockAccount();
+    return;
+  }
+
   // One watcher across both legs — see testFlow for why.
   const apiWatcher = new FlipkartApiWatcher();
-  const deskBrowser = await launchStealthBrowser({ headless: config.headless });
+  const deskBrowser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
   const deskContext = await desktopContext(deskBrowser);
     apiWatcher.attach(deskContext);
   let mobBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
@@ -501,7 +521,24 @@ async function runClaimedCheckoutJob(
   );
 
   let checkout: FlipkartCheckout | undefined;
+  // Once Pay has been pressed, a tunnel error is NOT re-queued: money may have
+  // moved, and the paymentStartedAt rule (never re-run blindly) applies.
+  let payPressed = false;
   try {
+    // Prove the tunnel before a single Flipkart request: the address Flipkart
+    // sees goes on the order row, and a dead proxy fails HERE as PROXY_FAILED
+    // (re-queued, attempt refunded) instead of minutes later as a page timeout
+    // blamed on the platform ID.
+    if (egress) {
+      const exitIp = await probeExitIp(deskContext);
+      log("info", `[proxy] egress ${egress.label} → exit IP ${exitIp} (worker ${config.workerId})`, "session");
+      await recordProxyUse(egress.id, data.jobId, exitIp);
+      await patchResult(data.jobId, { egressProxy: egress.label, exitIp });
+    } else {
+      log("warn", `[proxy] no proxy — leaving from this machine's own address (PROXY_MODE=${config.proxyMode})`, "session");
+      await patchResult(data.jobId, { egressProxy: "direct" });
+    }
+
     log("info", `Restoring Flipkart session for ${session.email}`, "session");
     await restoreFlipkartSession(page, session.cookies);
 
@@ -539,7 +576,7 @@ async function runClaimedCheckoutJob(
     // ---- desktop leg done; everything from here is the m-site ----------------
     netObserver.dispose();
     await deskContext.close().catch(() => undefined);
-    mobBrowser = await launchMobileBrowser({ headless: config.headless });
+    mobBrowser = await launchMobileBrowser({ headless: config.headless, proxy: egress?.proxy });
     const mobContext = await mobileContext(mobBrowser);
     apiWatcher.attach(mobContext);
     paymentApi = new PaymentApiWatcher().attach(mobContext);
@@ -725,6 +762,7 @@ async function runClaimedCheckoutJob(
       // Durable, direct, awaited — not through the batched reporter — because
       // this is the line between "safe to re-run" and "money may have moved".
       onBeforePay: async () => {
+        payPressed = true;
         await CheckoutJob.updateOne({ _id: data.jobId }, { $set: { paymentStartedAt: new Date() } });
       },
     });
@@ -775,6 +813,26 @@ async function runClaimedCheckoutJob(
     );
     await sleep(config.keepBrowserOpenMs);
   } catch (err) {
+    const rawMessage = err instanceof Error ? err.message : String(err);
+
+    // The tunnel failed, not the order. The proxy takes the blame (dead after
+    // PROXY_DEAD_AFTER), the attempt goes back to the batch, and the job is
+    // re-queued so the next pick leaves through a different proxy. No status
+    // of "failed" and no error code on the job: Flipkart never saw it.
+    if (egress && !payPressed && isProxyError(rawMessage)) {
+      const retired = await reportProxyFailure(egress.id, rawMessage.split("\n")[0]);
+      log(
+        "warn",
+        `[proxy] ${egress.label} failed: ${rawMessage.split("\n")[0].slice(0, 200)}` +
+          `${retired ? " — marked DEAD" : ""}; attempt refunded, job re-queued`,
+        "session"
+      );
+      await releaseReservation();
+      await refundBatchAttempt(data.batchId);
+      await requeueCheckoutJob(data, config.proxyWaitMs, `proxy ${egress.label} failed — PROXY_FAILED`);
+      return;
+    }
+
     for (const s of netObserver.getBlocks().slice(-3)) {
       log("warn", `[net] ${s.kind}: ${s.text} — ${s.url}`, "net");
     }
@@ -782,7 +840,6 @@ async function runClaimedCheckoutJob(
     // reason. Out of stock / not deliverable used to stop the whole batch here;
     // they no longer do — the next platform ID gets its own attempt, because a
     // product Flipkart refuses to one account may still be sold to another.
-    const rawMessage = err instanceof Error ? err.message : String(err);
     let failure = err instanceof CheckoutFailure ? err : null;
     if (!failure && err instanceof OutOfStockPincodeError) {
       failure = new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", err.rawMessage);

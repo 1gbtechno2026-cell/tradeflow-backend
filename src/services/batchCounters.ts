@@ -200,6 +200,32 @@ export async function reserveBatchSlot(input: {
   return { kind: "skip_target", purchasedQuantity, attemptsUsed };
 }
 
+const REFUND_ATTEMPT_LUA = `
+local attemptsKey = KEYS[1]
+local statusKey = KEYS[2]
+local ttl = tonumber(ARGV[1])
+local attempts = tonumber(redis.call('GET', attemptsKey) or '0')
+if attempts > 0 then
+  attempts = redis.call('DECR', attemptsKey)
+end
+if redis.call('GET', statusKey) == 'exhausted' then
+  redis.call('DEL', statusKey)
+end
+redis.call('EXPIRE', attemptsKey, ttl)
+return attempts
+`;
+
+/**
+ * Gives an attempt back. For a job that never reached Flipkart because OUR
+ * plumbing failed (the proxy), so the batch's attempt budget is spent only on
+ * Flipkart's answers. Clears an `exhausted` mark the refunded attempt caused.
+ */
+export async function refundBatchAttempt(batchId: string): Promise<number> {
+  const r = getBatchRedis();
+  const left = await r.eval(REFUND_ATTEMPT_LUA, 2, attemptsKey(batchId), statusKey(batchId), String(KEY_TTL_SEC));
+  return asInt(left);
+}
+
 export async function releaseBatchReservation(batchId: string, quantityPerOrder: number): Promise<number> {
   const r = getBatchRedis();
   const restored = await r.eval(

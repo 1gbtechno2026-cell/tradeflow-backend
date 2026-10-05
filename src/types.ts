@@ -139,6 +139,10 @@ export interface JobResultSnapshot {
   /** Set only when a corporate handset was leased for the OTP. */
   employeeId?: string;
   authenticatedAt?: Date;
+  /** Egress: the Proxy Pool row the worker left from ("host:port", or
+   *  "direct") and the public address Flipkart saw. */
+  egressProxy?: string;
+  exitIp?: string;
 }
 
 export interface CheckoutJobData {

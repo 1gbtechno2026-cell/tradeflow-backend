@@ -1,4 +1,5 @@
-export type CheckoutErrorSource = "PLATFORM" | "BANK" | "USER";
+/** INFRA: our own plumbing (a proxy, a tunnel) — never the platform ID's fault. */
+export type CheckoutErrorSource = "PLATFORM" | "BANK" | "USER" | "INFRA";
 
 export type CheckoutErrorCode =
   | "PRODUCT_UNAVAILABLE"
@@ -24,6 +25,7 @@ export type CheckoutErrorCode =
   | "OTP_TIMEOUT"
   | "OTP_NOT_FOUND"
   | "OTP_CARD_MISMATCH"
+  | "PROXY_FAILED"
   | "UNKNOWN";
 
 export interface CheckoutErrorDef {
@@ -244,6 +246,20 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     failedStep: "payment",
     stageDisplay: "Processing Payment",
     noRetry: true,
+  },
+  /**
+   * The worker's outbound proxy failed (tunnel refused, auth rejected, the
+   * egress probe got nothing). Nothing about the platform ID or the product:
+   * the runner re-queues the job without burning an attempt and the proxy's
+   * fail counter goes up (dead after PROXY_DEAD_AFTER). Recorded on the job
+   * only when the re-queue itself is impossible.
+   */
+  PROXY_FAILED: {
+    code: "PROXY_FAILED",
+    display: "Proxy connection failed",
+    source: "INFRA",
+    failedStep: "session",
+    stageDisplay: "Opening browser",
   },
   UNKNOWN: {
     code: "UNKNOWN",

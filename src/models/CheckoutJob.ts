@@ -207,6 +207,10 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       parentCardLast4: { type: String, default: "" },
       childCardLast4: { type: String, default: "" },
       billingPhone: { type: String, default: "" },
+      // Egress: which Proxy Pool row the worker left from ("host:port") and the
+      // public address Flipkart saw. "direct" when no proxy was used.
+      egressProxy: { type: String, default: "" },
+      exitIp: { type: String, default: "" },
     },
     logs: { type: [JobLogSchema], default: [] },
     bullmqJobId: { type: String },

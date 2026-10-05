@@ -1,3 +1,4 @@
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
@@ -45,4 +46,27 @@ export const config = {
   enableTestRoutes: process.env.ENABLE_TEST_ROUTES === "1",
   /** Where test-run screenshots and page text are written. */
   testArtifactDir: process.env.TEST_ARTIFACT_DIR || "debug/test-runs",
+  /**
+   * This process's identity in the Proxy Pool: the row it binds to is keyed on
+   * it, so the binding survives restarts. Set WORKER_ID=w-001 … per AWS task;
+   * locally it is the machine's hostname. The API process (Test tab) uses
+   * `${workerId}-api` so it never shares a worker's proxy.
+   */
+  workerId: (process.env.WORKER_ID || os.hostname().split(".")[0] || "worker").trim(),
+  /**
+   * required  — a worker with no proxy exits at boot and takes no jobs; a job
+   *             whose proxy vanishes mid-batch waits (re-queued) for a free one.
+   * preferred — use a proxy when one is free, else the local connection, and
+   *             say so on every job (default: this laptop).
+   * off       — ignore the pool entirely.
+   */
+  proxyMode: (["required", "preferred", "off"].includes(String(process.env.PROXY_MODE || "").toLowerCase())
+    ? String(process.env.PROXY_MODE).toLowerCase()
+    : "preferred") as "required" | "preferred" | "off",
+  /** Decrypts proxy passwords (services/proxySecrets.ts). Same value as the dashboard's. */
+  proxyCredKey: process.env.PROXY_CRED_KEY || "",
+  /** How long a job waits for a proxy to free up in `required` mode. */
+  proxyWaitMs: Math.max(5_000, Number(process.env.PROXY_WAIT_MS || 30_000)),
+  /** Consecutive proxy failures before a row is marked dead. */
+  proxyDeadAfter: Math.max(1, Number(process.env.PROXY_DEAD_AFTER || 3)),
 };

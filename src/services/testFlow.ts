@@ -24,6 +24,7 @@ import { verdictFor } from "./cardPool.js";
 import { authenticatePayment } from "../paymentStrategies/index.js";
 import { remainingBudgetMs } from "./paymentPhase.js";
 import { orderDetailFields } from "./checkoutRunner.js";
+import { claimProxyForWorker } from "./proxyPool.js";
 import type { JobResultSnapshot } from "../types.js";
 import type { AuthType, CardDetails } from "../paymentStrategies/types.js";
 import type { AddressDetails, LogLevel } from "../types.js";
@@ -349,7 +350,14 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
       file: paymentApi.writeTo(dir),
     };
   };
-  const desktopBrowser = await launchStealthBrowser({ headless: cfg.headless ?? config.headless });
+  // The harness leaves through the pool too, bound as "<worker>-api" so it never
+  // shares a real worker's address. Logged like the worker does.
+  const egress = await claimProxyForWorker(`${config.workerId}-api`).catch((err) => {
+    log("warn", `[proxy] pool unavailable: ${err instanceof Error ? err.message : String(err)} — local connection`);
+    return null;
+  });
+  log("info", egress ? `[proxy] egress ${egress.label}` : `[proxy] no proxy bound — local connection (PROXY_MODE=${config.proxyMode})`);
+  const desktopBrowser = await launchStealthBrowser({ headless: cfg.headless ?? config.headless, proxy: egress?.proxy });
   let mobileBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
   let reachedPayments = false;
   let order: TestFlowResult["order"];
@@ -414,7 +422,7 @@ export async function runTestFlow(cfg: TestFlowConfig, existingRunId?: string): 
 
     // ================= MOBILE LEG =================
     await step(4, `Mobile: switch context (${cfg.mobileDevice || config.mobileDevice})`);
-    mobileBrowser = await launchMobileBrowser({ headless: cfg.headless ?? config.headless });
+    mobileBrowser = await launchMobileBrowser({ headless: cfg.headless ?? config.headless, proxy: egress?.proxy });
     const mob = await mobileContext(mobileBrowser, cfg.mobileDevice);
     apiWatcher.attach(mob);
     paymentApi.attach(mob);

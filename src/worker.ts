@@ -3,6 +3,7 @@ import { config } from "./config.js";
 import { createCheckoutWorker, LEGACY_QUEUE, queueNameFor } from "./queue.js";
 import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
+import { claimProxyForWorker } from "./services/proxyPool.js";
 
 /**
  * Which classes this process serves, and how many jobs of each at once.
@@ -33,6 +34,26 @@ function concurrencyFor(cls: JobClass): number {
 
 async function main() {
   await connectDb();
+
+  // Egress first. In `required` mode a worker with nothing to leave from must
+  // not take a single job — it would place orders from this machine's own
+  // address. The binding is re-read at every job start (claimProxyForWorker),
+  // so this is the gate, not the only read.
+  if (config.proxyMode !== "off") {
+    const egress = await claimProxyForWorker(config.workerId);
+    if (egress) {
+      console.log(`[proxy] worker ${config.workerId} bound to ${egress.label} (mode ${config.proxyMode})`);
+    } else if (config.proxyMode === "required") {
+      console.error(
+        `[proxy] worker ${config.workerId}: no free proxy in the pool and PROXY_MODE=required — ` +
+          `add proxies in the dashboard's Proxy Pool tab (or assign one to "${config.workerId}") and start again`
+      );
+      process.exit(3);
+    } else {
+      console.warn(`[proxy] worker ${config.workerId}: no free proxy — running on the local connection (PROXY_MODE=preferred)`);
+    }
+  }
+
   const classes = classesFromEnv();
   const names = [...classes.map((c) => [queueNameFor(c), concurrencyFor(c)] as const), [LEGACY_QUEUE, 1] as const];
   for (const [name, concurrency] of names) {

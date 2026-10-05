@@ -83,7 +83,21 @@ function stealthLaunchArgs() {
  * automation needs one leg on each. launchStealthContext below is unchanged and
  * still the right call for anything that wants a single desktop context.
  */
-export async function launchStealthBrowser(options?: { headless?: boolean }): Promise<Browser> {
+/** Outbound proxy for a launched Chrome, in Playwright's launch-option shape.
+ *  From the Proxy Pool (services/proxyPool.ts); undefined = local connection. */
+export interface LaunchProxy {
+  server: string;
+  username?: string;
+  password?: string;
+  bypass?: string;
+}
+
+export interface LaunchOptions {
+  headless?: boolean;
+  proxy?: LaunchProxy;
+}
+
+export async function launchStealthBrowser(options?: LaunchOptions): Promise<Browser> {
   const executablePath = getChromePath();
   // Visible Chrome unless the caller explicitly asks for headless true.
   const headless = options?.headless ?? config.headless;
@@ -102,6 +116,7 @@ export async function launchStealthBrowser(options?: { headless?: boolean }): Pr
     handleSIGTERM: false,
     handleSIGHUP: false,
     args: stealthLaunchArgs(),
+    ...(options?.proxy ? { proxy: options.proxy } : {}),
     ...launchTarget,
   });
 }
@@ -184,7 +199,7 @@ export async function mobileContext(browser: Browser, deviceName?: string): Prom
  * playwright-extra's `chromium` is a singleton and the login and verify flows
  * depend on its current behaviour.
  */
-export async function launchMobileBrowser(options?: { headless?: boolean }): Promise<Browser> {
+export async function launchMobileBrowser(options?: LaunchOptions): Promise<Browser> {
   const plug = stealthPlugin();
   plug.enabledEvasions.delete("user-agent-override");
   const launcher = addExtra(playwrightChromium);
@@ -205,11 +220,12 @@ export async function launchMobileBrowser(options?: { headless?: boolean }): Pro
     handleSIGTERM: false,
     handleSIGHUP: false,
     args: stealthLaunchArgs(),
+    ...(options?.proxy ? { proxy: options.proxy } : {}),
     ...launchTarget,
   });
 }
 
-export async function launchStealthContext(options?: { headless?: boolean }) {
+export async function launchStealthContext(options?: LaunchOptions) {
   const browser = await launchStealthBrowser(options);
   const context = await desktopContext(browser);
   return { browser, context };

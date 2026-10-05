@@ -207,9 +207,17 @@ export async function leaseOtpPhone(opts: {
  */
 export async function releaseOtpPhone(phoneId: number, runId: string): Promise<boolean> {
   const userId = new Types.ObjectId(workspaceUserId());
+  // leasedUntil is set to "just now" rather than cleared. The picker sorts by
+  // leasedUntil ascending to take the handset idle longest — but a cleared
+  // field sorts as null, every released phone tied at null, and the tie-break
+  // on id handed DMPL001 every single lease (every ICICI order from 1 to 5 Oct
+  // went through 87****1297 while 49 other handsets sat untouched). A lapsed
+  // timestamp keeps the phone claimable (the filter accepts leasedUntil < now)
+  // and makes "released earliest" what the sort actually sees; never-leased
+  // phones (null) still sort first.
   const res = await EmployeePhone.updateOne(
     { userId, id: phoneId, leasedBy: runId },
-    { $set: { leasedBy: null, leasedUntil: null } }
+    { $set: { leasedBy: null, leasedUntil: new Date(Date.now() - 1) } }
   );
   return res.modifiedCount === 1;
 }

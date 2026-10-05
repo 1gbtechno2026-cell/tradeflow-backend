@@ -1141,7 +1141,16 @@ export class FlipkartCheckout {
         const btn = removeBtns().first();
         await btn.scrollIntoViewIfNeeded().catch(() => {});
         console.log(`[Cart] clicking Remove (${i})`);
-        await btn.click({ timeout: 5000 });
+        // A DOM click on the m-site can hang in "scrolling into view" with two
+        // Chromes on one laptop (addsobrap, 5 Oct: 5s timeout, job failed as
+        // UNKNOWN before the product was even opened). Fall back to a tap,
+        // which is what the rest of the m-site flow uses, before giving up.
+        try {
+          await btn.click({ timeout: 5000 });
+        } catch (err) {
+          console.log(`[Cart] Remove click did not complete (${err instanceof Error ? err.message.split("\n")[0] : String(err)}) — tapping instead`);
+          await removeBtns().first().tap({ timeout: 5000 });
+        }
         const emptied = await this.waitUntil(() => this.cartIsEmpty(), 3500, 120, "Your cart is empty after Remove");
         if (emptied) {
           console.log("[Cart] emptied — Your cart is empty!");

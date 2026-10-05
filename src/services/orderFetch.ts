@@ -18,6 +18,9 @@ import {
   restoreFlipkartSession,
   sleep,
 } from "./browser.js";
+import { openOrderApiSession, type MappedOrderUnit } from "./orderApi.js";
+import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSync.js";
+import type { APIRequestContext } from "playwright";
 
 export interface FetchLog {
   time: string;
@@ -653,7 +656,7 @@ export function getOrderFetchJob(userId: string) {
   const job = state(userId);
   tickElapsed(job);
   const { liveBrowsers, ...rest } = job;
-  return { ...rest, logs: [...job.logs], report: { ...job.report } };
+  return { ...rest, mode: config.orderFetchMode, logs: [...job.logs], report: { ...job.report } };
 }
 
 export function isOnOrAfterSince(value?: Date | string | null, since?: Date) {
@@ -1002,6 +1005,8 @@ export type OrderUnitCard = {
   productName?: string;
   status?: string;
   text?: string;
+  /** Known exactly when the card came from the API list; parsed from text otherwise. */
+  orderDate?: Date | null;
 };
 type ListCard = OrderUnitCard;
 
@@ -1067,7 +1072,7 @@ async function discoverUnit(
   if (saved?.last_fetch && !/^skipped — older/i.test(String(saved.last_error || ""))) {
     scrape_status = "scraped";
   } else {
-    const listDate = parseListCardDate(card.status || card.text || "");
+    const listDate = listDateSafe(card);
     if (listDate && listDate.getTime() < jobSince(userId).getTime()) scrape_status = "skipped_old";
   }
 
@@ -1099,7 +1104,233 @@ async function discoverUnit(
 }
 
 function listDateSafe(card: ListCard) {
+  if (card.orderDate instanceof Date && !Number.isNaN(card.orderDate.getTime())) return card.orderDate;
   return parseListCardDate(card.status || card.text || "");
+}
+
+// ---- API mode ---------------------------------------------------------------------
+//
+// ORDER_FETCH_MODE=api reads Flipkart's own order APIs (services/orderApi.ts)
+// instead of the pages. The persistence below is the SAME document and index
+// writes scrapeAndSave() does, so a unit saved either way looks identical in
+// Order Units History. A unit the API cannot serve falls back to the page.
+
+/** Persist one API-mapped unit exactly as scrapeAndSave() persists a scraped one. */
+export async function saveMappedUnit(
+  userId: string,
+  account: OrderAccount,
+  mapped: MappedOrderUnit,
+  opts: { applyCalendar?: boolean } = { applyCalendar: true }
+) {
+  const card = { orderId: mapped.order_id, itemId: mapped.item_id, unitId: mapped.unit_id, orderUrl: mapped.order_url };
+  const failed = mapped.status_key === "Failed";
+  const shippedStage = mapped.tracking.find((row) => /^shipped$/i.test(row.status));
+  const shippedDate = shippedStage?.date ? new Date(shippedStage.date) : null;
+  const orderDate = mapped.order_date;
+
+  if (opts.applyCalendar !== false && !failed && !orderDate) {
+    await patchOrderIndex(userId, account, card, { scrape_status: "failed", last_error: "no placed date in API timeline", order_url: card.orderUrl });
+    log(userId, "warn", `${card.orderId} unit ${card.unitId}: no placed date in the API timeline — skip`);
+    return { lastFetch: new Date(), productName: "", totalAmount: "", statusKey: "unknown", gstNumber: "", trackingCount: mapped.tracking.length, invoiceDownloaded: false, imei: null, orderDate: null, skippedOld: true };
+  }
+  if (opts.applyCalendar !== false && orderDate && !isOnOrAfterSince(orderDate, jobSince(userId))) {
+    log(userId, "info", `${card.orderId} unit ${card.unitId}: placed ${orderDate.toLocaleDateString("en-IN")} is before ${jobSinceLabel(userId)} — index only`);
+    await patchOrderIndex(userId, account, card, {
+      scrape_status: "skipped_old",
+      order_date: orderDate,
+      shipped_date: shippedDate,
+      status_key: mapped.status_key,
+      last_error: `placed before ${jobSinceLabel(userId)}`,
+      order_url: card.orderUrl,
+    });
+    return { lastFetch: new Date(), productName: "", totalAmount: "", statusKey: "older", gstNumber: "", trackingCount: 0, invoiceDownloaded: false, imei: null, orderDate, skippedOld: true };
+  }
+
+  const lastFetch = new Date();
+  const existing = await Order.findOne({ userId, unit_id: mapped.unit_id }).select("id").lean();
+  const seq = existing?.id || (await nextSeq("order_fetch"));
+  const { api_extra, ...fields } = mapped;
+  void api_extra;
+  await Order.updateOne(
+    { userId, unit_id: mapped.unit_id },
+    {
+      $set: {
+        userId,
+        platformAccountId: account.id,
+        id: seq,
+        platform_email: account.email,
+        platform: "FLIPKART",
+        ...fields,
+        is_bae_order: false,
+        is_invoice_downloaded: false,
+        invoice_path: "",
+        cancelled_from_bae: false,
+        imei: null,
+        is_logged_in: true,
+        last_fetch: lastFetch,
+        ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
+        last_error: "",
+      },
+    },
+    { upsert: true }
+  );
+  await patchOrderIndex(userId, account, card, {
+    scrape_status: "scraped",
+    status_key: mapped.status_key,
+    order_date: orderDate,
+    shipped_date: shippedDate,
+    last_error: "",
+    order_url: card.orderUrl,
+  });
+  return {
+    lastFetch,
+    productName: mapped.product_name,
+    totalAmount: mapped.total_amount,
+    statusKey: mapped.status_key,
+    gstNumber: mapped.business_gst_no,
+    trackingCount: mapped.tracking.length,
+    invoiceDownloaded: false,
+    imei: null,
+    orderDate,
+    skippedOld: false,
+  };
+}
+
+/** Read one unit through the API and persist it. Throws on API trouble so the
+ *  caller can fall back to the page for that unit. */
+export async function apiScrapeAndSave(
+  ctx: APIRequestContext,
+  userId: string,
+  account: OrderAccount,
+  card: OrderUnitCard,
+  opts: { applyCalendar?: boolean; listUnit?: ApiListedUnit["unit"] | null } = {}
+) {
+  const read = await readUnitViaApi(ctx, card.orderId, card.unitId, opts.listUnit ?? null);
+  return saveMappedUnit(userId, account, read.mapped, { applyCalendar: opts.applyCalendar });
+}
+
+/**
+ * API-mode discovery + enrichment for one account. Returns false when the
+ * API would not serve this session at all (then the page path runs instead).
+ * A single unit the API cannot serve is retried on the page via getPage().
+ */
+async function processAccountViaApi(
+  getPage: () => Promise<Page>,
+  userId: string,
+  queue: QueueAccount[],
+  row: QueueAccount,
+  index: number
+): Promise<boolean> {
+  const job = state(userId);
+  job.currentEmail = row.email;
+  job.phase = "discover";
+  log(userId, "info", `Discover ${index + 1}/${queue.length}: ${row.email} (API)`);
+  const ctx = await openOrderApiSession(row.cookies);
+  try {
+    let walk: Awaited<ReturnType<typeof walkOrderList>>;
+    try {
+      walk = await walkOrderList(ctx, jobSince(userId), {
+        onPage: (p) => log(userId, "info", `${row.email}: list page ${p.page} · ${p.units} unit(s) · ${p.older} older than ${jobSinceLabel(userId)} · ${p.ms}ms`),
+      });
+    } catch (err) {
+      // Whatever stopped the list — a refused session, an HTTP error, a socket
+      // that would not settle after retries — the page path still knows how
+      // to do this account. Fall back rather than fail it.
+      const why = err instanceof Error ? err.message.split("\n")[0] : String(err);
+      log(userId, "warn", `${row.email}: API list unavailable (${why.slice(0, 160)}) — using the page`);
+      return false;
+    }
+    const byUnit = new Map<string, ApiListedUnit>();
+    const cards: ListCard[] = walk.units.map((u) => {
+      byUnit.set(u.unitId, u);
+      return { orderId: u.orderId, itemId: u.itemId, unitId: u.unitId, orderUrl: u.orderUrl, amount: u.amount, productName: u.productName, status: u.status, orderDate: u.orderDate };
+    });
+    for (const prev of row.existing) {
+      if (prev.orderDate && !isOnOrAfterSince(prev.orderDate, jobSince(userId))) continue;
+      if (byUnit.has(prev.unitId)) continue;
+      cards.push({ orderId: prev.orderId, itemId: prev.itemId, unitId: prev.unitId, orderUrl: prev.orderUrl || orderDetailsUrl(prev.orderId, prev.itemId, prev.unitId), amount: "" });
+    }
+    log(userId, "info", `Collect done (API): ${cards.length} unit(s) in ${walk.pages} page(s)${walk.stoppedAtSince ? ` — stopped at ${jobSinceLabel(userId)}` : ""}`);
+    job.report.idsFound += cards.length;
+    tickElapsed(job);
+
+    let discoveredNew = 0;
+    let discoveredDup = 0;
+    for (const card of cards) {
+      if (job.cancelled) throw new Error("cancelled");
+      const kind = await discoverUnit(userId, row, card);
+      job.report.idsDiscovered += 1;
+      if (kind === "duplicate" || kind === "seeded") {
+        discoveredDup += 1;
+        job.report.idsDuplicate += 1;
+      } else {
+        discoveredNew += 1;
+        job.report.idsNew += 1;
+      }
+    }
+    log(userId, "info", `${row.email}: indexed ${cards.length} unit(s) · ${discoveredNew} new · ${discoveredDup} already known`);
+
+    job.phase = "enrich";
+    const pending = await OrderIndex.find({ userId, platformAccountId: row.id, scrape_status: { $in: ["pending", "failed"] } }).lean();
+    job.report.enrichQueued += pending.length;
+    log(userId, "info", `Enrich ${row.email} (API): ${pending.length} pending/failed unit(s)`);
+
+    let fallbackPage: Page | null = null;
+    for (let n = 0; n < pending.length; n++) {
+      const rowIdx = pending[n];
+      if (job.cancelled) throw new Error("cancelled");
+      const card: ListCard = {
+        orderId: rowIdx.order_id,
+        itemId: rowIdx.item_id,
+        unitId: rowIdx.unit_id,
+        orderUrl: rowIdx.order_url || orderDetailsUrl(rowIdx.order_id, rowIdx.item_id, rowIdx.unit_id),
+        amount: "",
+      };
+      job.currentEmail = `${row.email} enrich ${n + 1}/${pending.length} ${card.orderId} ${card.unitId}`;
+      job.report.idsOpened += 1;
+      let result: Awaited<ReturnType<typeof saveMappedUnit>>;
+      try {
+        try {
+          result = await apiScrapeAndSave(ctx, userId, row, card, { applyCalendar: true, listUnit: byUnit.get(card.unitId)?.unit ?? null });
+        } catch (apiErr) {
+          const why = apiErr instanceof Error ? apiErr.message : String(apiErr);
+          log(userId, "warn", `${card.orderId} unit ${card.unitId}: API read failed (${why.slice(0, 140)}) — falling back to the page`);
+          if (!fallbackPage) {
+            fallbackPage = await getPage();
+            await restoreFlipkartSession(fallbackPage, row.cookies);
+          }
+          result = await scrapeAndSave(fallbackPage, userId, row, card, { applyCalendar: true });
+        }
+        if (result.skippedOld) {
+          job.report.idsSkippedOld += 1;
+          tickElapsed(job);
+          continue;
+        }
+        job.report.idsScraped += 1;
+        job.savedOrders += 1;
+        if (result.productName) job.report.withProduct += 1;
+        if (result.trackingCount) job.report.withTracking += 1;
+        if (result.gstNumber) job.report.withGst += 1;
+        tickElapsed(job);
+        log(userId, "info", `${card.orderId} unit ${card.unitId}: ${result.productName || "product"} · ₹${result.totalAmount || "?"} · ${result.statusKey || "status"} · ${result.trackingCount} tracking stage(s)`);
+      } catch (err) {
+        if (isDestroyedContext(err)) throw err;
+        job.report.idsFailed += 1;
+        tickElapsed(job);
+        const message = err instanceof Error ? err.message : String(err);
+        log(userId, "warn", `${card.orderId} unit ${card.unitId}: enrich failed (${message})`);
+        await patchOrderIndex(userId, row, card, { scrape_status: "failed", last_error: message });
+      }
+    }
+
+    job.done += 1;
+    job.report.accountsDone += 1;
+    tickElapsed(job);
+    log(userId, "info", `${row.email}: discover ${cards.length} · enrich ${pending.length} · API · last fetch ${new Date().toLocaleString("en-IN")}`);
+    return true;
+  } finally {
+    await ctx.dispose().catch(() => undefined);
+  }
 }
 
 async function closeLiveBrowsers(userId: string) {
@@ -1668,7 +1899,12 @@ export async function scrapeAndSave(
 }
 
 
-async function processAccount(page: Page, userId: string, queue: QueueAccount[], row: QueueAccount, index: number) {
+async function processAccount(getPage: () => Promise<Page>, userId: string, queue: QueueAccount[], row: QueueAccount, index: number) {
+  if (config.orderFetchMode === "api") {
+    const served = await processAccountViaApi(getPage, userId, queue, row, index);
+    if (served) return;
+  }
+  const page = await getPage();
   const job = state(userId);
   job.currentEmail = row.email;
   job.phase = "discover";
@@ -1772,21 +2008,35 @@ async function run(userId: string, queue: QueueAccount[]) {
   const job = state(userId);
   const windows = Math.max(1, job.windows || 1);
   let next = 0;
-  log(userId, "info", `Opening ${windows} Chrome window(s) for ${queue.length} email(s)`);
+  log(
+    userId,
+    "info",
+    config.orderFetchMode === "api"
+      ? `API mode: ${windows} lane(s) for ${queue.length} email(s) — Chrome only if a unit falls back to the page`
+      : `Opening ${windows} Chrome window(s) for ${queue.length} email(s)`
+  );
 
   async function lane(laneId: number) {
     if (job.cancelled) return;
-    const launched = await launchStealthContext();
-    job.liveBrowsers.push(launched);
-    const page = await launched.context.newPage();
-    await blockFlipkartLogout(page);
+    // Chrome on demand: scrape mode needs it for every account, API mode only
+    // when a unit (or a whole session) has to fall back to the page.
+    let launched: { browser: Browser; context: BrowserContext } | null = null;
+    let page: Page | null = null;
+    const getPage = async () => {
+      if (page) return page;
+      launched = await launchStealthContext();
+      job.liveBrowsers.push(launched);
+      page = await launched.context.newPage();
+      await blockFlipkartLogout(page);
+      return page;
+    };
     try {
       while (!job.cancelled) {
         const i = next++;
         if (i >= queue.length) break;
         const row = queue[i];
         try {
-          await processAccount(page, userId, queue, row, i);
+          await processAccount(getPage, userId, queue, row, i);
         } catch (err) {
           if (job.cancelled || (err instanceof Error && err.message === "cancelled")) {
             log(userId, "warn", `Stopped at ${row.email}`);
@@ -1795,16 +2045,21 @@ async function run(userId: string, queue: QueueAccount[]) {
           job.failed += 1;
           log(userId, "error", `${row.email} failed: ${err instanceof Error ? err.message : err}`);
         }
-        try {
-          await wipeFlipkartLocalSession(page);
-        } catch {
-          /* next restore */
+        if (page) {
+          try {
+            await wipeFlipkartLocalSession(page);
+          } catch {
+            /* next restore */
+          }
         }
         await sleep(600);
       }
     } finally {
-      await closeBrowser(launched.browser, launched.context).catch(() => {});
-      job.liveBrowsers = job.liveBrowsers.filter((row) => row.browser !== launched.browser);
+      if (launched) {
+        const l = launched as { browser: Browser; context: BrowserContext };
+        await closeBrowser(l.browser, l.context).catch(() => {});
+        job.liveBrowsers = job.liveBrowsers.filter((row) => row.browser !== l.browser);
+      }
     }
     void laneId;
   }

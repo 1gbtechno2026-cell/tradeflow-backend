@@ -17,6 +17,7 @@ import {
 import { terminalStatusFilter } from "./orderLifecycle.js";
 import { assertIdleForUpdate, markUpdateRunning } from "./orderSyncLock.js";
 import {
+  apiScrapeAndSave,
   cookiesFor,
   orderDetailsUrl,
   parseOrderId,
@@ -25,6 +26,8 @@ import {
   type OrderAccount,
   type OrderUnitCard,
 } from "./orderFetch.js";
+import { openOrderApiSession, OrderApiSessionError } from "./orderApi.js";
+import type { APIRequestContext } from "playwright";
 
 export interface UpdateLog {
   time: string;
@@ -114,7 +117,7 @@ export function getOrderUpdateJob(userId: string) {
   const job = state(userId);
   tickElapsed(job);
   const { liveBrowsers, ...rest } = job;
-  return { ...rest, logs: [...job.logs] };
+  return { ...rest, mode: config.orderFetchMode, logs: [...job.logs] };
 }
 
 async function closeLiveBrowsers(userId: string) {
@@ -273,7 +276,7 @@ export async function startOrderUpdate(userId: string, input: UpdateTriggerInput
   log(
     userId,
     "info",
-    `Update ${targets.length} unit(s) across ${accountCount} account(s) · ${job.windows} Chrome window(s) · active statuses only unless IDs were listed`
+    `Update ${targets.length} unit(s) across ${accountCount} account(s) · ${job.windows} lane(s)${config.orderFetchMode === "api" ? " · API mode (Chrome only on fallback)" : " · Chrome"} · active statuses only unless IDs were listed`
   );
 
   void run(userId, targets).finally(() => {
@@ -299,10 +302,25 @@ async function run(userId: string, targets: UpdateTarget[]) {
 
   async function lane() {
     if (job.cancelled) return;
-    const launched = await launchStealthContext();
-    job.liveBrowsers.push(launched);
-    const page = await launched.context.newPage();
-    await blockFlipkartLogout(page);
+    // Chrome on demand: scrape mode needs it for every account, API mode only
+    // when a unit (or a whole session) has to fall back to the page.
+    let launched: { browser: Browser; context: BrowserContext } | null = null;
+    let page: Page | null = null;
+    const getPage = async () => {
+      if (page) return page;
+      launched = await launchStealthContext();
+      job.liveBrowsers.push(launched);
+      page = await launched.context.newPage();
+      await blockFlipkartLogout(page);
+      return page;
+    };
+    const openPageFor = async (account: OrderAccount) => {
+      const p = await getPage();
+      await restoreFlipkartSession(p, account.cookies);
+      await p.goto("https://www.flipkart.com/account/orders?link=home_orders", { waitUntil: "domcontentloaded", timeout: 30000 });
+      if (flipkartLoginUrl(p.url())) throw new Error("Flipkart session expired. Refresh this ID in platform id first.");
+      return p;
+    };
     try {
       while (!job.cancelled) {
         const i = next++;
@@ -310,32 +328,53 @@ async function run(userId: string, targets: UpdateTarget[]) {
         const batch = lanes[i];
         const account = batch[0].account;
         try {
-          await restoreFlipkartSession(page, account.cookies);
-          await page.goto("https://www.flipkart.com/account/orders?link=home_orders", {
-            waitUntil: "domcontentloaded",
-            timeout: 30000,
-          });
-          if (flipkartLoginUrl(page.url())) {
-            throw new Error("Flipkart session expired. Refresh this ID in platform id first.");
-          }
-          for (let n = 0; n < batch.length; n++) {
-            if (job.cancelled) throw new Error("cancelled");
-            const { card } = batch[n];
-            job.currentEmail = `${account.email} ${n + 1}/${batch.length} ${card.orderId} ${card.unitId}`;
+          let api: APIRequestContext | null = null;
+          let pageForAccount: Page | null = null;
+          if (config.orderFetchMode === "api") {
             try {
-              const scraped = await scrapeAndSave(page, userId, account, card, { applyCalendar: false });
-              job.done += 1;
-              if (scraped.statusKey) job.savedOrders += 1;
-              log(
-                userId,
-                "info",
-                `${card.orderId} unit ${card.unitId}: ${scraped.statusKey || "updated"} · ${scraped.productName || "product"}`
-              );
+              api = await openOrderApiSession(account.cookies);
             } catch (err) {
-              if (isDestroyedContext(err)) throw err;
-              job.failed += 1;
-              log(userId, "warn", `${card.orderId} unit ${card.unitId}: ${err instanceof Error ? err.message : err}`);
+              log(userId, "warn", `${account.email}: API session unavailable (${err instanceof Error ? err.message : err}) — using the page`);
             }
+          }
+          try {
+            if (!api) pageForAccount = await openPageFor(account);
+            for (let n = 0; n < batch.length; n++) {
+              if (job.cancelled) throw new Error("cancelled");
+              const { card } = batch[n];
+              job.currentEmail = `${account.email} ${n + 1}/${batch.length} ${card.orderId} ${card.unitId}`;
+              try {
+                let result: Awaited<ReturnType<typeof scrapeAndSave>>;
+                if (api) {
+                  try {
+                    result = await apiScrapeAndSave(api, userId, account, card, { applyCalendar: false });
+                  } catch (apiErr) {
+                    if (apiErr instanceof OrderApiSessionError) {
+                      // The whole session is refused: finish this account on the page.
+                      log(userId, "warn", `${account.email}: ${apiErr.message} — using the page from here`);
+                      await api.dispose().catch(() => undefined);
+                      api = null;
+                    } else {
+                      log(userId, "warn", `${card.orderId} unit ${card.unitId}: API read failed (${apiErr instanceof Error ? apiErr.message.slice(0, 140) : apiErr}) — falling back to the page`);
+                    }
+                    if (!pageForAccount) pageForAccount = await openPageFor(account);
+                    result = await scrapeAndSave(pageForAccount, userId, account, card, { applyCalendar: false });
+                  }
+                } else {
+                  if (!pageForAccount) pageForAccount = await openPageFor(account);
+                  result = await scrapeAndSave(pageForAccount, userId, account, card, { applyCalendar: false });
+                }
+                job.done += 1;
+                if (result.statusKey) job.savedOrders += 1;
+                log(userId, "info", `${card.orderId} unit ${card.unitId}: ${result.statusKey || "updated"} · ${result.productName || "product"}${api ? " · API" : ""}`);
+              } catch (err) {
+                if (isDestroyedContext(err)) throw err;
+                job.failed += 1;
+                log(userId, "warn", `${card.orderId} unit ${card.unitId}: ${err instanceof Error ? err.message : err}`);
+              }
+            }
+          } finally {
+            await api?.dispose().catch(() => undefined);
           }
         } catch (err) {
           if (job.cancelled || (err instanceof Error && err.message === "cancelled")) break;
@@ -345,8 +384,11 @@ async function run(userId: string, targets: UpdateTarget[]) {
         await sleep(400);
       }
     } finally {
-      await closeBrowser(launched.browser, launched.context).catch(() => {});
-      job.liveBrowsers = job.liveBrowsers.filter((row) => row.browser !== launched.browser);
+      if (launched) {
+        const l = launched as { browser: Browser; context: BrowserContext };
+        await closeBrowser(l.browser, l.context).catch(() => {});
+        job.liveBrowsers = job.liveBrowsers.filter((row) => row.browser !== l.browser);
+      }
     }
   }
 

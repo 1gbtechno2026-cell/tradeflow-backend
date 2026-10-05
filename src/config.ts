@@ -69,4 +69,11 @@ export const config = {
   proxyWaitMs: Math.max(5_000, Number(process.env.PROXY_WAIT_MS || 30_000)),
   /** Consecutive proxy failures before a row is marked dead. */
   proxyDeadAfter: Math.max(1, Number(process.env.PROXY_DEAD_AFTER || 3)),
+  /**
+   * How order fetch / update read Flipkart:
+   *   scrape — the My Orders and order-details PAGES, parsed from the DOM (default)
+   *   api    — Flipkart's own order APIs with the saved session (services/orderApi.ts);
+   *            a Chrome is opened only when a unit has to fall back to the page.
+   */
+  orderFetchMode: (String(process.env.ORDER_FETCH_MODE || "scrape").toLowerCase() === "api" ? "api" : "scrape") as "scrape" | "api",
 };

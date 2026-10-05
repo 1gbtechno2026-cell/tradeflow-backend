@@ -1,7 +1,25 @@
 import { request as playwrightRequest, type APIRequestContext } from "playwright";
 import type { ITrackingStage, ITrackingStep } from "../models/Order.js";
 import { mapPlaywrightCookies } from "./browser.js";
-import { toIstIso } from "./orderFetch.js";
+
+/** "2026-09-23T21:50:50+05:30" — the same IST form orderFetch.toIstIso writes
+ *  (kept local so this module never imports the scraper, which imports it). */
+function toIstIso(value?: Date | string | null): string | null {
+  const at = value instanceof Date ? value : value ? new Date(value) : null;
+  if (!at || Number.isNaN(at.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(at);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value || "00";
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}+05:30`;
+}
 
 /**
  * Flipkart's own order APIs, called with a saved session — the two calls the
@@ -130,6 +148,26 @@ export interface OrderListPage {
   bytes: number;
 }
 
+/** Socket-level blips (the first fetch on a fresh context hit ECONNRESET on
+ *  2026-10-05) are retried; HTTP errors and non-JSON answers are not. */
+const TRANSIENT_RE = /ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|EPIPE|socket hang up|Timeout \d+ms exceeded|network error/i;
+
+async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (err instanceof OrderApiError || err instanceof OrderApiSessionError || !TRANSIENT_RE.test(msg) || i === attempts) throw err;
+      await new Promise((r) => setTimeout(r, 500 * i * i));
+      console.warn(`[order-api] ${label}: ${msg.split("\n")[0].slice(0, 120)} — retry ${i}/${attempts - 1}`);
+    }
+  }
+  throw lastErr;
+}
+
 async function readJson(res: { ok(): boolean; status(): number; text(): Promise<string>; url(): string }): Promise<unknown> {
   const text = await res.text();
   if (!res.ok()) {
@@ -152,8 +190,10 @@ export async function fetchOrderList(
   const qs = new URLSearchParams({ page: String(page) });
   for (const p of nextCallParams) qs.set(p.key, p.value);
   const started = Date.now();
-  const res = await ctx.get(`${API_HOST}/api/5/self-serve/orders/?${qs.toString()}`);
-  const text = await res.text();
+  const { res, text } = await withRetry(`list page ${page}`, async () => {
+    const r = await ctx.get(`${API_HOST}/api/5/self-serve/orders/?${qs.toString()}`);
+    return { res: r, text: await r.text() };
+  });
   if (!res.ok()) throw new OrderApiError(`order list answered HTTP ${res.status()}`, res.status(), text.slice(0, 300));
   let json: { RESPONSE?: { multipleOrderDetailsView?: { orders?: ApiOrder[]; moreOrder?: boolean; nextCallParams?: Array<{ key: string; value: string }> } } };
   try {
@@ -188,7 +228,7 @@ export interface OrderDetailsResult {
  */
 export async function fetchOrderDetails(ctx: APIRequestContext, orderId: string, unitId: string): Promise<OrderDetailsResult> {
   const started = Date.now();
-  const res = await ctx.post(`${API_HOST}/api/4/page/fetch`, {
+  const res = await withRetry(`details ${orderId}/${unitId}`, () => ctx.post(`${API_HOST}/api/4/page/fetch`, {
     data: {
       requestContext: { type: "CX_ORDER_DETAIL_PAGE", orderId, unitId, pageView: "", businessCategory: "" },
       pageType: "CX_ORDER_DETAIL_PAGE",
@@ -206,7 +246,7 @@ export async function fetchOrderDetails(ctx: APIRequestContext, orderId: string,
         fetchSeoData: false,
       },
     },
-  });
+  }));
   const raw = (await readJson(res)) as { RESPONSE?: { slots?: Array<{ widget?: { type?: string; data?: Record<string, unknown> } }> } };
   const slots = raw.RESPONSE?.slots || [];
   const dummy = slots.find((s) => s.widget?.type === "DUMMY_CARD_WIDGET");

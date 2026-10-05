@@ -10,6 +10,7 @@ import {
   type TestFlowConfig,
   type TestFlowResult,
 } from "../services/testFlow.js";
+import { getOrderApiRun, listOrderApiRuns, runOrderApiTest, type OrderApiTestConfig } from "../services/orderApiTest.js";
 
 /**
  * The Test tab's backend.
@@ -153,6 +154,65 @@ testRouter.get("/runs/:runId/log", (req, res) => {
     return;
   }
   res.type("text/plain").sendFile(resolved);
+});
+
+// ---- Fetch & update via Flipkart's order APIs (no browser) ---------------------
+// Synchronous: a run is a handful of JSON calls (~1s per list page, ~2s per
+// unit) — well inside a request, unlike the browser flow above.
+
+testRouter.post("/orders", async (req, res) => {
+  const body = (req.body || {}) as Partial<OrderApiTestConfig>;
+  if (!body.platformId) {
+    res.status(400).json({ error: "platformId (id or email) is required" });
+    return;
+  }
+  try {
+    const result = await runOrderApiTest({
+      platformId: String(body.platformId).trim(),
+      orderId: body.orderId ? String(body.orderId).trim().toUpperCase() : undefined,
+      unitId: body.unitId ? String(body.unitId).trim() : undefined,
+      maxPages: body.maxPages != null ? Number(body.maxPages) : undefined,
+      maxUnits: body.maxUnits != null ? Number(body.maxUnits) : undefined,
+    });
+    res.status(result.status === "failed" ? 200 : 201).json(result);
+  } catch (err) {
+    res.status(409).json({ error: err instanceof Error ? err.message : "Could not run" });
+  }
+});
+
+testRouter.get("/orders/runs", (_req, res) => {
+  res.json({
+    runs: listOrderApiRuns().map((r) => ({
+      runId: r.runId,
+      status: r.status,
+      startedAt: r.startedAt,
+      seconds: r.seconds,
+      email: r.email,
+      units: r.units.length,
+      different: r.units.reduce((n, u) => n + (u.details?.different || 0), 0),
+      error: r.error,
+    })),
+  });
+});
+
+testRouter.get("/orders/runs/:runId", (req, res) => {
+  const run = getOrderApiRun(String(req.params.runId)) || listOrderApiRuns(200).find((r) => r.runId === req.params.runId);
+  if (!run) {
+    res.status(404).json({ error: "Run not found" });
+    return;
+  }
+  res.json(run);
+});
+
+/** A run's raw file: `list` or `<orderId>-<unitId>`. */
+testRouter.get("/orders/runs/:runId/file/:name", (req, res) => {
+  const name = String(req.params.name).replace(/[^A-Za-z0-9_-]/g, "");
+  const file = path.resolve(ARTIFACT_ROOT, "orders", String(req.params.runId).replace(/[^A-Za-z0-9_-]/g, ""), `${name}.json`);
+  if (!file.startsWith(ARTIFACT_ROOT + path.sep) || !fs.existsSync(file)) {
+    res.status(404).json({ error: "File not found" });
+    return;
+  }
+  res.type("application/json").sendFile(file);
 });
 
 /** One artifact: `?kind=text` for the page text, otherwise the screenshot. */

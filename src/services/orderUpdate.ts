@@ -28,6 +28,7 @@ import {
 } from "./orderFetch.js";
 import { openOrderApiSession, OrderApiSessionError } from "./orderApi.js";
 import { beginTrace, endTrace } from "./orderTrace.js";
+import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import type { APIRequestContext } from "playwright";
 
 export interface UpdateLog {
@@ -51,6 +52,8 @@ interface UpdateJobState {
   finishedAt: string | null;
   elapsedMs: number;
   liveBrowsers: Array<{ browser: Browser; context: BrowserContext }>;
+  /** Effective mode for THIS run, resolved at start (dashboard setting, else env). */
+  mode: "scrape" | "api";
 }
 
 export interface UpdateTriggerInput {
@@ -102,6 +105,7 @@ function state(userId: string): UpdateJobState {
       finishedAt: null,
       elapsedMs: 0,
       liveBrowsers: [],
+      mode: config.orderFetchMode,
     });
   }
   return jobs.get(userId)!;
@@ -118,7 +122,7 @@ export function getOrderUpdateJob(userId: string) {
   const job = state(userId);
   tickElapsed(job);
   const { liveBrowsers, ...rest } = job;
-  return { ...rest, mode: config.orderFetchMode, logs: [...job.logs] };
+  return { ...rest, mode: job.mode || config.orderFetchMode, logs: [...job.logs] };
 }
 
 async function closeLiveBrowsers(userId: string) {
@@ -274,11 +278,13 @@ export async function startOrderUpdate(userId: string, input: UpdateTriggerInput
   job.finishedAt = null;
   job.elapsedMs = 0;
   markUpdateRunning(userId, true);
-  beginTrace(userId, "update", { targets: targets.length, accounts: accountCount, selection: input.selectionMethod || "" });
+  const resolved = await resolveOrderFetchMode(userId);
+  job.mode = resolved.mode;
+  beginTrace(userId, "update", { targets: targets.length, accounts: accountCount, selection: input.selectionMethod || "", mode: job.mode, modeSource: resolved.source });
   log(
     userId,
     "info",
-    `Update ${targets.length} unit(s) across ${accountCount} account(s) · ${job.windows} lane(s)${config.orderFetchMode === "api" ? " · API mode (Chrome only on fallback)" : " · Chrome"} · active statuses only unless IDs were listed`
+    `Update ${targets.length} unit(s) across ${accountCount} account(s) · ${job.windows} lane(s)${job.mode === "api" ? " · API mode (Chrome only on fallback)" : " · Chrome"} · mode from ${resolved.source === "ui" ? "the dashboard switch" : ".env"} · active statuses only unless IDs were listed`
   );
 
   void run(userId, targets).finally(() => {
@@ -332,7 +338,7 @@ async function run(userId: string, targets: UpdateTarget[]) {
         try {
           let api: APIRequestContext | null = null;
           let pageForAccount: Page | null = null;
-          if (config.orderFetchMode === "api") {
+          if (job.mode === "api") {
             try {
               api = await openOrderApiSession(account.cookies);
             } catch (err) {

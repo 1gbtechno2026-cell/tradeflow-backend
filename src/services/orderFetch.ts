@@ -21,6 +21,7 @@ import {
 import { openOrderApiSession, type MappedOrderUnit } from "./orderApi.js";
 import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSync.js";
 import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
+import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import type { APIRequestContext } from "playwright";
 
 export interface FetchLog {
@@ -76,6 +77,8 @@ interface FetchJobState {
   windows: number;
   report: FetchReport;
   liveBrowsers: Array<{ browser: Browser; context: BrowserContext }>;
+  /** Effective mode for THIS run, resolved at start (dashboard setting, else env). */
+  mode: "scrape" | "api";
 }
 
 const jobs = new Map<string, FetchJobState>();
@@ -631,6 +634,7 @@ function state(userId: string): FetchJobState {
       windows: 1,
       report: emptyReport(),
       liveBrowsers: [],
+      mode: config.orderFetchMode,
     });
   }
   const job = jobs.get(userId)!;
@@ -667,7 +671,7 @@ export function getOrderFetchJob(userId: string) {
   const job = state(userId);
   tickElapsed(job);
   const { liveBrowsers, ...rest } = job;
-  return { ...rest, mode: config.orderFetchMode, logs: [...job.logs], report: { ...job.report } };
+  return { ...rest, mode: job.mode || config.orderFetchMode, logs: [...job.logs], report: { ...job.report } };
 }
 
 export function isOnOrAfterSince(value?: Date | string | null, since?: Date) {
@@ -1330,7 +1334,7 @@ function logRunInvariant(userId: string) {
   log(
     userId,
     pass ? "info" : "warn",
-    `[fetch-invariant] RUN ${list.length} account(s) mode=${config.orderFetchMode} listed=${sum("listed")} dropped_by_date=${sum("droppedByDate")} known=${sum("known")} carried=${sum("carried")} → enriched=${sum("enriched")} → mapped=${sum("mapped")} old_at_enrich=${sum("oldAtEnrich")} failed=${sum("failed")} ${pass ? "PASS" : `FAIL (${list.filter((i) => !i.pass).length} account(s))`}`
+    `[fetch-invariant] RUN ${list.length} account(s) mode=${state(userId).mode} listed=${sum("listed")} dropped_by_date=${sum("droppedByDate")} known=${sum("known")} carried=${sum("carried")} → enriched=${sum("enriched")} → mapped=${sum("mapped")} old_at_enrich=${sum("oldAtEnrich")} failed=${sum("failed")} ${pass ? "PASS" : `FAIL (${list.filter((i) => !i.pass).length} account(s))`}`
   );
 }
 
@@ -1593,7 +1597,11 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
     accountsQueued: queue.length,
   };
   runInvariants.delete(userId);
-  beginTrace(userId, "fetch", { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows });
+  // The dashboard's switch wins over .env; resolved now, for this run only.
+  const resolved = await resolveOrderFetchMode(userId);
+  job.mode = resolved.mode;
+  log(userId, "info", `Fetch mode: ${resolved.mode} (from ${resolved.source === "ui" ? "the dashboard switch" : "ORDER_FETCH_MODE in .env"})`);
+  beginTrace(userId, "fetch", { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows, mode: job.mode, modeSource: resolved.source });
   log(
     userId,
     "info",
@@ -2046,7 +2054,7 @@ export async function scrapeAndSave(
 
 
 async function processAccount(getPage: () => Promise<Page>, userId: string, queue: QueueAccount[], row: QueueAccount, index: number) {
-  if (config.orderFetchMode === "api") {
+  if (state(userId).mode === "api") {
     const served = await processAccountViaApi(getPage, userId, queue, row, index);
     if (served) return;
   }
@@ -2174,7 +2182,7 @@ async function run(userId: string, queue: QueueAccount[]) {
   log(
     userId,
     "info",
-    config.orderFetchMode === "api"
+    job.mode === "api"
       ? `API mode: ${windows} lane(s) for ${queue.length} email(s) — Chrome only if a unit falls back to the page`
       : `Opening ${windows} Chrome window(s) for ${queue.length} email(s)`
   );

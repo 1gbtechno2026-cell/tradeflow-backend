@@ -1,5 +1,7 @@
 import { Router } from "express";
+import { config } from "../config.js";
 import { workspaceUserId } from "../services/sessionStore.js";
+import { resolveOrderFetchMode, setOrderFetchMode } from "../services/orderSyncSettings.js";
 import {
   getOrderFetchJob,
   parseSinceDate,
@@ -86,9 +88,45 @@ orderFetchRouter.post("/fetch/stop", async (req, res) => {
   }
 });
 
-orderFetchRouter.get("/fetch/status", (req, res) => {
+orderFetchRouter.get("/fetch/status", async (req, res) => {
   const userId = String(req.query.userId || "").trim() || workspaceUserId();
-  res.json(getOrderFetchJob(userId));
+  const job = getOrderFetchJob(userId);
+  // While idle, report the mode the NEXT run would use (the dashboard switch,
+  // else .env); while running, the mode this run was started with.
+  const resolved = await resolveOrderFetchMode(userId).catch(() => null);
+  res.json({ ...job, mode: job.running ? job.mode : resolved?.mode || job.mode, modeSource: resolved?.source || "env" });
+});
+
+/** The fetch/update mode switch — what the dashboard pill shows and flips. */
+orderFetchRouter.get("/fetch/mode", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  try {
+    const resolved = await resolveOrderFetchMode(userId);
+    res.json({ ...resolved, env_default: config.orderFetchMode });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Could not read the fetch mode" });
+  }
+});
+
+orderFetchRouter.put("/fetch/mode", async (req, res) => {
+  const userId = userIdFrom(req);
+  const mode = String(req.body?.mode || "").trim().toLowerCase();
+  if (mode !== "scrape" && mode !== "api") {
+    res.status(400).json({ error: 'mode must be "scrape" or "api"' });
+    return;
+  }
+  // Never flip under a run: the mode is read once at a run's start, and a
+  // half-API half-page run would be unexplainable.
+  if (getOrderFetchJob(userId).running || getOrderUpdateJob(userId).running) {
+    res.status(409).json({ error: "A fetch or update is running — stop it or wait for it to finish, then switch" });
+    return;
+  }
+  try {
+    const resolved = await setOrderFetchMode(userId, mode, String(req.body?.changedBy || "dashboard"));
+    res.json({ ...resolved, env_default: config.orderFetchMode });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not set the fetch mode" });
+  }
 });
 
 function parseCsvRows(value: unknown): Array<{ email: string; order_id: string }> {
@@ -149,9 +187,11 @@ orderFetchRouter.post("/update/stop", async (req, res) => {
   }
 });
 
-orderFetchRouter.get("/update/status", (req, res) => {
+orderFetchRouter.get("/update/status", async (req, res) => {
   const userId = String(req.query.userId || "").trim() || workspaceUserId();
-  res.json(getOrderUpdateJob(userId));
+  const job = getOrderUpdateJob(userId);
+  const resolved = await resolveOrderFetchMode(userId).catch(() => null);
+  res.json({ ...job, mode: job.running ? job.mode : resolved?.mode || job.mode, modeSource: resolved?.source || "env" });
 });
 
 orderFetchRouter.post("/sync/stop", async (req, res) => {

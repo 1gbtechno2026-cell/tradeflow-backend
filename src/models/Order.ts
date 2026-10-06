@@ -80,6 +80,8 @@ export interface IOrder {
   /** Which reader wrote this document last: "scrape" (the pages) or "api"
    *  (Flipkart's order APIs). Blank on documents older than the field. */
   fetch_source?: string;
+  /** Courier on the shipped step ("Ekart Logistics"). */
+  shipment_partner_name?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -173,6 +175,7 @@ const OrderSchema = new Schema<IOrder>(
     since_date: { type: Date, default: null },
     last_error: { type: String, default: "" },
     fetch_source: { type: String, default: "" },
+    shipment_partner_name: { type: String, default: "" },
   },
   { timestamps: true }
 );

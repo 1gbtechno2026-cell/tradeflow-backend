@@ -116,6 +116,8 @@ export interface ApiUnit {
       children?: Array<{
         eventName?: string;
         eventDate?: number | null;
+        /** Courier + consignment on the shipped step: "Ekart Logistics - FMPP…". */
+        eventLink?: { text?: string | null } | null;
         stepState?: { key?: string; text?: string };
         progressStepInfoList?: Array<{ remark?: string; updatedDate?: number | null; updatedLocation?: string | null }> | null;
       }>;
@@ -300,23 +302,36 @@ export function trackingFromApi(unit: ApiUnit): ITrackingStage[] {
     for (const child of node.children || []) {
       const key = child.stepState?.key || "";
       if (key === "INACTIVE") continue; // a step that has not happened is not history
-      const infos = child.progressStepInfoList?.length
-        ? child.progressStepInfoList
-        : [{ remark: child.stepState?.text || "", updatedDate: child.eventDate ?? null, updatedLocation: null }];
+      // The step's own time (eventDate) comes first: it is the moment the
+      // step happened. The info list holds later notes on the same step — a
+      // cancelled item's "has been returned" three days on, a shipment's hub
+      // scans — and must not become the step's date.
+      const infos = child.progressStepInfoList || [];
+      const stepAt = child.eventDate ?? infos[0]?.updatedDate ?? null;
+      const progress = [
+        { date: iso(stepAt), remark: String(child.stepState?.text || infos[0]?.remark || ""), location: null as string | null },
+        ...infos
+          .filter((i) => !(i.updatedDate === stepAt && String(i.remark || "") === String(child.stepState?.text || "")))
+          .map((i) => ({
+            date: iso(i.updatedDate ?? stepAt),
+            remark: String(i.remark || ""),
+            location: i.updatedLocation ? String(i.updatedLocation) : null,
+          })),
+      ];
       steps.push({
         event: child.eventName || "trackingStep",
-        progress: infos.map((i) => ({
-          date: iso(i.updatedDate ?? child.eventDate ?? null),
-          remark: String(i.remark || child.stepState?.text || ""),
-          location: i.updatedLocation ? String(i.updatedLocation) : null,
-        })),
+        progress,
         step_text: String(child.stepState?.text || infos[0]?.remark || ""),
       });
     }
     const status = String(node.nodeTitle || node.groupName || "").replace(/^Out For Delivery$/i, "Out for delivery");
     if (!status) continue;
+    // The stage's moment is its FIRST step's time (order placed, shipped,
+    // delivered, cancelled), as the page shows it and as the reference tool
+    // records it — not the node's own date, which on delivered and cancelled
+    // nodes can sit hours later (a later scan, a return step).
     stages.push({
-      date: iso(node.date ?? steps[0]?.progress[0]?.date ? new Date(String(steps[0]?.progress[0]?.date)).getTime() : null) ?? (node.date ? iso(node.date) : null),
+      date: steps[0]?.progress[0]?.date || iso(node.date),
       stage: done ? "DONE" : "PENDING",
       status,
       detailed_steps: steps,
@@ -328,9 +343,20 @@ export function trackingFromApi(unit: ApiUnit): ITrackingStage[] {
 function lastTrackingStep(tracking: ITrackingStage[]): string {
   const done = [...tracking].reverse().find((row) => row.stage === "DONE");
   if (!done) return "";
-  const last = done.detailed_steps.slice(-1)[0];
-  const when = last?.progress[0]?.date || done.date;
+  const when = done.date || done.detailed_steps.slice(-1)[0]?.progress[0]?.date;
   return when ? `${done.status} · ${when}` : done.status;
+}
+
+/** "Ekart Logistics" from the shipped step's link text "Ekart Logistics - FMPP…". */
+function shipmentPartnerFrom(unit: ApiUnit): string {
+  for (const node of unit.orderUnitProgressStepsV1?.unitProgressSteps || []) {
+    for (const child of node.children || []) {
+      const text = String(child.eventLink?.text || "");
+      const m = text.match(/^(.+?)\s*-\s*[A-Z0-9]{8,}\s*$/i);
+      if (m) return m[1].trim();
+    }
+  }
+  return "";
 }
 
 /** The fields scrapeAndSave() writes, from the API instead of the DOM. */
@@ -369,6 +395,7 @@ export interface MappedOrderUnit {
   cancelled_date: Date | null;
   cancelled_by_user: boolean;
   order_status_pre_cancellation: string | null;
+  shipment_partner_name: string;
   /** Extra, API-only: price lines the DOM never itemises. */
   api_extra: {
     listing_price: string;
@@ -407,9 +434,18 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
   const placedStep = tracking
     .flatMap((s) => s.detailed_steps)
     .find((st) => /paymentApprovalStep|approvalOnHoldStep/.test(st.event) || /has been placed|put on hold/i.test(st.step_text));
-  const orderDate = placedStep?.progress[0]?.date ? new Date(placedStep.progress[0].date) : dateOf(view.orderMetaData?.orderDate);
+  // The order's own timestamp, the moment it was created — the page and the
+  // reference tool show this; the "placed" step lands 15–50s later.
+  const orderDate = dateOf(view.orderMetaData?.orderDate) || (placedStep?.progress[0]?.date ? new Date(placedStep.progress[0].date) : null);
 
-  const cancelledAt = cancelledStage?.detailed_steps[0]?.progress[0]?.date || cancelledStage?.date || null;
+  // The cancellation itself, not the return/refund steps the same node carries.
+  const cancelStep = cancelledStage?.detailed_steps.find((st) => /cancel/i.test(st.event) || /cancel/i.test(st.step_text));
+  const cancelledAt = cancelStep?.progress[0]?.date || cancelledStage?.date || null;
+  // How far the order had got when it was cancelled: the furthest DONE stage
+  // before the Cancelled one ("Shipped", "Order Confirmed").
+  const furthestBeforeCancel = [...tracking]
+    .filter((s) => s.stage === "DONE" && !/cancel|return|refund/i.test(s.status))
+    .slice(-1)[0];
   const cancelledText = `${cancelledStage?.detailed_steps.map((s) => `${s.step_text} ${s.progress.map((p) => p.remark).join(" ")}`).join(" ") || ""} ${statusText}`;
 
   const qty = Number(meta.quantity) || 1;
@@ -443,8 +479,9 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
     total_amount: total,
     unit_amount: unitAmount,
     // A failed order still carries the promise it would have had; the page
-    // shows no delivery date for it and neither does the scraper.
-    delivery_date: failed || cancelled ? null : dateOf(promise.promisedDate),
+    // shows no delivery date for it. A cancelled order keeps its promise,
+    // as the reference export does.
+    delivery_date: failed ? null : dateOf(promise.promisedDate),
     // The "Delivered" timeline step is what the page (and so the scraper)
     // calls the delivery time; promiseDataBag.actualDeliveredDate is an
     // earlier hand-over scan, hours before it on every unit compared.
@@ -490,7 +527,8 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
     refund_msg: null,
     cancelled_date: cancelledAt ? new Date(cancelledAt) : cancelled ? orderDate : null,
     cancelled_by_user: /as per your request|cancelled by you|you cancelled/i.test(cancelledText),
-    order_status_pre_cancellation: cancelled ? confirmed?.status || "Order Confirmed" : null,
+    order_status_pre_cancellation: cancelled ? furthestBeforeCancel?.status || confirmed?.status || "Order Confirmed" : null,
+    shipment_partner_name: shipmentPartnerFrom(unit),
     api_extra: {
       listing_price: moneyStr(money.itemListingPrice),
       selling_price: moneyStr(money.itemSellingPrice),

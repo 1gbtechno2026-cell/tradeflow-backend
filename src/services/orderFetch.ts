@@ -22,6 +22,7 @@ import { openOrderApiSession, type MappedOrderUnit } from "./orderApi.js";
 import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSync.js";
 import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
+import { cardFieldsFor, checkoutOrderIdsFor } from "./orderLinks.js";
 import type { APIRequestContext } from "playwright";
 
 export interface FetchLog {
@@ -1186,6 +1187,7 @@ export async function saveMappedUnit(
         invoice_path: "",
         cancelled_from_bae: false,
         imei: null,
+        ...(await cardFieldsFor(userId, account.email, mapped.order_id).catch(() => ({}))),
         fetch_source: "api",
         is_logged_in: true,
         last_fetch: lastFetch,
@@ -1234,7 +1236,7 @@ export async function apiScrapeAndSave(
     traceFor(userId)?.unit({ email: account.email, orderId: card.orderId, unitId: card.unitId, mode: "api", outcome: "failed", error: err instanceof Error ? err.message : String(err), ms: Date.now() - started });
     throw err;
   }
-  const result = await saveMappedUnit(userId, account, read.mapped, { applyCalendar: opts.applyCalendar });
+  const result = { ...(await saveMappedUnit(userId, account, read.mapped, { applyCalendar: opts.applyCalendar })), siblingUnitIds: read.unitIds };
   traceFor(userId)?.unit({
     email: account.email,
     orderId: card.orderId,
@@ -1442,6 +1444,22 @@ async function processAccountViaApi(
         job.report.idsScraped += 1;
         acc.mapped += 1;
         job.savedOrders += 1;
+        // Every other unit of this order, from the order view itself: an add-on
+        // (Flipkart Trust Shield) has no card of its own on My Orders, so the
+        // page never discovered it. New ones join the queue of this same pass.
+        for (const sib of (result as { siblingUnitIds?: string[] }).siblingUnitIds || []) {
+          if (sib === card.unitId || pending.some((p) => String(p.unit_id) === sib)) continue;
+          const known = await OrderIndex.findOne({ userId, platformAccountId: row.id, unit_id: sib }).select("scrape_status").lean();
+          if (known) continue;
+          const sibCard: ListCard = { orderId: card.orderId, itemId: sib.replace(/000$/, ""), unitId: sib, orderUrl: orderDetailsUrl(card.orderId, sib.replace(/000$/, ""), sib), amount: "" };
+          await discoverUnit(userId, row, sibCard);
+          job.report.idsFound += 1;
+          job.report.idsDiscovered += 1;
+          job.report.idsNew += 1;
+          pending.push({ order_id: card.orderId, item_id: sibCard.itemId, unit_id: sib, order_url: sibCard.orderUrl } as (typeof pending)[number]);
+          job.report.enrichQueued += 1;
+          log(userId, "info", `${card.orderId}: sibling unit ${sib} found in the order view — queued`);
+        }
         if (result.productName) job.report.withProduct += 1;
         if (result.trackingCount) job.report.withTracking += 1;
         if (result.gstNumber) job.report.withGst += 1;
@@ -1565,6 +1583,14 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
         unitId,
         orderUrl: link.startsWith("http") ? link : orderDetailsUrl(orderId, itemId, unitId),
       });
+    }
+    // Orders OUR checkout placed are known by id even when Flipkart's list hides
+    // them (payment never confirmed, cancelled before confirmation): seed them
+    // so enrichment opens them directly, the way BoB does from its own records.
+    for (const ref of await checkoutOrderIdsFor(userId, row.email).catch(() => [])) {
+      const unitId = fallbackUnitId(ref.orderId);
+      if (existing.has(unitId)) continue;
+      existing.set(unitId, { orderId: ref.orderId, itemId: "", unitId, orderUrl: orderDetailsUrl(ref.orderId), orderDate: ref.placedAt });
     }
     queue.push({ id: row._id, email: row.email, cookies, existing: [...existing.values()] });
   }
@@ -2015,6 +2041,8 @@ export async function scrapeAndSave(
         ),
         order_status_pre_cancellation: cancelled ? (confirmed?.status || "Order Confirmed") : null,
         imei,
+        shipment_partner_name: String(courier[1] || "").replace(/\s+/g, " ").trim(),
+        ...(await cardFieldsFor(userId, account.email, card.orderId).catch(() => ({}))),
         fetch_source: "scrape",
         is_logged_in: true,
         last_fetch: lastFetch,

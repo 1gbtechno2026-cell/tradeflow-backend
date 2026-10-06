@@ -101,6 +101,8 @@ export interface ApiUnitRead {
   mapped: MappedOrderUnit;
   /** The whole page/fetch body, for the trace. */
   raw: unknown;
+  /** Every unit id the order view lists for this order — add-ons included. */
+  unitIds: string[];
   ms: number;
   bytes: number;
 }
@@ -114,5 +116,11 @@ export async function readUnitViaApi(
   listUnit?: ApiUnit | null
 ): Promise<ApiUnitRead> {
   const details = await fetchOrderDetails(ctx, orderId, unitId);
-  return { mapped: mapApiUnitToOrder(details.orderView, unitId, listUnit), raw: details.raw, ms: details.ms, bytes: details.bytes };
+  return {
+    mapped: mapApiUnitToOrder(details.orderView, unitId, listUnit),
+    raw: details.raw,
+    unitIds: Object.keys(details.orderView.units || {}),
+    ms: details.ms,
+    bytes: details.bytes,
+  };
 }

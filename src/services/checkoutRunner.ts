@@ -11,6 +11,7 @@ import {
   reserveBatchSlot,
 } from "./batchCounters.js";
 import { claimProxyForWorker, isProxyError, probeExitIp, recordProxyUse, reportProxyFailure } from "./proxyPool.js";
+import { setNavigationTimeoutScale } from "../automation/helpers.js";
 import {
   blockFlipkartLogout,
   desktopContext,
@@ -493,6 +494,11 @@ async function runClaimedCheckoutJob(
     await unlockAccount();
     return;
   }
+
+  // A tunnel adds latency to every request of every page: give page loads
+  // twice the time when the job leaves through a proxy. Process-wide, which
+  // is right — every job in this process uses the same proxy.
+  if (egress) setNavigationTimeoutScale(Math.max(2, Number(process.env.NAV_TIMEOUT_SCALE || 1)));
 
   // One watcher across both legs — see testFlow for why.
   const apiWatcher = new FlipkartApiWatcher();

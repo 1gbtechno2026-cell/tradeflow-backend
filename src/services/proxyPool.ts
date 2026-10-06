@@ -89,6 +89,18 @@ function toClaimed(row: IProxyPool & { _id: Types.ObjectId }): ClaimedProxy {
  */
 export async function claimProxyForWorker(workerId: string): Promise<ClaimedProxy | null> {
   if (config.proxyMode === "off") return null;
+  // One claim at a time per process: two jobs starting in the same instant
+  // both saw "no row bound to me yet" and each bound a fresh proxy (Mac held
+  // .173 and .183 at once on 2026-10-06). The second waits for the first.
+  const prev = claimChain.get(workerId) || Promise.resolve(null);
+  const next = prev.then(() => claimProxyForWorkerNow(workerId), () => claimProxyForWorkerNow(workerId));
+  claimChain.set(workerId, next.catch(() => null));
+  return next;
+}
+
+const claimChain = new Map<string, Promise<ClaimedProxy | null>>();
+
+async function claimProxyForWorkerNow(workerId: string): Promise<ClaimedProxy | null> {
   const userId = new Types.ObjectId(workspaceUserId());
 
   const own = await ProxyPool.findOne({ userId, assignedTo: workerId, status: "active" }).lean();

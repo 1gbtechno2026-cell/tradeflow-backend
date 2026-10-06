@@ -76,4 +76,7 @@ export const config = {
    *            a Chrome is opened only when a unit has to fall back to the page.
    */
   orderFetchMode: (String(process.env.ORDER_FETCH_MODE || "scrape").toLowerCase() === "api" ? "api" : "scrape") as "scrape" | "api",
+  /** Directory for replayable fetch/update traces (services/orderTrace.ts).
+   *  Empty = off. Holds real order data: keep it under debug/. */
+  orderTraceDir: String(process.env.ORDER_TRACE_DIR || "").trim(),
 };

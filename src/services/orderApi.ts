@@ -247,21 +247,31 @@ export async function fetchOrderDetails(ctx: APIRequestContext, orderId: string,
       },
     },
   }));
-  const raw = (await readJson(res)) as { RESPONSE?: { slots?: Array<{ widget?: { type?: string; data?: Record<string, unknown> } }> } };
-  const slots = raw.RESPONSE?.slots || [];
+  const raw = await readJson(res);
+  const orderView = orderViewFromPageFetch(raw);
+  if (!orderView) {
+    throw new OrderApiError(`order details for ${orderId}/${unitId} carried neither DUMMY_CARD_WIDGET nor ORDER_SUMMARY_WIDGET_CX`, 200);
+  }
+  return { orderView, raw, ms: Date.now() - started, bytes: JSON.stringify(raw).length };
+}
+
+/** The order view inside a CX_ORDER_DETAIL_PAGE body, or null. Shared with the
+ *  trace replay, which re-maps from the raw body on disk. */
+export function orderViewFromPageFetch(raw: unknown): ApiOrderView | null {
+  const body = raw as { RESPONSE?: { slots?: Array<{ widget?: { type?: string; data?: Record<string, unknown> } }> } };
+  const slots = body?.RESPONSE?.slots || [];
   const dummy = slots.find((s) => s.widget?.type === "DUMMY_CARD_WIDGET");
   const orderView = (dummy?.widget?.data?.ssResponse as { orderView?: ApiOrderView } | undefined)?.orderView;
-  if (orderView) return { orderView, raw, ms: Date.now() - started, bytes: JSON.stringify(raw).length };
-
+  if (orderView) return orderView;
   const summary = slots.find((s) => s.widget?.type === "ORDER_SUMMARY_WIDGET_CX")?.widget?.data as
     | { orderData?: ApiOrderView; primaryItemData?: ApiUnit }
     | undefined;
   if (summary?.orderData) {
     const view: ApiOrderView = { ...summary.orderData };
     if (summary.primaryItemData?.metaData?.unitId) view.units = { [summary.primaryItemData.metaData.unitId]: summary.primaryItemData };
-    return { orderView: view, raw, ms: Date.now() - started, bytes: JSON.stringify(raw).length };
+    return view;
   }
-  throw new OrderApiError(`order details for ${orderId}/${unitId} carried neither DUMMY_CARD_WIDGET nor ORDER_SUMMARY_WIDGET_CX`, 200);
+  return null;
 }
 
 // ---- Mapping to the order_details document -----------------------------------

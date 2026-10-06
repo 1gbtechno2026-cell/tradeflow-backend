@@ -15,7 +15,8 @@
     "test:otp-plumbing": "tsx src/scripts/otpPlumbingTest.ts",
     "backfill:order-ids": "tsx src/scripts/backfillOrderIds.ts",
     "test:classify": "tsx src/scripts/classifyTest.ts",
-    "test:proxy-pool": "tsx src/scripts/proxyPoolTest.ts"
+    "test:proxy-pool": "tsx src/scripts/proxyPoolTest.ts",
+    "orders:replay": "tsx src/scripts/replayOrderTrace.ts"
   },
   "dependencies": {
     "bullmq": "^5.58.5",

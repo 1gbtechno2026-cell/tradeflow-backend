@@ -20,6 +20,7 @@ import {
 } from "./browser.js";
 import { openOrderApiSession, type MappedOrderUnit } from "./orderApi.js";
 import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSync.js";
+import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
 import type { APIRequestContext } from "playwright";
 
 export interface FetchLog {
@@ -49,6 +50,12 @@ export interface FetchReport {
   withProduct: number;
   withTracking: number;
   withGst: number;
+  /** Units the list showed with a date before the since-date (indexed
+   *  skipped_old, never opened). One side of the fetch invariant. */
+  idsDroppedByDate: number;
+  /** Pending/failed index rows enriched although this run's list did not
+   *  show them (left over from an earlier run). The other side. */
+  idsCarried: number;
 }
 
 interface FetchJobState {
@@ -581,6 +588,8 @@ function emptyReport(): FetchReport {
     withProduct: 0,
     withTracking: 0,
     withGst: 0,
+    idsDroppedByDate: 0,
+    idsCarried: 0,
   };
 }
 
@@ -632,6 +641,8 @@ function state(userId: string): FetchJobState {
     job.report.idsDuplicate = 0;
   }
   if (job.report.enrichQueued == null) job.report.enrichQueued = 0;
+  if (job.report.idsDroppedByDate == null) job.report.idsDroppedByDate = 0;
+  if (job.report.idsCarried == null) job.report.idsCarried = 0;
   if (!job.phase) job.phase = "";
   if (!job.liveBrowsers) job.liveBrowsers = [];
   return job;
@@ -1054,6 +1065,12 @@ async function discoverUnit(
   card: ListCard
 ): Promise<"new" | "duplicate" | "seeded"> {
   const now = new Date();
+  // Counted for every listed unit, known or new: the invariant's
+  // dropped_by_date is "what the list showed older than the since-date".
+  {
+    const d = listDateSafe(card);
+    if (d && d.getTime() < jobSince(userId).getTime()) state(userId).report.idsDroppedByDate += 1;
+  }
   const existing = await OrderIndex.findOne({
     userId,
     platformAccountId: account.id,
@@ -1075,7 +1092,6 @@ async function discoverUnit(
     const listDate = listDateSafe(card);
     if (listDate && listDate.getTime() < jobSince(userId).getTime()) scrape_status = "skipped_old";
   }
-
   await OrderIndex.updateOne(
     { userId, platformAccountId: account.id, unit_id: card.unitId },
     {
@@ -1166,6 +1182,7 @@ export async function saveMappedUnit(
         invoice_path: "",
         cancelled_from_bae: false,
         imei: null,
+        fetch_source: "api",
         is_logged_in: true,
         last_fetch: lastFetch,
         ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
@@ -1205,8 +1222,116 @@ export async function apiScrapeAndSave(
   card: OrderUnitCard,
   opts: { applyCalendar?: boolean; listUnit?: ApiListedUnit["unit"] | null } = {}
 ) {
-  const read = await readUnitViaApi(ctx, card.orderId, card.unitId, opts.listUnit ?? null);
-  return saveMappedUnit(userId, account, read.mapped, { applyCalendar: opts.applyCalendar });
+  const started = Date.now();
+  let read: Awaited<ReturnType<typeof readUnitViaApi>>;
+  try {
+    read = await readUnitViaApi(ctx, card.orderId, card.unitId, opts.listUnit ?? null);
+  } catch (err) {
+    traceFor(userId)?.unit({ email: account.email, orderId: card.orderId, unitId: card.unitId, mode: "api", outcome: "failed", error: err instanceof Error ? err.message : String(err), ms: Date.now() - started });
+    throw err;
+  }
+  const result = await saveMappedUnit(userId, account, read.mapped, { applyCalendar: opts.applyCalendar });
+  traceFor(userId)?.unit({
+    email: account.email,
+    orderId: card.orderId,
+    unitId: card.unitId,
+    mode: "api",
+    raw: read.raw,
+    mapped: read.mapped,
+    outcome: result.skippedOld ? (result.statusKey === "unknown" ? "no_date" : "skipped_old") : "saved",
+    ms: Date.now() - started,
+  });
+  return result;
+}
+
+// ---- The fetch invariant -----------------------------------------------------
+//
+//   listed − dropped_by_date − known + carried = queued = enriched
+//   enriched = mapped + old_at_enrich + failed
+//
+// On an account's first fetch known, carried and old_at_enrich are all zero
+// and this collapses to  listed − dropped_by_date = enriched = mapped.
+// `known` is read back from the index (listed units already scraped), so a
+// listed unit newer than the date that is in neither bucket — an index write
+// that did not land — fails the line instead of vanishing silently.
+
+export interface FetchInvariant {
+  email: string;
+  mode: "scrape" | "api";
+  listed: number;
+  droppedByDate: number;
+  known: number;
+  carried: number;
+  queued: number;
+  enriched: number;
+  mapped: number;
+  oldAtEnrich: number;
+  failed: number;
+  unaccounted: number;
+  pass: boolean;
+  line: string;
+}
+
+const runInvariants = new Map<string, FetchInvariant[]>();
+
+async function checkFetchInvariant(
+  userId: string,
+  account: OrderAccount,
+  mode: "scrape" | "api",
+  listedIds: string[],
+  droppedIds: string[],
+  pendingIds: string[],
+  counts: { enriched: number; mapped: number; oldAtEnrich: number; failed: number }
+): Promise<FetchInvariant> {
+  const listed = new Set(listedIds);
+  const dropped = new Set(droppedIds);
+  const pending = new Set(pendingIds);
+  const candidates = [...listed].filter((id) => !dropped.has(id));
+  const idx = candidates.length
+    ? await OrderIndex.find({ userId, platformAccountId: account.id, unit_id: { $in: candidates } }).select("unit_id scrape_status").lean()
+    : [];
+  const status = new Map(idx.map((r) => [String(r.unit_id), String(r.scrape_status)]));
+  // "known" = the index already decided this unit: enriched earlier, or judged
+  // older by its placed date in an earlier run (the page scraper re-lists such
+  // units from the saved documents without a list date).
+  const known = candidates.filter((id) => !pending.has(id) && (status.get(id) === "scraped" || status.get(id) === "skipped_old")).length;
+  const unaccountedIds = candidates.filter((id) => !pending.has(id) && status.get(id) !== "scraped" && status.get(id) !== "skipped_old");
+  const unaccounted = unaccountedIds.length;
+  const carried = [...pending].filter((id) => !listed.has(id)).length;
+  const queued = pending.size;
+  const lhs = listed.size - dropped.size - known + carried;
+  const eq1 = lhs === queued && queued === counts.enriched;
+  const eq2 = counts.enriched === counts.mapped + counts.oldAtEnrich + counts.failed;
+  const pass = eq1 && eq2 && unaccounted === 0;
+  const line =
+    `[fetch-invariant] ${account.email} mode=${mode} ` +
+    `listed=${listed.size} dropped_by_date=${dropped.size} known=${known} carried=${carried} → queued=${queued} | ` +
+    `enriched=${counts.enriched} → mapped=${counts.mapped} old_at_enrich=${counts.oldAtEnrich} failed=${counts.failed}` +
+    (unaccounted ? ` unaccounted=${unaccounted} [${unaccountedIds.slice(0, 5).join(",")}${unaccounted > 5 ? ",…" : ""}]` : "") +
+    ` | listed−dropped−known+carried=enriched: ${listed.size}−${dropped.size}−${known}+${carried}=${lhs} vs ${counts.enriched} ${eq1 ? "✓" : "✗"}` +
+    ` | enriched=mapped+old+failed: ${counts.enriched}=${counts.mapped}+${counts.oldAtEnrich}+${counts.failed} ${eq2 ? "✓" : "✗"}` +
+    ` ${pass ? "PASS" : "FAIL"}`;
+  const inv: FetchInvariant = { email: account.email, mode, listed: listed.size, droppedByDate: dropped.size, known, carried, queued, enriched: counts.enriched, mapped: counts.mapped, oldAtEnrich: counts.oldAtEnrich, failed: counts.failed, unaccounted, pass, line };
+  state(userId).report.idsCarried += carried;
+  log(userId, pass ? "info" : "warn", line);
+  const list = runInvariants.get(userId) || [];
+  list.push(inv);
+  runInvariants.set(userId, list);
+  traceFor(userId)?.invariant({ ...inv });
+  return inv;
+}
+
+/** The run-level line: every account's numbers summed, PASS only if each account passed. */
+function logRunInvariant(userId: string) {
+  const list = runInvariants.get(userId) || [];
+  if (!list.length) return;
+  const sum = (k: keyof FetchInvariant) => list.reduce((n, i) => n + Number(i[k] || 0), 0);
+  const pass = list.every((i) => i.pass);
+  log(
+    userId,
+    pass ? "info" : "warn",
+    `[fetch-invariant] RUN ${list.length} account(s) mode=${config.orderFetchMode} listed=${sum("listed")} dropped_by_date=${sum("droppedByDate")} known=${sum("known")} carried=${sum("carried")} → enriched=${sum("enriched")} → mapped=${sum("mapped")} old_at_enrich=${sum("oldAtEnrich")} failed=${sum("failed")} ${pass ? "PASS" : `FAIL (${list.filter((i) => !i.pass).length} account(s))`}`
+  );
 }
 
 /**
@@ -1231,6 +1356,7 @@ async function processAccountViaApi(
     try {
       walk = await walkOrderList(ctx, jobSince(userId), {
         onPage: (p) => log(userId, "info", `${row.email}: list page ${p.page} · ${p.units} unit(s) · ${p.older} older than ${jobSinceLabel(userId)} · ${p.ms}ms`),
+        onPageRaw: (page, request) => traceFor(userId)?.list({ email: row.email, page: page.page, request, response: { orders: page.orders, moreOrder: page.moreOrder, nextCallParams: page.nextCallParams }, ms: page.ms }),
       });
     } catch (err) {
       // Whatever stopped the list — a refused session, an HTTP error, a socket
@@ -1275,6 +1401,7 @@ async function processAccountViaApi(
     job.report.enrichQueued += pending.length;
     log(userId, "info", `Enrich ${row.email} (API): ${pending.length} pending/failed unit(s)`);
 
+    const acc = { enriched: 0, mapped: 0, oldAtEnrich: 0, failed: 0 };
     let fallbackPage: Page | null = null;
     for (let n = 0; n < pending.length; n++) {
       const rowIdx = pending[n];
@@ -1288,6 +1415,7 @@ async function processAccountViaApi(
       };
       job.currentEmail = `${row.email} enrich ${n + 1}/${pending.length} ${card.orderId} ${card.unitId}`;
       job.report.idsOpened += 1;
+      acc.enriched += 1;
       let result: Awaited<ReturnType<typeof saveMappedUnit>>;
       try {
         try {
@@ -1303,10 +1431,12 @@ async function processAccountViaApi(
         }
         if (result.skippedOld) {
           job.report.idsSkippedOld += 1;
+          acc.oldAtEnrich += 1;
           tickElapsed(job);
           continue;
         }
         job.report.idsScraped += 1;
+        acc.mapped += 1;
         job.savedOrders += 1;
         if (result.productName) job.report.withProduct += 1;
         if (result.trackingCount) job.report.withTracking += 1;
@@ -1316,12 +1446,24 @@ async function processAccountViaApi(
       } catch (err) {
         if (isDestroyedContext(err)) throw err;
         job.report.idsFailed += 1;
+        acc.failed += 1;
         tickElapsed(job);
         const message = err instanceof Error ? err.message : String(err);
         log(userId, "warn", `${card.orderId} unit ${card.unitId}: enrich failed (${message})`);
         await patchOrderIndex(userId, row, card, { scrape_status: "failed", last_error: message });
       }
     }
+
+    await checkFetchInvariant(
+      userId,
+      row,
+      "api",
+      walk.units.map((u) => u.unitId),
+      walk.units.filter((u) => u.orderDate && u.orderDate.getTime() < jobSince(userId).getTime()).map((u) => u.unitId),
+      pending.map((p) => String(p.unit_id)),
+      acc
+    );
+    traceFor(userId)?.account({ email: row.email, mode: "api", listPages: walk.pages, listed: walk.units.length, pending: pending.length, ...acc });
 
     job.done += 1;
     job.report.accountsDone += 1;
@@ -1450,6 +1592,8 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
     startedAt: new Date().toISOString(),
     accountsQueued: queue.length,
   };
+  runInvariants.delete(userId);
+  beginTrace(userId, "fetch", { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows });
   log(
     userId,
     "info",
@@ -1671,6 +1815,7 @@ export async function scrapeAndSave(
   }
 
   const tracking = parseTracking(trackingText);
+  traceFor(userId)?.unit({ email: account.email, orderId: card.orderId, unitId, mode: "scrape", url: page.url(), pageData, trackingText, outcome: "read" });
   const cancelledStage = tracking.find((row) => /^cancelled$/i.test(row.status) && row.stage === "DONE");
   const deliveredStageHit = tracking.find((row) => /^delivered$/i.test(row.status) && row.stage === "DONE");
   const pageText = String(pageData.pageText || "");
@@ -1862,6 +2007,7 @@ export async function scrapeAndSave(
         ),
         order_status_pre_cancellation: cancelled ? (confirmed?.status || "Order Confirmed") : null,
         imei,
+        fetch_source: "scrape",
         is_logged_in: true,
         last_fetch: lastFetch,
         ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
@@ -1922,6 +2068,7 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
   }
 
   const cards = await collectOrderIds(page, userId, row.existing);
+  traceFor(userId)?.list({ email: row.email, page: 0, request: { source: "my-orders-page", existingMerged: row.existing.length }, response: cards, ms: 0 });
   job.report.idsFound += cards.length;
   tickElapsed(job);
 
@@ -1954,6 +2101,7 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
   job.report.enrichQueued += pending.length;
   log(userId, "info", `Enrich ${row.email}: ${pending.length} pending/failed unit(s) to open`);
 
+  const acc = { enriched: 0, mapped: 0, oldAtEnrich: 0, failed: 0 };
   for (let n = 0; n < pending.length; n++) {
     const rowIdx = pending[n];
     if (job.cancelled) throw new Error("cancelled");
@@ -1966,14 +2114,17 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
     };
     job.currentEmail = `${row.email} enrich ${n + 1}/${pending.length} ${card.orderId} ${card.unitId}`;
     job.report.idsOpened += 1;
+    acc.enriched += 1;
     try {
       const scraped = await scrapeAndSave(page, userId, row, card, { applyCalendar: true });
       if (scraped.skippedOld) {
         job.report.idsSkippedOld += 1;
+        acc.oldAtEnrich += 1;
         tickElapsed(job);
         continue;
       }
       job.report.idsScraped += 1;
+      acc.mapped += 1;
       job.savedOrders += 1;
       if (scraped.productName) job.report.withProduct += 1;
       if (scraped.trackingCount) job.report.withTracking += 1;
@@ -1987,12 +2138,24 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
     } catch (err) {
       if (isDestroyedContext(err)) throw err;
       job.report.idsFailed += 1;
+      acc.failed += 1;
       tickElapsed(job);
       const message = err instanceof Error ? err.message : String(err);
       log(userId, "warn", `${card.orderId} unit ${card.unitId}: enrich failed (${message})`);
       await patchOrderIndex(userId, row, card, { scrape_status: "failed", last_error: message });
     }
   }
+
+  await checkFetchInvariant(
+    userId,
+    row,
+    "scrape",
+    cards.map((c) => c.unitId),
+    cards.filter((c) => { const d = listDateSafe(c); return Boolean(d && d.getTime() < jobSince(userId).getTime()); }).map((c) => c.unitId),
+    pending.map((p) => String(p.unit_id)),
+    acc
+  );
+  traceFor(userId)?.account({ email: row.email, mode: "scrape", listed: cards.length, pending: pending.length, ...acc });
 
   job.done += 1;
   job.report.accountsDone += 1;
@@ -2081,6 +2244,8 @@ async function run(userId: string, queue: QueueAccount[]) {
       "info",
       `Report: ${formatElapsed(r.elapsedMs)} · found ${r.idsFound} units · scraped ${r.idsScraped} · tracking ${r.withTracking}`
     );
+    logRunInvariant(userId);
+    endTrace(userId, { report: { ...r }, cancelled: job.cancelled, pass: (runInvariants.get(userId) || []).every((i) => i.pass) });
     await closeLiveBrowsers(userId);
     if (!job.cancelled) log(userId, "info", "Chrome closed. Orders are stored.");
   }

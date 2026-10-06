@@ -89,7 +89,7 @@ export interface OrderApiTestResult {
   dir: string;
 }
 
-const COMPARED_FIELDS: Array<keyof MappedOrderUnit> = [
+export const COMPARED_FIELDS: Array<keyof MappedOrderUnit> = [
   "order_id",
   "item_id",
   "unit_id",
@@ -132,7 +132,7 @@ function norm(v: unknown): string {
   return s.replace(/(T\d{2}:\d{2}):\d{2}/g, "$1").replace(/\s+/g, " ").toLowerCase();
 }
 
-function diffAgainstScraper(mapped: MappedOrderUnit, saved: Record<string, unknown> | null): FieldDiff[] {
+export function diffAgainstScraper(mapped: MappedOrderUnit, saved: Record<string, unknown> | null): FieldDiff[] {
   return COMPARED_FIELDS.map((field) => {
     const api = mapped[field];
     const scraper = saved ? saved[field] : undefined;

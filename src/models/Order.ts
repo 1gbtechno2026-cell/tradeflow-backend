@@ -77,6 +77,9 @@ export interface IOrder {
   last_fetch: Date | null;
   since_date: Date | null;
   last_error: string;
+  /** Which reader wrote this document last: "scrape" (the pages) or "api"
+   *  (Flipkart's order APIs). Blank on documents older than the field. */
+  fetch_source?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -169,6 +172,7 @@ const OrderSchema = new Schema<IOrder>(
     last_fetch: { type: Date, default: null },
     since_date: { type: Date, default: null },
     last_error: { type: String, default: "" },
+    fetch_source: { type: String, default: "" },
   },
   { timestamps: true }
 );

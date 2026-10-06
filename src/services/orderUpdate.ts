@@ -27,6 +27,7 @@ import {
   type OrderUnitCard,
 } from "./orderFetch.js";
 import { openOrderApiSession, OrderApiSessionError } from "./orderApi.js";
+import { beginTrace, endTrace } from "./orderTrace.js";
 import type { APIRequestContext } from "playwright";
 
 export interface UpdateLog {
@@ -273,6 +274,7 @@ export async function startOrderUpdate(userId: string, input: UpdateTriggerInput
   job.finishedAt = null;
   job.elapsedMs = 0;
   markUpdateRunning(userId, true);
+  beginTrace(userId, "update", { targets: targets.length, accounts: accountCount, selection: input.selectionMethod || "" });
   log(
     userId,
     "info",
@@ -396,6 +398,7 @@ async function run(userId: string, targets: UpdateTarget[]) {
     await Promise.all(Array.from({ length: job.windows }, () => lane()));
     if (!job.cancelled) log(userId, "info", `Update finished. ok ${job.done}, failed ${job.failed}`);
   } finally {
+    endTrace(userId, { done: job.done, failed: job.failed, total: job.total, cancelled: job.cancelled });
     await closeLiveBrowsers(userId);
     if (!job.cancelled) log(userId, "info", "Chrome closed.");
   }

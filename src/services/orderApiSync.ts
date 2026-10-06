@@ -6,6 +6,7 @@ import {
   mapApiUnitToOrder,
   type ApiUnit,
   type MappedOrderUnit,
+  type OrderListPage,
 } from "./orderApi.js";
 
 /**
@@ -45,7 +46,12 @@ export interface ApiListWalk {
 export async function walkOrderList(
   ctx: APIRequestContext,
   since: Date,
-  opts: { maxPages?: number; onPage?: (info: { page: number; units: number; older: number; ms: number }) => void } = {}
+  opts: {
+    maxPages?: number;
+    onPage?: (info: { page: number; units: number; older: number; ms: number }) => void;
+    /** The raw page, for the trace writer. */
+    onPageRaw?: (page: OrderListPage, request: { page: number; nextCallParams: Array<{ key: string; value: string }> }) => void;
+  } = {}
 ): Promise<ApiListWalk> {
   const maxPages = Math.max(1, opts.maxPages ?? 60);
   const units: ApiListedUnit[] = [];
@@ -55,6 +61,7 @@ export async function walkOrderList(
   let stoppedAtSince = false;
   for (let p = 1; p <= maxPages; p++) {
     const page = await fetchOrderList(ctx, p, next);
+    opts.onPageRaw?.(page, { page: p, nextCallParams: next });
     pages += 1;
     const rows = listUnits(page);
     let older = 0;
@@ -92,6 +99,8 @@ export async function walkOrderList(
 
 export interface ApiUnitRead {
   mapped: MappedOrderUnit;
+  /** The whole page/fetch body, for the trace. */
+  raw: unknown;
   ms: number;
   bytes: number;
 }
@@ -105,5 +114,5 @@ export async function readUnitViaApi(
   listUnit?: ApiUnit | null
 ): Promise<ApiUnitRead> {
   const details = await fetchOrderDetails(ctx, orderId, unitId);
-  return { mapped: mapApiUnitToOrder(details.orderView, unitId, listUnit), ms: details.ms, bytes: details.bytes };
+  return { mapped: mapApiUnitToOrder(details.orderView, unitId, listUnit), raw: details.raw, ms: details.ms, bytes: details.bytes };
 }

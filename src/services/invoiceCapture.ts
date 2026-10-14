@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { Page } from "playwright";
+import { createRequire } from "node:module";
+import { PDFDocument } from "pdf-lib";
 import { HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { config } from "../config.js";
 import { Order } from "../models/Order.js";
@@ -25,6 +27,66 @@ import { sleep } from "./browser.js";
  */
 
 export type InvoiceMode = "off" | "new" | "missing";
+
+const require = createRequire(import.meta.url);
+const pdfParse = require("pdf-parse") as (data: Buffer) => Promise<{ text: string; numpages: number }>;
+
+/** What one PDF inside Flipkart's invoice bundle is. */
+export type InvoicePartType = "product" | "protect_promise" | "flipkart_fee" | "transport" | "other";
+export interface InvoicePart {
+  type: InvoicePartType;
+  pages: number;
+  invoiceNumber: string;
+  bytes: number;
+}
+
+/** Classify a PDF of the bundle by its text; order decides what comes first in the merged file. */
+export async function classifyInvoicePdf(buf: Buffer): Promise<{ type: InvoicePartType; invoiceNumber: string; text: string }> {
+  let text = "";
+  try {
+    text = (await pdfParse(buf)).text.replace(/\s+/g, " ");
+  } catch {
+    return { type: "other", invoiceNumber: "", text: "" };
+  }
+  const invoiceNumber = (text.match(/Invoice Number\s*#?\s*:?\s*([A-Z0-9]{8,})/i) || [])[1] || (text.match(/Tax Invoice Number\s*:\s*([A-Z0-9]{8,})/i) || [])[1] || "";
+  let type: InvoicePartType = "other";
+  if (/GT Charges|GOODS TRANSPORTED BY GTA|Goods Carriage/i.test(text)) type = "transport";
+  else if (/Protect Promise Fee/i.test(text)) type = "protect_promise";
+  else if (/Corporate Card Fee|Offer Handling Fee|Flipkart Internet Private Limited/i.test(text) && !/FSN:/i.test(text)) type = "flipkart_fee";
+  else if (/FSN:|HSN\/SAC:\s*\d{4,}|Product\s*Title|Total items:/i.test(text)) type = "product";
+  return { type, invoiceNumber, text };
+}
+
+const PART_ORDER: Record<InvoicePartType, number> = { product: 0, protect_promise: 1, flipkart_fee: 2, transport: 3, other: 4 };
+
+/** Merge the bundle into one PDF, product invoice first, and describe the parts. */
+export async function mergeInvoiceBundle(pdfs: Buffer[]): Promise<{ pdf: Buffer; parts: InvoicePart[] }> {
+  const classified = await Promise.all(pdfs.map(async (b) => ({ buf: b, ...(await classifyInvoicePdf(b)) })));
+  classified.sort((a, b) => PART_ORDER[a.type] - PART_ORDER[b.type]);
+  if (classified.length === 1) {
+    const only = classified[0];
+    let pages = 1;
+    try {
+      pages = (await PDFDocument.load(only.buf, { ignoreEncryption: true })).getPageCount();
+    } catch {
+      /* keep 1 */
+    }
+    return { pdf: only.buf, parts: [{ type: only.type, pages, invoiceNumber: only.invoiceNumber, bytes: only.buf.length }] };
+  }
+  const merged = await PDFDocument.create();
+  const parts: InvoicePart[] = [];
+  for (const c of classified) {
+    try {
+      const src = await PDFDocument.load(c.buf, { ignoreEncryption: true });
+      const pages = await merged.copyPages(src, src.getPageIndices());
+      for (const p of pages) merged.addPage(p);
+      parts.push({ type: c.type, pages: pages.length, invoiceNumber: c.invoiceNumber, bytes: c.buf.length });
+    } catch {
+      parts.push({ type: c.type, pages: 0, invoiceNumber: c.invoiceNumber, bytes: c.buf.length });
+    }
+  }
+  return { pdf: Buffer.from(await merged.save()), parts };
+}
 
 export function parseInvoiceMode(v: unknown): InvoiceMode {
   const s = String(v || "").toLowerCase();
@@ -127,8 +189,12 @@ async function clickDownloadInvoice(page: Page): Promise<boolean> {
   return Boolean(await evalOnPage<boolean>(page, CLICK_DOWNLOAD_INVOICE));
 }
 
-/** Open the order page (session already on the page) and bring back the invoice PDF bytes. */
-export async function captureInvoicePdf(page: Page, orderUrl: string): Promise<Buffer> {
+/**
+ * Open the order page (session already on the page) and bring back every PDF
+ * Flipkart hands out for the unit: a single PDF, or a zip bundling the product
+ * invoice with the fee / transport invoices (one order = several tax invoices).
+ */
+export async function captureInvoicePdfs(page: Page, orderUrl: string): Promise<Buffer[]> {
   await page.goto(orderUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
   await sleep(900);
   await page
@@ -144,20 +210,29 @@ export async function captureInvoicePdf(page: Page, orderUrl: string): Promise<B
     const raw = path.join(tmp, "invoice.download");
     await download.saveAs(raw);
     const buf = fs.readFileSync(raw);
-    if (buf.subarray(0, 4).toString("utf8") === "%PDF") return buf;
+    if (buf.subarray(0, 4).toString("utf8") === "%PDF") return [buf];
     if (buf[0] === 0x50 && buf[1] === 0x4b) {
-      // A zip: Flipkart bundles several PDFs for some orders — take the first.
       const dir = path.join(tmp, "x");
       fs.mkdirSync(dir);
       execFileSync(process.platform === "win32" ? "tar" : "unzip", process.platform === "win32" ? ["-xf", raw, "-C", dir] : ["-o", raw, "-d", dir], { stdio: "ignore" });
-      const pdf = fs.readdirSync(dir, { recursive: true }).map((n) => path.join(dir, String(n))).find((f) => fs.statSync(f).isFile() && f.toLowerCase().endsWith(".pdf"));
-      if (!pdf) throw new Error("Invoice zip had no PDF");
-      return fs.readFileSync(pdf);
+      const pdfs = fs
+        .readdirSync(dir, { recursive: true })
+        .map((n) => path.join(dir, String(n)))
+        .filter((f) => fs.statSync(f).isFile() && f.toLowerCase().endsWith(".pdf"))
+        .sort()
+        .map((f) => fs.readFileSync(f));
+      if (!pdfs.length) throw new Error("Invoice zip had no PDF");
+      return pdfs;
     }
     throw new Error("Downloaded file was not a PDF or zip");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+/** Back-compat: the merged bundle as one PDF. */
+export async function captureInvoicePdf(page: Page, orderUrl: string): Promise<Buffer> {
+  return (await mergeInvoiceBundle(await captureInvoicePdfs(page, orderUrl))).pdf;
 }
 
 export interface InvoiceCaptureSummary {
@@ -204,21 +279,37 @@ export async function captureInvoicesForAccount(opts: {
   out.skippedCap = wanted.length - batch.length;
   opts.log("info", `${opts.email}: invoices — ${wanted.length} delivered unit(s) without a PDF${out.skippedCap ? ` (doing ${cap}, ${out.skippedCap} left for the next run)` : ""}`);
   const page = await opts.getPage();
+  // Flipkart's download on ANY unit page returns the whole order's bundle. A
+  // multi-unit order therefore gets ONE object, keyed by order id, and every
+  // delivered unit of it shares the key (extraction picks the unit's own
+  // product invoice out of the bundle). Captured once per run per order.
+  const doneOrders = new Map<string, { key: string; size: number; parts: InvoicePart[] }>();
   for (const r of batch) {
     if (opts.cancelled()) break;
-    const key = invoiceKeyFor(opts.userId, r.order_date, String(r.order_id), String(r.unit_id));
+    const orderId = String(r.order_id);
     try {
-      let size: number;
-      if (await invoiceExists(key)) {
-        // Already in the bucket (an earlier run that died before the row was stamped).
-        size = 0;
-      } else {
-        const pdf = await captureInvoicePdf(page, String(r.order_url || ""));
-        size = await putInvoice(key, pdf);
+      let stamped = doneOrders.get(orderId);
+      let fresh = false;
+      if (!stamped) {
+        const pdfs = await captureInvoicePdfs(page, String(r.order_url || ""));
+        const bundle = await mergeInvoiceBundle(pdfs);
+        const productParts = bundle.parts.filter((p) => p.type === "product").length;
+        const key = productParts > 1 ? invoiceKeyFor(opts.userId, r.order_date, orderId) : invoiceKeyFor(opts.userId, r.order_date, orderId, String(r.unit_id));
+        const size = await putInvoice(key, bundle.pdf);
+        stamped = { key, size, parts: bundle.parts };
+        if (productParts > 1) doneOrders.set(orderId, stamped);
+        fresh = true;
+        if (!productParts) opts.log("warn", `${orderId} unit ${r.unit_id}: bundle has no product invoice (${bundle.parts.map((p) => p.type).join(", ")})`);
       }
-      await Order.updateOne({ _id: r._id }, { $set: { invoice_s3_key: key, invoice_downloaded_at: new Date(), invoice_size: size, is_invoice_downloaded: true } });
+      await Order.updateOne(
+        { _id: r._id },
+        { $set: { invoice_s3_key: stamped.key, invoice_downloaded_at: new Date(), invoice_size: stamped.size, is_invoice_downloaded: true, invoice_parts: stamped.parts } }
+      );
       out.stored += 1;
-      opts.log("info", `${r.order_id} unit ${r.unit_id}: invoice stored${size ? ` (${Math.round(size / 1024)} KB)` : " (already in bucket)"}`);
+      const summary = Object.entries(stamped.parts.reduce<Record<string, number>>((acc, p) => ((acc[p.type] = (acc[p.type] || 0) + 1), acc), {}))
+        .map(([t, n]) => (n > 1 ? `${n}× ${t}` : t))
+        .join(", ");
+      opts.log("info", `${orderId} unit ${r.unit_id}: invoice ${fresh ? "stored" : "shares the order's bundle"} (${Math.round(stamped.size / 1024)} KB: ${summary})`);
     } catch (err) {
       out.failed += 1;
       opts.log("warn", `${r.order_id} unit ${r.unit_id}: invoice failed (${err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : String(err)})`);

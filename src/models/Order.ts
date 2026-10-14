@@ -56,6 +56,7 @@ export interface IOrder {
   invoice_s3_key: string;
   invoice_downloaded_at: Date | null;
   invoice_size: number;
+  invoice_parts: Array<{ type: string; pages: number; invoiceNumber: string; bytes: number }>;
   api_extra?: Record<string, unknown>;
   supercoin_amount_applied: number;
   is_bae_order: boolean;
@@ -162,6 +163,8 @@ const OrderSchema = new Schema<IOrder>(
     invoice_s3_key: { type: String, default: "" },
     invoice_downloaded_at: { type: Date, default: null },
     invoice_size: { type: Number, default: 0 },
+    /** The PDFs inside Flipkart's bundle, in merged order (product first). */
+    invoice_parts: { type: [new Schema({ type: String, pages: Number, invoiceNumber: String, bytes: Number }, { _id: false })], default: [] },
     /** API-only extras from the order view (fsn, listing_id, prices…) — kept
      *  so the dashboard's Product ID / Listing ID filters have something to match. */
     api_extra: { type: Schema.Types.Mixed, default: undefined },

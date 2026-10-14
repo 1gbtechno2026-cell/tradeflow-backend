@@ -79,4 +79,10 @@ export const config = {
   /** Directory for replayable fetch/update traces (services/orderTrace.ts).
    *  Empty = off. Holds real order data: keep it under debug/. */
   orderTraceDir: String(process.env.ORDER_TRACE_DIR || "").trim(),
+  /** Private S3 bucket for invoice PDFs (services/invoiceCapture.ts). Same
+   *  bucket as the dashboard's INVOICE_S3_BUCKET. Empty = invoice step off. */
+  invoiceBucket: String(process.env.INVOICE_S3_BUCKET || "").trim(),
+  awsRegion: String(process.env.AWS_REGION || "ap-south-1").trim(),
+  /** Most invoices one account captures in one run ("missing" mode). */
+  invoiceMaxPerRun: Math.max(1, Number(process.env.INVOICE_MAX_PER_RUN || 200)),
 };

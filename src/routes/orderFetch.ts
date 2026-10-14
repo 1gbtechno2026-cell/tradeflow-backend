@@ -1,3 +1,4 @@
+import { parseInvoiceMode } from "../services/invoiceCapture.js";
 import { Router } from "express";
 import { config } from "../config.js";
 import { workspaceUserId } from "../services/sessionStore.js";
@@ -60,7 +61,7 @@ orderFetchRouter.post("/fetch/trigger", async (req, res) => {
     }
     const sinceDate = parseSinceDate(after);
     const userId = userIdFrom(req);
-    await startOrderFetch(userId, emails, sinceDate);
+    await startOrderFetch(userId, emails, sinceDate, { invoices: parseInvoiceMode(req.body?.invoices) });
     const job = getOrderFetchJob(userId);
     res.json({
       message: "Order fetch triggered successfully",
@@ -71,6 +72,7 @@ orderFetchRouter.post("/fetch/trigger", async (req, res) => {
       tasks_created: job.total,
       windows: job.windows,
       fetch_orders_after_date: after,
+      invoices: parseInvoiceMode(req.body?.invoices),
       timestamp: Math.floor(Date.now() / 1000),
     });
   } catch (err) {

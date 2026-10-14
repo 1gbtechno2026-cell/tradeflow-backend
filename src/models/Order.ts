@@ -53,6 +53,10 @@ export interface IOrder {
   billing_address_pincode: string | null;
   is_invoice_downloaded: boolean;
   invoice_path: string;
+  invoice_s3_key: string;
+  invoice_downloaded_at: Date | null;
+  invoice_size: number;
+  api_extra?: Record<string, unknown>;
   supercoin_amount_applied: number;
   is_bae_order: boolean;
   cash_on_delivery: boolean;
@@ -154,6 +158,13 @@ const OrderSchema = new Schema<IOrder>(
     billing_address_pincode: { type: String, default: null },
     is_invoice_downloaded: { type: Boolean, default: false },
     invoice_path: { type: String, default: "" },
+    /** S3 key of the stored invoice PDF (services/invoiceCapture.ts). */
+    invoice_s3_key: { type: String, default: "" },
+    invoice_downloaded_at: { type: Date, default: null },
+    invoice_size: { type: Number, default: 0 },
+    /** API-only extras from the order view (fsn, listing_id, prices…) — kept
+     *  so the dashboard's Product ID / Listing ID filters have something to match. */
+    api_extra: { type: Schema.Types.Mixed, default: undefined },
     supercoin_amount_applied: { type: Number, default: 0 },
     is_bae_order: { type: Boolean, default: false },
     cash_on_delivery: { type: Boolean, default: false },

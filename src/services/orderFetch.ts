@@ -23,6 +23,7 @@ import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSyn
 import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { cardFieldsFor, checkoutOrderIdsFor } from "./orderLinks.js";
+import { captureInvoicesForAccount, type InvoiceMode } from "./invoiceCapture.js";
 import type { APIRequestContext } from "playwright";
 
 export interface FetchLog {
@@ -80,6 +81,8 @@ interface FetchJobState {
   liveBrowsers: Array<{ browser: Browser; context: BrowserContext }>;
   /** Effective mode for THIS run, resolved at start (dashboard setting, else env). */
   mode: "scrape" | "api";
+  /** Invoice step for THIS run: off | new (units enriched now) | missing (every delivered unit without a PDF). */
+  invoices: InvoiceMode;
 }
 
 const jobs = new Map<string, FetchJobState>();
@@ -636,6 +639,7 @@ function state(userId: string): FetchJobState {
       report: emptyReport(),
       liveBrowsers: [],
       mode: config.orderFetchMode,
+      invoices: "off",
     });
   }
   const job = jobs.get(userId)!;
@@ -1408,6 +1412,7 @@ async function processAccountViaApi(
     log(userId, "info", `Enrich ${row.email} (API): ${pending.length} pending/failed unit(s)`);
 
     const acc = { enriched: 0, mapped: 0, oldAtEnrich: 0, failed: 0 };
+    const enrichedUnits = new Set<string>();
     let fallbackPage: Page | null = null;
     for (let n = 0; n < pending.length; n++) {
       const rowIdx = pending[n];
@@ -1444,6 +1449,7 @@ async function processAccountViaApi(
         job.report.idsScraped += 1;
         acc.mapped += 1;
         job.savedOrders += 1;
+        enrichedUnits.add(String(card.unitId));
         // Every other unit of this order, from the order view itself: an add-on
         // (Flipkart Trust Shield) has no card of its own on My Orders, so the
         // page never discovered it. New ones join the queue of this same pass.
@@ -1474,6 +1480,23 @@ async function processAccountViaApi(
         log(userId, "warn", `${card.orderId} unit ${card.unitId}: enrich failed (${message})`);
         await patchOrderIndex(userId, row, card, { scrape_status: "failed", last_error: message });
       }
+    }
+
+    if (job.invoices !== "off" && !job.cancelled) {
+      const inv = await captureInvoicesForAccount({
+        userId, platformAccountId: row.id, email: row.email, mode: job.invoices, justEnriched: enrichedUnits,
+        getPage: async () => {
+          if (!fallbackPage) {
+            fallbackPage = await getPage();
+            await restoreFlipkartSession(fallbackPage, row.cookies);
+          }
+          return fallbackPage;
+        },
+        cancelled: () => job.cancelled,
+        log: (level, message) => log(userId, level, message),
+      });
+      job.report.invoicesDownloaded += inv.stored;
+      if (inv.candidates) log(userId, "info", `${row.email}: invoices stored ${inv.stored} · failed ${inv.failed}${inv.skippedCap ? ` · ${inv.skippedCap} deferred` : ""}`);
     }
 
     await checkFetchInvariant(
@@ -1540,7 +1563,7 @@ export async function stopAllOrderFetch() {
   }
 }
 
-export async function startOrderFetch(userId: string, emails: string[], sinceDate: Date) {
+export async function startOrderFetch(userId: string, emails: string[], sinceDate: Date, opts: { invoices?: InvoiceMode } = {}) {
   assertIdleForFetch(userId);
   const job = state(userId);
   if (job.running) throw new Error("Order fetch is already running");
@@ -1626,12 +1649,14 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
   // The dashboard's switch wins over .env; resolved now, for this run only.
   const resolved = await resolveOrderFetchMode(userId);
   job.mode = resolved.mode;
+  job.invoices = opts.invoices || "off";
+  if (job.invoices !== "off") log(userId, "info", `Invoices: ${job.invoices === "new" ? "units enriched in this run" : "every delivered unit without a PDF"} → S3 (after enrichment, Chrome per unit)`);
   log(userId, "info", `Fetch mode: ${resolved.mode} (from ${resolved.source === "ui" ? "the dashboard switch" : "ORDER_FETCH_MODE in .env"})`);
   beginTrace(userId, "fetch", { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows, mode: job.mode, modeSource: resolved.source });
   log(
     userId,
     "info",
-    `Fetch from ${job.sinceLabel}: ${queue.length} email(s) · ${windows} Chrome window(s) · discover all unit IDs, then enrich new ones on/after placed date (no invoice)` +
+    `Fetch from ${job.sinceLabel}: ${queue.length} email(s) · ${windows} Chrome window(s) · discover all unit IDs, then enrich new ones on/after placed date${job.invoices === "off" ? " (no invoice)" : " + invoices"}` +
       (skipped.length ? ` · skipped ${skipped.length} not logged in` : "")
   );
   for (const email of skipped.slice(0, 8)) log(userId, "warn", `Skipped ${email} — not logged in`);
@@ -2138,6 +2163,7 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
   log(userId, "info", `Enrich ${row.email}: ${pending.length} pending/failed unit(s) to open`);
 
   const acc = { enriched: 0, mapped: 0, oldAtEnrich: 0, failed: 0 };
+  const enrichedUnits = new Set<string>();
   for (let n = 0; n < pending.length; n++) {
     const rowIdx = pending[n];
     if (job.cancelled) throw new Error("cancelled");
@@ -2162,6 +2188,7 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
       job.report.idsScraped += 1;
       acc.mapped += 1;
       job.savedOrders += 1;
+      enrichedUnits.add(String(card.unitId));
       if (scraped.productName) job.report.withProduct += 1;
       if (scraped.trackingCount) job.report.withTracking += 1;
       if (scraped.gstNumber) job.report.withGst += 1;
@@ -2180,6 +2207,17 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
       log(userId, "warn", `${card.orderId} unit ${card.unitId}: enrich failed (${message})`);
       await patchOrderIndex(userId, row, card, { scrape_status: "failed", last_error: message });
     }
+  }
+
+  if (job.invoices !== "off" && !job.cancelled) {
+    const inv = await captureInvoicesForAccount({
+      userId, platformAccountId: row.id, email: row.email, mode: job.invoices, justEnriched: enrichedUnits,
+      getPage: async () => page,
+      cancelled: () => job.cancelled,
+      log: (level, message) => log(userId, level, message),
+    });
+    job.report.invoicesDownloaded += inv.stored;
+    if (inv.candidates) log(userId, "info", `${row.email}: invoices stored ${inv.stored} · failed ${inv.failed}${inv.skippedCap ? ` · ${inv.skippedCap} deferred` : ""}`);
   }
 
   await checkFetchInvariant(

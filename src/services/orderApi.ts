@@ -48,10 +48,16 @@ export class OrderApiError extends Error {
 }
 
 /** A request context carrying the account's cookies and the page's headers. */
-export async function openOrderApiSession(cookies: unknown[]): Promise<APIRequestContext> {
+export async function openOrderApiSession(
+  cookies: unknown[],
+  opts: { proxy?: { server: string; username?: string; password?: string } } = {}
+): Promise<APIRequestContext> {
   const mapped = mapPlaywrightCookies(cookies);
   if (!mapped.length) throw new OrderApiSessionError("Saved Flipkart session has no usable cookies");
   return playwrightRequest.newContext({
+    // Through the pool when the caller has a proxy, so a background sync leaves
+    // from the same kind of address a checkout does, not the server's own.
+    ...(opts.proxy ? { proxy: opts.proxy } : {}),
     storageState: {
       cookies: mapped.map((c) => ({ ...c, expires: c.expires ?? -1 })),
       origins: [],

@@ -70,6 +70,20 @@ export interface IOrder {
   parent_card_number: string;
   card_number: string;
   ref_code: string;
+  /** From the checkout job that placed the order (services/orderLinks.ts):
+   *  "cod" / "card", the amount Flipkart charged, and its handling fee —
+   *  COD_FEE on cash on delivery, the card-type fee on a card. Blank on
+   *  orders no job of ours placed. */
+  payment_mode: string;
+  transaction_amount: string;
+  payment_fee: string;
+  payment_fee_details: string;
+  /** Cancellation requested from the dashboard (services/orderCancel.ts):
+   *  "" | queued | running | cancelled | not_cancellable | failed. */
+  cancel_status: string;
+  cancel_request_id: string;
+  cancel_requested_at: Date | null;
+  cancel_error: string;
   refund_status: string | null;
   refund_amount: string | null;
   refund_msg: string | null;
@@ -176,6 +190,14 @@ const OrderSchema = new Schema<IOrder>(
     parent_card_number: { type: String, default: "" },
     card_number: { type: String, default: "" },
     ref_code: { type: String, default: "" },
+    payment_mode: { type: String, default: "" },
+    transaction_amount: { type: String, default: "" },
+    payment_fee: { type: String, default: "" },
+    payment_fee_details: { type: String, default: "" },
+    cancel_status: { type: String, default: "" },
+    cancel_request_id: { type: String, default: "" },
+    cancel_requested_at: { type: Date, default: null },
+    cancel_error: { type: String, default: "" },
     refund_status: { type: String, default: null },
     refund_amount: { type: String, default: null },
     refund_msg: { type: String, default: null },

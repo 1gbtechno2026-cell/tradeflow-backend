@@ -44,6 +44,17 @@ export interface ICheckoutJob {
   heartbeatAt?: Date | null;
   claimedBy?: string;
   completedAt: Date | null;
+  /** Getting this attempt's order into Order Units (services/orderSync.ts). */
+  orderSync?: {
+    status: "pending" | "done" | "skipped" | "failed";
+    attempts: number;
+    lastError: string;
+    /** The order ids the sync wrote, including one discovered for a failed attempt. */
+    orderIds: string[];
+    units: number;
+    queuedAt: Date | null;
+    syncedAt: Date | null;
+  };
   createdAt: Date;
   updatedAt: Date;
 }
@@ -229,6 +240,21 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
     /** Which worker run holds the claim, so a stale reclaim is attributable. */
     claimedBy: { type: String, default: "" },
     completedAt: { type: Date, default: null },
+    orderSync: {
+      type: new Schema(
+        {
+          status: { type: String, enum: ["pending", "done", "skipped", "failed"], default: "pending" },
+          attempts: { type: Number, default: 0 },
+          lastError: { type: String, default: "" },
+          orderIds: { type: [String], default: [] },
+          units: { type: Number, default: 0 },
+          queuedAt: { type: Date, default: null },
+          syncedAt: { type: Date, default: null },
+        },
+        { _id: false }
+      ),
+      default: undefined,
+    },
   },
   { timestamps: true, collection: "tradeflowjobs" }
 );
@@ -236,5 +262,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
 // Backs the stale-claim reclaim: find `running` jobs whose heartbeat has gone
 // quiet without scanning the collection.
 CheckoutJobSchema.index({ status: 1, heartbeatAt: 1 });
+// Backs the order-sync sweep: finished jobs whose order has not reached Order Units.
+CheckoutJobSchema.index({ "orderSync.status": 1, completedAt: 1 });
 
 export const CheckoutJob = mongoose.model<ICheckoutJob>("CheckoutJob", CheckoutJobSchema);

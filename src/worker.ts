@@ -1,16 +1,29 @@
 import { connectDb } from "./db.js";
 import { config } from "./config.js";
-import { createCheckoutWorker, LEGACY_QUEUE, queueNameFor } from "./queue.js";
+import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createSyncWorker, getSyncQueue, LEGACY_QUEUE, queueNameFor, SYNC_QUEUE } from "./queue.js";
 import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
+import { runCancelJob } from "./services/orderCancel.js";
+import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
 
 /**
+ * What this process does. One image, three roles, so each can be its own
+ * deployment (AWS: the checkout workers run checkout,cancel; one small
+ * tradeflow-sync service runs sync — no Chrome, HTTP only):
+ *
+ *   WORKER_ROLES=checkout,cancel,sync          default: all three (local dev)
+ *   SYNC_CONCURRENCY=4                          order syncs at once (default 4)
+ *   SYNC_SWEEP_MS=600000                        outbox sweep period (default 10 min)
+ *
  * Which classes this process serves, and how many jobs of each at once.
  *
  *   WORKER_CLASSES=otp-phone,card,cod        default: all three
  *   WORKER_CONCURRENCY=2                      default per class
  *   WORKER_CONCURRENCY_OTP_PHONE=1            per-class override
+ *   CANCEL_CONCURRENCY=2                      order cancellations (one per account
+ *                                             at a time); default WORKER_CONCURRENCY,
+ *                                             0 = this process takes none
  *
  * Every job is two Chromes (~0.5 GB), so per-class concurrency is a RAM
  * number for this machine. The CLASS caps — phones online, the 200/300
@@ -24,6 +37,16 @@ function classesFromEnv(): JobClass[] {
     .map((s) => s.trim())
     .filter(isJobClass);
   return picked.length ? picked : [...JOB_CLASSES];
+}
+
+type Role = "checkout" | "cancel" | "sync";
+
+function rolesFromEnv(): Set<Role> {
+  const raw = String(process.env.WORKER_ROLES || "").trim();
+  const all: Role[] = ["checkout", "cancel", "sync"];
+  if (!raw) return new Set(all);
+  const picked = raw.split(",").map((s) => s.trim()).filter((r): r is Role => (all as string[]).includes(r));
+  return new Set(picked.length ? picked : all);
 }
 
 function concurrencyFor(cls: JobClass): number {
@@ -54,9 +77,12 @@ async function main() {
     }
   }
 
+  const roles = rolesFromEnv();
   const classes = classesFromEnv();
-  const names = [...classes.map((c) => [queueNameFor(c), concurrencyFor(c)] as const), [LEGACY_QUEUE, 1] as const];
-  for (const [name, concurrency] of names) {
+  const names: Array<readonly [string, number]> = roles.has("checkout")
+    ? [...classes.map((c) => [queueNameFor(c), concurrencyFor(c)] as const), [LEGACY_QUEUE, 1] as const]
+    : [];
+  for (const [name, concurrency] of [...names]) {
     const worker = createCheckoutWorker(name, concurrency, async (data) => {
       console.log(`[worker] PICKED ${name} job=${data.jobId} email=${data.email}`);
       await runCheckoutJob(data);
@@ -71,8 +97,49 @@ async function main() {
       console.error(`[worker] Redis/worker error (${name}):`, err.message);
     });
   }
+  // Order cancellations: one job per account, accounts in parallel up to the cap.
+  const cancelEnv = Number(process.env.CANCEL_CONCURRENCY);
+  const cancelConcurrency = Number.isFinite(cancelEnv) && cancelEnv >= 0 ? Math.floor(cancelEnv) : config.workerConcurrency;
+  if (roles.has("cancel") && cancelConcurrency > 0) {
+    const cancelWorker = createCancelWorker(cancelConcurrency, async (job, token) => {
+      console.log(`[worker] PICKED ${CANCEL_QUEUE} request=${job.data.requestId} email=${job.data.email}`);
+      await runCancelJob(job, token);
+    });
+    cancelWorker.on("failed", (job, err) => {
+      if (err.name === "DelayedError") return;
+      console.error(`[worker] FAILED ${CANCEL_QUEUE} job=${job?.id}:`, err.message);
+    });
+    cancelWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${CANCEL_QUEUE}):`, err.message));
+    names.push([CANCEL_QUEUE, cancelConcurrency]);
+  }
+  // Order sync: finished checkouts' orders into Order Units, plus the sweep.
+  if (roles.has("sync")) {
+    const syncEnv = Number(process.env.SYNC_CONCURRENCY);
+    const syncConcurrency = Number.isFinite(syncEnv) && syncEnv > 0 ? Math.floor(syncEnv) : 4;
+    const syncWorker = createSyncWorker(syncConcurrency, async (job, token) => {
+      if (job.name === "sweep") {
+        await sweepOrderSyncs();
+        return;
+      }
+      await runOrderSyncJob(job, token);
+    });
+    syncWorker.on("failed", (job, err) => {
+      if (err.name === "DelayedError") return;
+      console.error(`[worker] FAILED ${SYNC_QUEUE} job=${job?.id} (attempt ${job?.attemptsMade}):`, err.message);
+    });
+    syncWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${SYNC_QUEUE}):`, err.message));
+    // One schedule in Redis however many sync workers run: upsert is idempotent.
+    const sweepMs = Math.max(60_000, Number(process.env.SYNC_SWEEP_MS) || 10 * 60 * 1000);
+    await getSyncQueue().upsertJobScheduler("order-sync-sweep", { every: sweepMs }, { name: "sweep", data: { checkoutJobId: "" }, opts: { attempts: 1 } });
+    names.push([SYNC_QUEUE, syncConcurrency]);
+  }
+
+  if (!names.length) {
+    console.error("[worker] WORKER_ROLES selected nothing to run");
+    process.exit(2);
+  }
   console.log(
-    `[worker] listening on ${names.map(([n, c]) => `${n}×${c}`).join(", ")} — waiting for jobs (lock=10m)`
+    `[worker] roles ${[...roles].join(",")} — listening on ${names.map(([n, c]) => `${n}×${c}`).join(", ")} — waiting for jobs (lock=10m)`
   );
 }
 

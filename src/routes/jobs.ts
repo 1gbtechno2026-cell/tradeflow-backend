@@ -11,6 +11,7 @@ import { enqueueCheckoutJob } from "../services/checkoutEnqueue.js";
 import { requestSnapshot } from "../services/orderSnapshot.js";
 import { resolveAddress, resolveLoggedInSession, workspaceUserId } from "../services/sessionStore.js";
 import { toCardDetails } from "../services/paymentCards.js";
+import { resyncCheckoutJob } from "../services/orderSync.js";
 import type { AuthType } from "../paymentStrategies/types.js";
 import type { AddressDetails, JobRequestSnapshot, JobResultSnapshot } from "../types.js";
 
@@ -51,6 +52,7 @@ function publicJob(job: {
   logs?: unknown[];
   startedAt: Date | null;
   completedAt: Date | null;
+  orderSync?: unknown;
   createdAt: Date;
   updatedAt: Date;
 }) {
@@ -89,6 +91,8 @@ function publicJob(job: {
     logs: job.logs,
     startedAt: job.startedAt,
     completedAt: job.completedAt,
+    /** Whether this attempt's order reached Order Units (services/orderSync.ts). */
+    orderSync: job.orderSync ?? null,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   };
@@ -362,6 +366,19 @@ jobsRouter.get("/:id", async (req, res) => {
     return;
   }
   res.json(publicJob(job));
+});
+
+/** Put this attempt's order into Order Units again (or for the first time) — the
+ *  manual lever for a sync that gave up, e.g. after the ID was re-logged in. */
+jobsRouter.post("/:id/order-sync", async (req, res) => {
+  const job = await CheckoutJob.findById(req.params.id).select("_id status");
+  if (!job) {
+    res.status(404).json({ error: "Job not found" });
+    return;
+  }
+  await resyncCheckoutJob(String(job._id));
+  const after = await CheckoutJob.findById(job._id).select("orderSync").lean();
+  res.status(202).json({ jobId: String(job._id), orderSync: after?.orderSync ?? null });
 });
 
 jobsRouter.post("/:id/cancel", async (req, res) => {

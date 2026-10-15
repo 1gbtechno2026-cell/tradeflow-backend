@@ -225,3 +225,33 @@ aws ecs delete-service --cluster tradeflow --service <service-name> --force
 |---|---|---|
 | Trade_Flow_Backend | working dir | API + workers (`tradeflow-fetch` image) |
 | ordergine (`gmail-id-dashboard_mongodb`) | separate folder | Dashboard (frontend + backend), not yet deployed to AWS |
+
+
+## Pending: order-sync and order-cancel (added 2026-10-15)
+
+Finished checkouts now hand their order to an `order-sync` queue, and the
+dashboard's Cancel Order Units goes to an `order-cancel` queue. Both are served
+by the same image as the workers, picked with `WORKER_ROLES`:
+
+| Where | `WORKER_ROLES` | Notes |
+|---|---|---|
+| `tradeflow-worker-w-01` … `w-10` | `checkout,cancel` | add the env var; `CANCEL_CONCURRENCY=1` per worker is enough |
+| **new** `tradeflow-sync` service (1 task) | `sync` | `deploy/ecs-task-definition-sync.json` — 0.5 vCPU / 1 GB, no Chrome, Flipkart order API over HTTP |
+
+To create the sync service:
+
+1. Fill the `REPLACE_*` values in `deploy/ecs-task-definition-sync.json` from the
+   `tradeflow-worker` base task definition (execution role, Redis URL, secret ARNs).
+2. `aws ecs register-task-definition --cli-input-json file://deploy/ecs-task-definition-sync.json`
+3. `aws ecs create-service --cluster <cluster> --service-name tradeflow-sync --task-definition tradeflow-sync --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[<same as workers>],securityGroups=[sg-0e4a81a96183876c3],assignPublicIp=ENABLED}"`
+4. Add `WORKER_ROLES=checkout,cancel` to the `tradeflow-worker` base and re-derive w-01…w-10
+   (without it they default to all three roles and would ALSO run syncs — harmless, but
+   then every worker holds a sync slot and the sweep schedule).
+
+Notes:
+- With `PROXY_MODE=required` the sync task binds one proxy from the pool as `sync-01`
+  (11 proxies needed for 10 workers + sync, or set `PROXY_MODE=preferred` on it).
+- Scale by `desired-count` or `SYNC_CONCURRENCY`; the sweep is one Redis schedule
+  however many sync tasks run. Every sync takes the per-account lock checkouts take.
+- The outcome of each sync is on the job: `orderSync.status` (`done | skipped | failed`)
+  and `orderSync.lastError`; `POST /api/jobs/:id/order-sync` re-runs one.

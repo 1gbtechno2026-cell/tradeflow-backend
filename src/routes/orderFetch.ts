@@ -9,6 +9,7 @@ import {
   startOrderFetch,
   stopOrderFetch,
 } from "../services/orderFetch.js";
+import { getCancelRequest, listCancelRequests, requestCancellation } from "../services/orderCancel.js";
 import {
   getOrderUpdateJob,
   startOrderUpdate,
@@ -205,4 +206,43 @@ orderFetchRouter.post("/sync/stop", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Could not stop" });
   }
+});
+
+/**
+ * Cancel Order Units. Body: { type: "unit" | "order", ids: "id id,id" | string[],
+ * dryRun?: boolean }. Answers at once with what was queued and what was refused;
+ * the units are cancelled by the worker (order-cancel queue), one account at a
+ * time per account, accounts in parallel.
+ */
+orderFetchRouter.post("/cancel", async (req, res) => {
+  try {
+    const type = String(req.body?.type || "").toLowerCase();
+    if (type !== "unit" && type !== "order") {
+      res.status(400).json({ error: 'type must be "unit" or "order"' });
+      return;
+    }
+    const result = await requestCancellation(userIdFrom(req), {
+      type,
+      ids: parseIds(req.body?.ids),
+      dryRun: req.body?.dryRun === true,
+    });
+    res.status(202).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not queue the cancellation" });
+  }
+});
+
+orderFetchRouter.get("/cancel", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  res.json({ requests: await listCancelRequests(userId, Number(req.query.limit) || 20) });
+});
+
+orderFetchRouter.get("/cancel/:id", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  const row = await getCancelRequest(userId, req.params.id);
+  if (!row) {
+    res.status(404).json({ error: "Cancel request not found" });
+    return;
+  }
+  res.json(row);
 });

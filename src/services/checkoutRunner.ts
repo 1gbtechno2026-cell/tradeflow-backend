@@ -29,6 +29,8 @@ import { availablePhoneCapacity } from "./employeePhoneLease.js";
 import { cardPoolAdmission } from "./cardPool.js";
 import { getRedis } from "../lib/redis.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
+import { lockAccount } from "./accountLock.js";
+import { enqueueOrderSync } from "./orderSync.js";
 import { runPaymentPhase } from "./paymentPhase.js";
 import { FlipkartNetworkObserver } from "../automation/FlipkartNetworkObserver.js";
 import {
@@ -218,26 +220,6 @@ const HEARTBEAT_MS = Number(process.env.CHECKOUT_HEARTBEAT_MS || 60 * 1000);
 /** How long an otp-phone job waits before asking again when no handset is free. */
 const PHONE_WAIT_MS = Number(process.env.PHONE_WAIT_MS || 20 * 1000);
 /** Upper bound on one job's hold of a Flipkart account; released on exit. */
-const ACCOUNT_LOCK_MS = Number(process.env.ACCOUNT_LOCK_MS || 15 * 60 * 1000);
-
-/**
- * One job per Flipkart account at a time. The cart is shared per account and
- * the first step of every job EMPTIES it — two concurrent jobs on one login
- * would each throw away the other's item. Never a problem at concurrency 1;
- * the first thing that breaks at 2. Redis SET NX with a TTL, released by the
- * holder only (compare-and-delete), so a dead worker's hold lapses on its own.
- */
-async function lockAccount(email: string, holder: string): Promise<(() => Promise<void>) | null> {
-  const redis = getRedis();
-  const key = `account:lock:${String(email || "").trim().toLowerCase()}`;
-  const ok = await redis.set(key, holder, "PX", ACCOUNT_LOCK_MS, "NX");
-  if (ok !== "OK") return null;
-  return async () => {
-    await redis
-      .eval(`if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0`, 1, key, holder)
-      .catch(() => undefined);
-  };
-}
 
 /**
  * Take exclusive ownership of a job, or report that someone else has it.
@@ -320,6 +302,8 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     ).select("result.flipkartOrderId");
     if (parked) {
       console.log(`[${data.jobId}] [error] [claim] silent after Pay — parked as needs_reconciliation (order id known: ${parked.result?.flipkartOrderId || "no"})`);
+      // Whatever Flipkart made of that attempt goes into Order Units.
+      await enqueueOrderSync(data.jobId);
       return;
     }
     // Already finished, or another worker is actively on it. Either way this
@@ -351,6 +335,9 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     clearInterval(heartbeat);
     await closeReporter(data.jobId);
     console.log(`[${data.jobId}] [info] [reporter] ${reporter.writes} batched write(s) for this job`);
+    // Hand the order to the sync worker (a few ms, never throws, never waits on
+    // Flipkart): paid or failed, it lands in Order Units without a manual fetch.
+    await enqueueOrderSync(data.jobId);
   }
 }
 

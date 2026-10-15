@@ -260,9 +260,17 @@ export class PaymentApiWatcher {
       const c = this.calls[i];
       const r = c.response as Record<string, unknown> | null;
       if (!r || typeof r !== "object") continue;
-      if (/pgresponsehandler/i.test(c.url) && !out.transactionAmount) {
-        const action = (r.action ?? {}) as Record<string, unknown>;
-        const pp = (action.postbackParams ?? {}) as Record<string, string>;
+      // Cash on Delivery has no bank round trip, so no pgresponsehandler. The same
+      // parameters (transaction_amount, payment_handling_fees_details COD_FEE,
+      // merchant_reference_id, pg_trackid …) come back on the Pay press itself:
+      // payments/pay?instrument=COD → primary_action.parameters (OD438890447913742100).
+      const isCodPay = /\/payments\/pay\?[^#]*instrument=COD/i.test(c.url);
+      if ((isCodPay || /pgresponsehandler/i.test(c.url)) && !out.transactionAmount) {
+        const pp = (
+          isCodPay
+            ? ((r.primary_action ?? {}) as Record<string, unknown>).parameters ?? {}
+            : ((r.action ?? {}) as Record<string, unknown>).postbackParams ?? {}
+        ) as Record<string, string>;
         if (!pp.transaction_amount && !pp.merchant_transaction_id) continue;
         const paise = (v: unknown) => {
           const n = Number(v);

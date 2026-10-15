@@ -94,21 +94,41 @@ export class FlipkartPayment {
     // Click the COD option
     await codOption.click({ timeout: 10_000 });
 
-    // Note: After clicking COD, Flipkart usually reveals a "Place Order" button.
-    // We need to find that button. Since we don't have the exact DOM for the post-click state,
-    // we look for common text patterns.
-    const placeOrderBtn = this.page.locator('button:has-text("Place Order"), button:has-text("Confirm Order")').first();
-    
-    if (await placeOrderBtn.count() === 0) {
+    // Two presses, measured on 2026-10-15 (boAt Aavante Bar 490):
+    //   1. <button data-testid="payButton" id="cod-place-order">Place Order</button>
+    //      — rendered in BOTH COD sections ("Recommended for You" and the COD row
+    //      further down), so :visible picks the one actually on screen.
+    //   2. Place Order does not place anything. It opens a bottom sheet
+    //      (/payments#bottomsheet) "Confirm Cash on Delivery Order" with
+    //      [Cancel] [Confirm order], and only Confirm order places the order.
+    // The old single locator matched "Place Order" first, pressed it, and then
+    // waited two minutes on the open sheet for a confirmation that never came.
+    const placeOrderBtn = this.page.locator("#cod-place-order:visible, button:has-text('Place Order'):visible").first();
+    try {
+      await placeOrderBtn.waitFor({ state: "visible", timeout: 10_000 });
+    } catch {
       throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "COD Place Order button not found after selecting COD");
     }
-    
     if (!(await placeOrderBtn.isEnabled())) {
       throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "COD Place Order button is disabled");
     }
-
     await placeOrderBtn.click({ timeout: 10_000 });
-    
+    this.log("info", "[fk-pay] COD Place Order pressed — waiting for the Confirm order sheet", "payment");
+
+    // Exact name, so the sheet's title "Confirm Cash on Delivery Order" never matches.
+    const confirmBtn = this.page.getByRole("button", { name: /^confirm order$/i }).last();
+    try {
+      await confirmBtn.waitFor({ state: "visible", timeout: 15_000 });
+    } catch {
+      // No sheet: Flipkart may have gone straight to the confirmation page, which
+      // waitForOrderConfirmation reads. Still on /payments with no sheet is a
+      // press that did nothing.
+      if (/orderConfirmation|orderresponse/i.test(this.page.url())) return;
+      throw new CheckoutFailure("UNABLE_TO_PLACE_ORDER", "COD Confirm order sheet did not appear after Place Order");
+    }
+    await confirmBtn.click({ timeout: 10_000 });
+    this.log("info", "[fk-pay] COD Confirm order pressed", "payment");
+
     // Wait for the navigation to start
     await this.page.waitForTimeout(2000);
   }

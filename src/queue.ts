@@ -1,4 +1,4 @@
-import { Queue, Worker, type JobsOptions } from "bullmq";
+import { Queue, Worker, type Job, type JobsOptions } from "bullmq";
 import { config } from "./config.js";
 import { JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import type { CheckoutJobData } from "./types.js";
@@ -82,4 +82,84 @@ export function createCheckoutWorker(
       maxStalledCount: 2,
     }
   );
+}
+
+// ── Order cancellation ─────────────────────────────────────────────────────
+// One job per (cancel request, account): every unit the request holds for that
+// account is cancelled in one browser, one after another. Different accounts are
+// separate jobs, so they run in parallel up to the worker's cancel concurrency.
+
+export const CANCEL_QUEUE = "order-cancel";
+
+export interface CancelJobData {
+  requestId: string;
+  email: string;
+}
+
+let cancelQueue: Queue<CancelJobData> | null = null;
+
+export function getCancelQueue(): Queue<CancelJobData> {
+  if (!cancelQueue) {
+    cancelQueue = new Queue<CancelJobData>(CANCEL_QUEUE, {
+      connection: redisConnection(),
+      defaultJobOptions: { attempts: 1, removeOnComplete: true, removeOnFail: true } satisfies JobsOptions,
+    });
+  }
+  return cancelQueue;
+}
+
+export function createCancelWorker(
+  concurrency: number,
+  processor: (job: Job<CancelJobData>, token: string | undefined) => Promise<void>
+) {
+  return new Worker<CancelJobData>(CANCEL_QUEUE, processor, {
+    connection: redisConnection(),
+    concurrency: Math.max(1, concurrency),
+    lockDuration: 10 * 60 * 1000,
+    stalledInterval: 60 * 1000,
+    maxStalledCount: 1,
+  });
+}
+
+// ── Order sync ─────────────────────────────────────────────────────────────
+// After a checkout ends, its order goes into Order Units without anyone running
+// a fetch (services/orderSync.ts). One job per checkout job, keyed by its id, so
+// a second enqueue of the same attempt is a no-op. Retries back off from 30s;
+// the sweep (every SYNC_SWEEP_MS) re-queues anything the queue lost.
+
+export const SYNC_QUEUE = "order-sync";
+
+export interface SyncJobData {
+  checkoutJobId: string;
+}
+
+let syncQueue: Queue<SyncJobData> | null = null;
+
+export function getSyncQueue(): Queue<SyncJobData> {
+  if (!syncQueue) {
+    syncQueue = new Queue<SyncJobData>(SYNC_QUEUE, {
+      connection: redisConnection(),
+      defaultJobOptions: {
+        attempts: 6,
+        backoff: { type: "exponential", delay: 30_000 },
+        removeOnComplete: true,
+        // Kept a week for inspection; the outcome itself is on the CheckoutJob.
+        removeOnFail: { age: 7 * 24 * 3600 },
+      } satisfies JobsOptions,
+    });
+  }
+  return syncQueue;
+}
+
+export function createSyncWorker(
+  concurrency: number,
+  processor: (job: Job<SyncJobData>, token: string | undefined) => Promise<void>
+) {
+  return new Worker<SyncJobData>(SYNC_QUEUE, processor, {
+    connection: redisConnection(),
+    concurrency: Math.max(1, concurrency),
+    lockDuration: 2 * 60 * 1000,
+    stalledInterval: 60 * 1000,
+    maxStalledCount: 2,
+  });
 }

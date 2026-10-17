@@ -7,17 +7,25 @@ import { createRequire } from "node:module";
 import { PDFDocument } from "pdf-lib";
 import { HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { config } from "../config.js";
+import { Types } from "mongoose";
 import { Order } from "../models/Order.js";
+import { Invoice, type IInvoicePart } from "../models/Invoice.js";
 import { evalOnPage } from "../lib/evalOnPage.js";
 import { sleep } from "./browser.js";
 
 /**
  * Invoice capture: open a delivered unit's order page, press Flipkart's
  * "Download Invoice", catch the file, and put it in the private S3 bucket
- * under the same key layout the dashboard signs links for:
+ * under the key the extraction pipeline listens on:
  *
- *   invoices/<workspace user id>/<order date YYYY-MM-DD>/<order id>.pdf
- *   (…/<order id>-<unit id>.pdf when one order has several invoices)
+ *   raw/<workspace user id>/<order id>.pdf
+ *
+ * One object per order — Flipkart's download on ANY unit page returns the
+ * whole order's bundle, so every unit of the order shares the key and the
+ * pipeline picks each unit's own product invoice out of it. The key never
+ * changes afterwards; status lives on an S3 tag (pending here, processed /
+ * failed from the Lambda) and on the `invoices` row this file registers as
+ * `pending`. S3 → SQS → Lambda does the extraction; nothing is parsed here.
  *
  * Runs as a step AFTER enrichment, never inside it, so the fetch invariant
  * (listed − dropped − known + carried = queued = enriched) is untouched.
@@ -104,12 +112,12 @@ function s3(): S3Client {
   return client;
 }
 
-export function invoiceKeyFor(userId: string, orderDate: Date | string | null | undefined, orderId: string, unitId = ""): string {
-  const d = orderDate ? new Date(orderDate) : null;
-  const day = d && !Number.isNaN(d.getTime()) ? d.toISOString().slice(0, 10) : "undated";
+export const RAW_PREFIX = "raw/";
+
+/** raw/<workspace user id>/<order id>.pdf — fixed for the object's life. Same function as the dashboard's invoicePipeline.ts. */
+export function rawInvoiceKey(userId: string, orderId: string): string {
   const safe = (s: string) => String(s || "").replace(/[^A-Za-z0-9._-]/g, "_");
-  const name = unitId && unitId !== orderId ? `${safe(orderId)}-${safe(unitId)}` : safe(orderId);
-  return `invoices/${safe(userId)}/${day}/${name}.pdf`;
+  return `${RAW_PREFIX}${safe(userId)}/${safe(orderId)}.pdf`;
 }
 
 export async function invoiceExists(key: string): Promise<boolean> {
@@ -121,9 +129,51 @@ export async function invoiceExists(key: string): Promise<boolean> {
   }
 }
 
-export async function putInvoice(key: string, body: Buffer): Promise<number> {
-  await s3().send(new PutObjectCommand({ Bucket: config.invoiceBucket, Key: key, Body: body, ContentType: "application/pdf" }));
-  return body.length;
+/** Upload the bundle tagged `status=pending`; the ETag identifies these exact bytes to the pipeline. */
+export async function putInvoice(key: string, body: Buffer): Promise<{ size: number; etag: string }> {
+  const res = await s3().send(
+    new PutObjectCommand({ Bucket: config.invoiceBucket, Key: key, Body: body, ContentType: "application/pdf", Tagging: "status=pending" })
+  );
+  return { size: body.length, etag: String(res.ETag || "").replace(/"/g, "") };
+}
+
+/**
+ * Hand the object to the extraction pipeline: one `invoices` row per bundle,
+ * created `pending` when new. An existing row keeps its status — the Lambda's
+ * claim notices changed bytes by etag on its own — so a re-capture never
+ * regresses a processed invoice; and if the S3 event beat us here, the
+ * Lambda's own upsert already made the row and this only fills in what the
+ * worker knows (parts, units, account).
+ */
+export async function registerInvoice(input: {
+  userId: string;
+  platformAccountId: unknown;
+  orderId: string;
+  key: string;
+  etag: string;
+  size: number;
+  parts: IInvoicePart[];
+  unitIds: string[];
+}): Promise<void> {
+  const now = new Date();
+  const account = input.platformAccountId && Types.ObjectId.isValid(String(input.platformAccountId)) ? new Types.ObjectId(String(input.platformAccountId)) : null;
+  await Invoice.updateOne(
+    { s3_key: input.key },
+    {
+      $setOnInsert: {
+        userId: new Types.ObjectId(input.userId),
+        order_id: input.orderId,
+        source_key: input.key,
+        processing_status: "pending",
+        retry_count: 0,
+        last_error: "",
+        createdAt: now,
+      },
+      $set: { etag: input.etag, size: input.size, parts: input.parts, updatedAt: now, ...(account ? { platformAccountId: account } : {}) },
+      $addToSet: { unit_ids: { $each: input.unitIds } },
+    },
+    { upsert: true, timestamps: false }
+  );
 }
 
 // ---- the page work (ported from the dashboard's proven click path) ----------
@@ -279,10 +329,8 @@ export async function captureInvoicesForAccount(opts: {
   out.skippedCap = wanted.length - batch.length;
   opts.log("info", `${opts.email}: invoices — ${wanted.length} delivered unit(s) without a PDF${out.skippedCap ? ` (doing ${cap}, ${out.skippedCap} left for the next run)` : ""}`);
   const page = await opts.getPage();
-  // Flipkart's download on ANY unit page returns the whole order's bundle. A
-  // multi-unit order therefore gets ONE object, keyed by order id, and every
-  // delivered unit of it shares the key (extraction picks the unit's own
-  // product invoice out of the bundle). Captured once per run per order.
+  // One object per order, captured once per run however many of its units
+  // are in the batch; each unit row then points at the shared key.
   const doneOrders = new Map<string, { key: string; size: number; parts: InvoicePart[] }>();
   for (const r of batch) {
     if (opts.cancelled()) break;
@@ -294,12 +342,22 @@ export async function captureInvoicesForAccount(opts: {
         const pdfs = await captureInvoicePdfs(page, String(r.order_url || ""));
         const bundle = await mergeInvoiceBundle(pdfs);
         const productParts = bundle.parts.filter((p) => p.type === "product").length;
-        const key = productParts > 1 ? invoiceKeyFor(opts.userId, r.order_date, orderId) : invoiceKeyFor(opts.userId, r.order_date, orderId, String(r.unit_id));
-        const size = await putInvoice(key, bundle.pdf);
-        stamped = { key, size, parts: bundle.parts };
-        if (productParts > 1) doneOrders.set(orderId, stamped);
+        const key = rawInvoiceKey(opts.userId, orderId);
+        const put = await putInvoice(key, bundle.pdf);
+        stamped = { key, size: put.size, parts: bundle.parts };
+        doneOrders.set(orderId, stamped);
         fresh = true;
-        if (!productParts) opts.log("warn", `${orderId} unit ${r.unit_id}: bundle has no product invoice (${bundle.parts.map((p) => p.type).join(", ")})`);
+        await registerInvoice({
+          userId: opts.userId,
+          platformAccountId: opts.platformAccountId,
+          orderId,
+          key,
+          etag: put.etag,
+          size: put.size,
+          parts: bundle.parts,
+          unitIds: rows.filter((x) => String(x.order_id) === orderId).map((x) => String(x.unit_id)),
+        });
+        if (!productParts) opts.log("warn", `${orderId} unit ${r.unit_id}: bundle has no product invoice (${bundle.parts.map((p) => p.type).join(", ")}) — the pipeline will park it as needs_review`);
       }
       await Order.updateOne(
         { _id: r._id },

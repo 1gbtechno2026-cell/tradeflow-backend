@@ -43,6 +43,8 @@ export interface IInvoice {
   retried_by: string;
   retried_at: Date | null;
   unit_ids: string[];
+  /** Every tax invoice in the bundle (written by the Lambda; the dashboard's invoiceParse.ts InvoiceLine). */
+  lines: Record<string, unknown>[];
   summary: Record<string, unknown> | null;
   createdAt: Date;
   updatedAt: Date;
@@ -67,6 +69,7 @@ const InvoiceSchema = new Schema<IInvoice>(
     retried_by: { type: String, default: "" },
     retried_at: { type: Date, default: null },
     unit_ids: { type: [String], default: [] },
+    lines: { type: [new Schema<Record<string, unknown>>({}, { _id: false, strict: false })], default: [] },
     summary: { type: Schema.Types.Mixed, default: null },
   },
   { timestamps: true }

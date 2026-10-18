@@ -20,9 +20,12 @@ export async function requeueCheckoutJob(data: CheckoutJobData, delayMs: number,
     }
   );
   // A fresh BullMQ job id each time: the original id is still "active" until
-  // this processor returns, and BullMQ refuses a duplicate.
+  // this processor returns, and BullMQ refuses a duplicate. The separator must
+  // not be ":" — BullMQ 5 throws "Custom Id cannot contain :", and the job was
+  // then lost: Mongo said queued/waiting while nothing sat in the queue (every
+  // job that reached this path between 2026-10-15 and 2026-10-18 stranded).
   await getCheckoutQueue(jobClassFor(data)).add("checkout", data, {
-    jobId: `${data.jobId}:w${now.getTime().toString(36)}`,
+    jobId: `${data.jobId}-w${now.getTime().toString(36)}`,
     delay: Math.max(1000, delayMs),
   });
 }

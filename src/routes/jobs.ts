@@ -417,7 +417,7 @@ jobsRouter.post("/:id/cancel", async (req, res) => {
     const queued = await queue.getJob(String(job._id));
     if (queued) await queued.remove();
     for (const j of await queue.getDelayed()) {
-      if (String(j.id || "").startsWith(`${String(job._id)}:w`)) await j.remove().catch(() => undefined);
+      if (String(j.id || "").startsWith(`${String(job._id)}-w`)) await j.remove().catch(() => undefined);
     }
   } catch {
     /* ignore */

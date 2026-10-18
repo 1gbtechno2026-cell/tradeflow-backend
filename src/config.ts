@@ -54,6 +54,13 @@ export const config = {
    */
   workerId: (process.env.WORKER_ID || os.hostname().split(".")[0] || "worker").trim(),
   /**
+   * Which deployment this process belongs to — the owner of the batches it
+   * creates and the only one that consumes or sweeps them. All processes that
+   * share one Redis share one TRADEFLOW_SYSTEM_ID (e.g. "aws" for every Fargate
+   * task, the hostname for a developer Mac). Defaults to the machine name.
+   */
+  systemId: (process.env.TRADEFLOW_SYSTEM_ID || os.hostname().split(".")[0] || "local").trim(),
+  /**
    * required  — a worker with no proxy exits at boot and takes no jobs; a job
    *             whose proxy vanishes mid-batch waits (re-queued) for a free one.
    * preferred — use a proxy when one is free, else the local connection, and

@@ -15,6 +15,7 @@
     "test:cancel": "tsx src/scripts/cancelTestCli.ts",
     "test:otp-plumbing": "tsx src/scripts/otpPlumbingTest.ts",
     "backfill:order-ids": "tsx src/scripts/backfillOrderIds.ts",
+    "batches:backfill": "tsx src/scripts/backfillBatchCounters.ts",
     "test:classify": "tsx src/scripts/classifyTest.ts",
     "test:proxy-pool": "tsx src/scripts/proxyPoolTest.ts",
     "orders:replay": "tsx src/scripts/replayOrderTrace.ts"

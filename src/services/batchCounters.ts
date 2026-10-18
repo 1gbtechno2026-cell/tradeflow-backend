@@ -1,50 +1,29 @@
-import { Redis } from "ioredis";
-import { config } from "../config.js";
+import { CheckoutBatch, type BatchRecordStatus } from "../models/CheckoutBatch.js";
 
 /**
- * Batch-wide counters shared by every worker.
- * Keys:
- *   batch:{batchId}:purchasedQuantity
- *   batch:{batchId}:attemptsUsed
- *   batch:{batchId}:status   completed | exhausted
+ * Batch-wide counters, kept on the batch's own Mongo document
+ * (tradeflowbatches) and mutated only with atomic, guarded updates — never
+ * read-then-write in JS. Atlas is a replica set, so one findOneAndUpdate is
+ * as atomic as the Lua script this replaced, and the numbers are the same
+ * from every machine, survive a Redis restart, and feed the change stream
+ * the dashboard listens to.
  *
- * All mutations go through INCRBY/DECRBY or Lua — never GET then SET in JS.
+ * Semantics (unchanged from the Redis version):
+ *   purchasedQuantity  units reserved by attempts in flight + units bought;
+ *                      a failed attempt gives its reservation back
+ *   attemptsUsed       attempts that reached Flipkart; refunded only when OUR
+ *                      plumbing failed before Flipkart saw anything
+ *   batchStatus        running → completed (target met) | exhausted (budget
+ *                      spent) | cancelling → cancelled (operator)
  *
  * There is no "filtered" state any more. A batch used to be stopped the moment
  * one job saw out-of-stock / not-deliverable; now every selected platform ID is
  * attempted and reports its own reason, because a product refused to one
  * account may be sold to another. The only things that end a batch early are
- * reaching the quantity target and running out of attempts.
+ * reaching the quantity target, running out of attempts, and cancellation.
  */
 
-const KEY_TTL_SEC = 60 * 60 * 24 * 14;
-
-let client: Redis | null = null;
-
-export function getBatchRedis(): Redis {
-  if (!client) {
-    const u = new URL(config.redisUrl);
-    client = new Redis({
-      host: u.hostname,
-      port: Number(u.port || 6376),
-      password: u.password || undefined,
-      maxRetriesPerRequest: null,
-    });
-  }
-  return client;
-}
-
-export function purchasedKey(batchId: string) {
-  return `batch:${batchId}:purchasedQuantity`;
-}
-export function attemptsKey(batchId: string) {
-  return `batch:${batchId}:attemptsUsed`;
-}
-export function statusKey(batchId: string) {
-  return `batch:${batchId}:status`;
-}
-
-export type BatchStatus = "running" | "completed" | "exhausted";
+export type BatchStatus = BatchRecordStatus;
 
 export interface BatchProgress {
   status: BatchStatus;
@@ -55,165 +34,63 @@ export interface BatchProgress {
 export type ReserveResult =
   | { kind: "ok"; purchasedQuantity: number; attemptsUsed: number }
   | { kind: "skip_target"; purchasedQuantity: number; attemptsUsed: number }
-  | { kind: "skip_exhausted"; purchasedQuantity: number; attemptsUsed: number };
+  | { kind: "skip_exhausted"; purchasedQuantity: number; attemptsUsed: number }
+  | { kind: "skip_cancelled"; purchasedQuantity: number; attemptsUsed: number };
 
-const RESERVE_LUA = `
-local purchasedKey = KEYS[1]
-local attemptsKey = KEYS[2]
-local statusKey = KEYS[3]
-local perOrder = tonumber(ARGV[1])
-local totalQty = tonumber(ARGV[2])
-local totalAttempts = tonumber(ARGV[3])
-local ttl = tonumber(ARGV[4])
+const CANCELLED: BatchStatus[] = ["cancelling", "cancelled"];
 
-local function nums()
-  return tonumber(redis.call('GET', purchasedKey) or '0'), tonumber(redis.call('GET', attemptsKey) or '0')
-end
+type Counters = { batchStatus: BatchStatus; purchasedQuantity: number; attemptsUsed: number };
 
-local function touch()
-  redis.call('EXPIRE', purchasedKey, ttl)
-  redis.call('EXPIRE', attemptsKey, ttl)
-  redis.call('EXPIRE', statusKey, ttl)
-end
-
-local status = redis.call('GET', statusKey)
-if status == 'completed' then
-  local p, a = nums()
-  return {'skip_target', p, a}
-end
-if status == 'exhausted' then
-  local p, a = nums()
-  return {'skip_exhausted', p, a}
-end
-
-local purchased = tonumber(redis.call('GET', purchasedKey) or '0')
-if purchased >= totalQty then
-  redis.call('SET', statusKey, 'completed')
-  touch()
-  local p, a = nums()
-  return {'skip_target', p, a}
-end
-
-local newQty = redis.call('INCRBY', purchasedKey, perOrder)
-if newQty > totalQty then
-  local restored = redis.call('DECRBY', purchasedKey, perOrder)
-  if restored < 0 then
-    redis.call('SET', purchasedKey, '0')
-    restored = 0
-  end
-  if restored >= totalQty then
-    redis.call('SET', statusKey, 'completed')
-  end
-  touch()
-  local a = tonumber(redis.call('GET', attemptsKey) or '0')
-  return {'skip_target', restored, a}
-end
-
-local attempts = redis.call('INCR', attemptsKey)
-if attempts > totalAttempts then
-  local restored = redis.call('DECRBY', purchasedKey, perOrder)
-  if restored < 0 then
-    redis.call('SET', purchasedKey, '0')
-    restored = 0
-  end
-  redis.call('SET', statusKey, 'exhausted')
-  touch()
-  return {'skip_exhausted', restored, attempts}
-end
-
-touch()
-return {'ok', newQty, attempts}
-`;
-
-const RELEASE_LUA = `
-local purchasedKey = KEYS[1]
-local perOrder = tonumber(ARGV[1])
-local ttl = tonumber(ARGV[2])
-local restored = redis.call('DECRBY', purchasedKey, perOrder)
-if restored < 0 then
-  redis.call('SET', purchasedKey, '0')
-  restored = 0
-end
-redis.call('EXPIRE', purchasedKey, ttl)
-return restored
-`;
-
-const PROGRESS_LUA = `
-local purchasedKey = KEYS[1]
-local attemptsKey = KEYS[2]
-local statusKey = KEYS[3]
-local totalQty = tonumber(ARGV[1])
-local totalAttempts = tonumber(ARGV[2])
-local ttl = tonumber(ARGV[3])
-local purchased = tonumber(redis.call('GET', purchasedKey) or '0')
-local attempts = tonumber(redis.call('GET', attemptsKey) or '0')
-local status = redis.call('GET', statusKey)
-if purchased >= totalQty then
-  redis.call('SET', statusKey, 'completed')
-  redis.call('EXPIRE', statusKey, ttl)
-  return {'completed', purchased, attempts}
-end
-if attempts >= totalAttempts and purchased < totalQty then
-  redis.call('SET', statusKey, 'exhausted')
-  redis.call('EXPIRE', statusKey, ttl)
-  return {'exhausted', purchased, attempts}
-end
-return {status or 'running', purchased, attempts}
-`;
-
-function asInt(v: unknown): number {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
+async function readCounters(batchId: string): Promise<Counters | null> {
+  return CheckoutBatch.findOne({ batchId }).select("batchStatus purchasedQuantity attemptsUsed").lean<Counters>();
 }
 
-export async function initBatchCounters(batchId: string): Promise<void> {
-  const r = getBatchRedis();
-  await r.set(purchasedKey(batchId), "0", "NX");
-  await r.set(attemptsKey(batchId), "0", "NX");
-  await r.expire(purchasedKey(batchId), KEY_TTL_SEC);
-  await r.expire(attemptsKey(batchId), KEY_TTL_SEC);
+/** The batch document is created by the jobs route; nothing to prepare any more. Kept for callers. */
+export async function initBatchCounters(_batchId: string): Promise<void> {
+  /* no-op */
 }
 
-export async function reserveBatchSlot(input: {
-  batchId: string;
-  quantityPerOrder: number;
-  totalQuantity: number;
-  totalAttempts: number;
-}): Promise<ReserveResult> {
-  const r = getBatchRedis();
-  const raw = (await r.eval(
-    RESERVE_LUA,
-    3,
-    purchasedKey(input.batchId),
-    attemptsKey(input.batchId),
-    statusKey(input.batchId),
-    String(input.quantityPerOrder),
-    String(input.totalQuantity),
-    String(input.totalAttempts),
-    String(KEY_TTL_SEC)
-  )) as unknown[];
-  const kind = String(raw?.[0] || "skip_target") as ReserveResult["kind"];
-  const purchasedQuantity = asInt(raw?.[1]);
-  const attemptsUsed = asInt(raw?.[2]);
-  if (kind === "ok") return { kind, purchasedQuantity, attemptsUsed };
-  if (kind === "skip_exhausted") return { kind, purchasedQuantity, attemptsUsed };
+/**
+ * Take one attempt and `quantityPerOrder` units for an attempt that is about
+ * to open Chrome, or say why it must not: target already met, budget spent,
+ * batch cancelled. One guarded update; two workers cannot both take the last
+ * slot.
+ */
+export async function reserveBatchSlot(input: { batchId: string; quantityPerOrder: number; totalQuantity: number; totalAttempts: number }): Promise<ReserveResult> {
+  const { batchId, quantityPerOrder, totalQuantity, totalAttempts } = input;
+  const taken = await CheckoutBatch.findOneAndUpdate(
+    {
+      batchId,
+      batchStatus: "running",
+      purchasedQuantity: { $lte: totalQuantity - quantityPerOrder },
+      attemptsUsed: { $lt: totalAttempts },
+    },
+    { $inc: { purchasedQuantity: quantityPerOrder, attemptsUsed: 1 }, $set: { lastProgressAt: new Date() } },
+    { new: true }
+  )
+    .select("purchasedQuantity attemptsUsed")
+    .lean<Counters>();
+  if (taken) return { kind: "ok", purchasedQuantity: taken.purchasedQuantity, attemptsUsed: taken.attemptsUsed };
+
+  // Refused: say why, and settle the batch status the way the attempt would have.
+  const now = await readCounters(batchId);
+  const purchasedQuantity = now?.purchasedQuantity ?? 0;
+  const attemptsUsed = now?.attemptsUsed ?? 0;
+  if (!now) return { kind: "skip_target", purchasedQuantity, attemptsUsed };
+  if (CANCELLED.includes(now.batchStatus)) return { kind: "skip_cancelled", purchasedQuantity, attemptsUsed };
+  if (now.batchStatus === "completed") return { kind: "skip_target", purchasedQuantity, attemptsUsed };
+  if (now.batchStatus === "exhausted") return { kind: "skip_exhausted", purchasedQuantity, attemptsUsed };
+  if (purchasedQuantity >= totalQuantity) {
+    await CheckoutBatch.updateOne({ batchId, batchStatus: "running" }, { $set: { batchStatus: "completed", completedAt: new Date() } });
+    return { kind: "skip_target", purchasedQuantity, attemptsUsed };
+  }
+  if (attemptsUsed >= totalAttempts) {
+    await CheckoutBatch.updateOne({ batchId, batchStatus: "running" }, { $set: { batchStatus: "exhausted", completedAt: new Date() } });
+    return { kind: "skip_exhausted", purchasedQuantity, attemptsUsed };
+  }
+  // Room left, but less than one full order: not a completed batch yet, just no slot for this attempt.
   return { kind: "skip_target", purchasedQuantity, attemptsUsed };
 }
-
-const REFUND_ATTEMPT_LUA = `
-local attemptsKey = KEYS[1]
-local statusKey = KEYS[2]
-local ttl = tonumber(ARGV[1])
-local attempts = tonumber(redis.call('GET', attemptsKey) or '0')
-if attempts > 0 then
-  attempts = redis.call('DECR', attemptsKey)
-end
-if redis.call('GET', statusKey) == 'exhausted' then
-  redis.call('DEL', statusKey)
-end
-redis.call('EXPIRE', attemptsKey, ttl)
-return attempts
-`;
 
 /**
  * Gives an attempt back. For a job that never reached Flipkart because OUR
@@ -221,44 +98,51 @@ return attempts
  * Flipkart's answers. Clears an `exhausted` mark the refunded attempt caused.
  */
 export async function refundBatchAttempt(batchId: string): Promise<number> {
-  const r = getBatchRedis();
-  const left = await r.eval(REFUND_ATTEMPT_LUA, 2, attemptsKey(batchId), statusKey(batchId), String(KEY_TTL_SEC));
-  return asInt(left);
+  const doc = await CheckoutBatch.findOneAndUpdate(
+    { batchId },
+    [
+      {
+        $set: {
+          attemptsUsed: { $max: [0, { $subtract: ["$attemptsUsed", 1] }] },
+          batchStatus: { $cond: [{ $eq: ["$batchStatus", "exhausted"] }, "running", "$batchStatus"] },
+          completedAt: { $cond: [{ $eq: ["$batchStatus", "exhausted"] }, null, "$completedAt"] },
+        },
+      },
+    ],
+    { new: true }
+  )
+    .select("attemptsUsed")
+    .lean<Counters>();
+  return doc?.attemptsUsed ?? 0;
 }
 
+/** An attempt that reserved units and did not buy them gives them back (never below zero). */
 export async function releaseBatchReservation(batchId: string, quantityPerOrder: number): Promise<number> {
-  const r = getBatchRedis();
-  const restored = await r.eval(
-    RELEASE_LUA,
-    1,
-    purchasedKey(batchId),
-    String(quantityPerOrder),
-    String(KEY_TTL_SEC)
-  );
-  return asInt(restored);
+  const doc = await CheckoutBatch.findOneAndUpdate(
+    { batchId },
+    [{ $set: { purchasedQuantity: { $max: [0, { $subtract: ["$purchasedQuantity", quantityPerOrder] }] } } }],
+    { new: true }
+  )
+    .select("purchasedQuantity")
+    .lean<Counters>();
+  return doc?.purchasedQuantity ?? 0;
 }
 
-export async function readBatchProgress(
-  batchId: string,
-  totalQuantity: number,
-  totalAttempts: number
-): Promise<BatchProgress> {
-  const r = getBatchRedis();
-  const raw = (await r.eval(
-    PROGRESS_LUA,
-    3,
-    purchasedKey(batchId),
-    attemptsKey(batchId),
-    statusKey(batchId),
-    String(totalQuantity),
-    String(totalAttempts),
-    String(KEY_TTL_SEC)
-  )) as unknown[];
-  const rawStatus = String(raw?.[0] || "running");
-  const status: BatchStatus = rawStatus === "completed" || rawStatus === "exhausted" ? rawStatus : "running";
-  return {
-    status,
-    purchasedQuantity: asInt(raw?.[1]),
-    attemptsUsed: asInt(raw?.[2]),
-  };
+/** Current numbers, settling `completed` / `exhausted` if the counters already say so. */
+export async function readBatchProgress(batchId: string, totalQuantity: number, totalAttempts: number): Promise<BatchProgress> {
+  const now = await readCounters(batchId);
+  if (!now) return { status: "running", purchasedQuantity: 0, attemptsUsed: 0 };
+  let status = now.batchStatus;
+  if (status === "running" && now.purchasedQuantity >= totalQuantity) {
+    await CheckoutBatch.updateOne({ batchId, batchStatus: "running" }, { $set: { batchStatus: "completed", completedAt: new Date() } });
+    status = "completed";
+  } else if (status === "running" && now.attemptsUsed >= totalAttempts) {
+    await CheckoutBatch.updateOne({ batchId, batchStatus: "running" }, { $set: { batchStatus: "exhausted", completedAt: new Date() } });
+    status = "exhausted";
+  }
+  return { status, purchasedQuantity: now.purchasedQuantity, attemptsUsed: now.attemptsUsed };
+}
+
+export function isBatchCancelled(status: BatchStatus | string | undefined): boolean {
+  return CANCELLED.includes(status as BatchStatus);
 }

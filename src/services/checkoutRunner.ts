@@ -5,6 +5,7 @@ import { FlipkartApiWatcher } from "../automation/FlipkartApiWatcher.js";
 import { PaymentApiWatcher, type PlacedOrderDetails } from "../automation/PaymentApiWatcher.js";
 import { closeReporter, openReporter, reporterFor } from "./jobReporter.js";
 import {
+  isBatchCancelled,
   readBatchProgress,
   refundBatchAttempt,
   releaseBatchReservation,
@@ -148,6 +149,10 @@ async function maybeEnqueueRetry(
   if (latest?.status === "cancelled") return;
   const { quantityPerOrder, totalQuantity, totalAttempts } = batchLimits(data);
   const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
+  if (isBatchCancelled(progress.status)) {
+    console.log(`[${data.jobId}] [info] [batch] batch cancelled — no retry`);
+    return;
+  }
   if (progress.status === "completed" || progress.purchasedQuantity >= totalQuantity) {
     console.log(
       `[${data.jobId}] [info] [batch] target reached purchased=${progress.purchasedQuantity}/${totalQuantity} — no retry`
@@ -404,6 +409,11 @@ async function runClaimedCheckoutJob(
       `Attempt budget exhausted (${slot.attemptsUsed}/${totalAttempts}, purchased ${slot.purchasedQuantity}/${totalQuantity}) — Chrome not opened`,
       "error"
     );
+    await unlockAccount();
+    return;
+  }
+  if (slot.kind === "skip_cancelled") {
+    await finishWithoutChrome(data.jobId, "cancelled", "cancelled", `Batch cancelled by operator (purchased ${slot.purchasedQuantity}/${totalQuantity}) — Chrome not opened`, "warn");
     await unlockAccount();
     return;
   }

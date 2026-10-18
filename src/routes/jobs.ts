@@ -6,7 +6,8 @@ import { CheckoutBatch } from "../models/CheckoutBatch.js";
 import { getCheckoutQueue } from "../queue.js";
 import { jobClassFor } from "../services/jobClass.js";
 import { effectiveAttemptsFor, parseCreateJobBody, requiredOrdersFor } from "../services/jobRequest.js";
-import { initBatchCounters, readBatchProgress } from "../services/batchCounters.js";
+import { readBatchProgress } from "../services/batchCounters.js";
+import { config } from "../config.js";
 import { enqueueCheckoutJob } from "../services/checkoutEnqueue.js";
 import { requestSnapshot } from "../services/orderSnapshot.js";
 import { resolveAddress, resolveLoggedInSession, workspaceUserId } from "../services/sessionStore.js";
@@ -237,10 +238,11 @@ jobsRouter.post("/", async (req, res) => {
     }
 
     if (!data.dryRun) {
-      await initBatchCounters(batchId);
+      // The batch document is the progress ledger (services/batchCounters.ts) and the unit of cancellation.
       await CheckoutBatch.create({
         batchId,
         userId,
+        systemId: config.systemId,
         batchStatus: "running",
         filterReason: null,
         filteredCount: 0,
@@ -249,6 +251,9 @@ jobsRouter.post("/", async (req, res) => {
         totalQuantity,
         quantityPerOrder: perOrderQty,
         totalAttempts: effectiveAttempts,
+        productUrl: data.productUrl,
+        paymentMode: data.paymentMode || "",
+        createdBy: String(req.header("x-requested-by") || ""),
       });
     }
 

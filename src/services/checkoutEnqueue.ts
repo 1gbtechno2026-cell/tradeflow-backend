@@ -1,3 +1,4 @@
+import { config } from "../config.js";
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import { getCheckoutQueue } from "../queue.js";
 import { jobClassFor } from "./jobClass.js";
@@ -60,6 +61,7 @@ export async function enqueueCheckoutJob(input: {
   const created = await CheckoutJob.create({
     batchId: input.batchId,
     userId: input.userId,
+    systemId: config.systemId,
     email: input.email,
     platformId: input.platformId,
     productUrl: input.productUrl,

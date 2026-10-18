@@ -230,6 +230,8 @@ export async function sweepOrderSyncs(): Promise<number> {
   const now = Date.now();
   const rows = await CheckoutJob.find({
     status: { $in: TERMINAL },
+    // Only this deployment's jobs (rows from before systemId existed count as ours).
+    systemId: { $in: [config.systemId, "", null] },
     completedAt: { $lt: new Date(now - SWEEP_GRACE_MS), $gt: new Date(now - SWEEP_MAX_AGE_MS) },
     $or: [{ orderSync: { $exists: false } }, { orderSync: null }, { "orderSync.status": "pending" }],
   })

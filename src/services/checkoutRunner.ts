@@ -10,6 +10,7 @@ import {
   refundBatchAttempt,
   releaseBatchReservation,
   reserveBatchSlot,
+  settleBatchIfCancelling,
 } from "./batchCounters.js";
 import { claimProxyForWorker, isProxyError, probeExitIp, recordProxyUse, reportProxyFailure } from "./proxyPool.js";
 import { setNavigationTimeoutScale } from "../automation/helpers.js";
@@ -889,5 +890,7 @@ async function runClaimedCheckoutJob(
     const latest = await CheckoutJob.findById(data.jobId).select("status");
     if (latest?.status === "cancelled") await releaseReservation();
     await unlockAccount();
+    // A batch being cancelled is done the moment its last open attempt ends.
+    await settleBatchIfCancelling(data.batchId).catch(() => undefined);
   }
 }

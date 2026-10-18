@@ -146,3 +146,22 @@ export async function readBatchProgress(batchId: string, totalQuantity: number, 
 export function isBatchCancelled(status: BatchStatus | string | undefined): boolean {
   return CANCELLED.includes(status as BatchStatus);
 }
+
+/**
+ * A `cancelling` batch becomes `cancelled` once nothing is open any more.
+ * Called when an attempt ends (runner) and by the cancel route itself, so a
+ * batch with no attempts past Pay settles immediately and one with attempts
+ * finishing settles when the last of them does. Returns the status now.
+ */
+export async function settleBatchIfCancelling(batchId: string): Promise<BatchStatus | null> {
+  const { CheckoutJob } = await import("../models/CheckoutJob.js");
+  const batch = await CheckoutBatch.findOne({ batchId }).select("batchStatus").lean<{ batchStatus: BatchStatus }>();
+  if (!batch) return null;
+  if (batch.batchStatus !== "cancelling") return batch.batchStatus;
+  const open = await CheckoutJob.countDocuments({ batchId, status: { $in: ["queued", "running"] } });
+  if (open > 0) return "cancelling";
+  const settled = await CheckoutBatch.findOneAndUpdate({ batchId, batchStatus: "cancelling" }, { $set: { batchStatus: "cancelled", cancelledAt: new Date(), completedAt: new Date() } }, { new: true })
+    .select("batchStatus")
+    .lean<{ batchStatus: BatchStatus }>();
+  return settled?.batchStatus ?? "cancelled";
+}

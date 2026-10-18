@@ -43,6 +43,8 @@ export interface ICheckoutJob {
   startedAt: Date | null;
   heartbeatAt?: Date | null;
   claimedBy?: string;
+  /** Deployment that owns this job (config.systemId); only its workers consume or sweep it. */
+  systemId?: string;
   completedAt: Date | null;
   /** Getting this attempt's order into Order Units (services/orderSync.ts). */
   orderSync?: {
@@ -239,6 +241,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
     heartbeatAt: { type: Date, default: null },
     /** Which worker run holds the claim, so a stale reclaim is attributable. */
     claimedBy: { type: String, default: "" },
+    systemId: { type: String, default: "", index: true },
     completedAt: { type: Date, default: null },
     orderSync: {
       type: new Schema(

@@ -40,6 +40,28 @@ const TERMINAL = /deliver|cancel|return|refund|fail/i;
 const IN_FLIGHT = new Set(["queued", "running"]);
 /** Errors worth one more go in the same browser. */
 const TRANSIENT = /timeout|timed out|net::|ECONN|ETIMEDOUT|EAI_AGAIN|socket hang up|proxy|Target (page|context|browser).*closed|has been closed|navigation/i;
+/**
+ * Hard cap on one unit in a tab. A renderer that stops answering (memory
+ * pressure, a swapped-out Chrome) can make a Playwright call wait forever;
+ * without this the tab, the job and one of the worker's slots hang for good —
+ * which is how a 3 900-unit run ground to a halt on 2026-10-19 with six idle
+ * Chromes and 750 units still queued.
+ */
+const UNIT_TIMEOUT_MS = 4 * 60 * 1000;
+/** A unit "running" this long with no finish was abandoned by a hung or dead worker; pick it up again. */
+const STALE_RUNNING_MS = 10 * 60 * 1000;
+
+class UnitTimeoutError extends Error {}
+
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  return Promise.race([
+    p.finally(() => clearTimeout(timer)),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new UnitTimeoutError(`${what} did not finish in ${Math.round(ms / 60000)} min — page hung`)), ms);
+    }),
+  ]);
+}
 /** The account is busy (checkout, sync or another cancel) — try again after this. */
 const LOCK_RETRY_MS = 20_000;
 /** Unknown orders are read inside the request; keep that to seconds, not minutes. */
@@ -445,8 +467,14 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
   const request = await CancelRequest.findById(requestId).lean();
   try {
     if (!request) return;
-    const units = request.units.filter((u) => u.email === email.toLowerCase() && u.status === "queued");
+    // Queued units, plus ones a hung or dead worker left "running" long ago.
+    const staleBefore = Date.now() - STALE_RUNNING_MS;
+    const units = request.units.filter(
+      (u) => u.email === email.toLowerCase() && (u.status === "queued" || (u.status === "running" && (!u.startedAt || new Date(u.startedAt).getTime() < staleBefore)))
+    );
     if (!units.length) return;
+    const stale = units.filter((u) => u.status === "running").length;
+    if (stale) console.log(`[cancel ${requestId}] ${email} re-picking ${stale} unit(s) left running by an earlier worker`);
     await CancelRequest.updateOne({ _id: requestId, status: "queued" }, { $set: { status: "running" } });
     const log = (msg: string) => console.log(`[cancel ${requestId}] ${email} ${msg}`);
 
@@ -483,8 +511,9 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
 
       const pending = [...units];
       let sessionDead = false;
-      const runTab = async (page: Page) => {
-        const flow = new FlipkartCancel(page, (_lvl, msg) => log(msg));
+      const runTab = async (startPage: Page) => {
+        let page = startPage;
+        let flow = new FlipkartCancel(page, (_lvl, msg) => log(msg));
         for (;;) {
           const u = pending.shift();
           if (!u) return;
@@ -498,14 +527,20 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
           try {
             // One automatic retry for network-class trouble (timeouts, proxy,
             // a closed target); never for an expired session or Flipkart's answer.
+            // Every attempt is capped: a tab that stops answering fails the
+            // unit instead of holding this slot forever.
             const attempt = () =>
-              flow.cancelUnit({ orderId: u.orderId, unitId: u.unitId, itemId: u.itemId }, { dryRun: request.dryRun, onStep: async (name) => void (lastStep = name) });
+              withTimeout(
+                flow.cancelUnit({ orderId: u.orderId, unitId: u.unitId, itemId: u.itemId }, { dryRun: request.dryRun, onStep: async (name) => void (lastStep = name) }),
+                UNIT_TIMEOUT_MS,
+                `${u.orderId}/${u.unitId}`
+              );
             let outcome: CancelOutcome;
             try {
               outcome = await attempt();
             } catch (first) {
               const text = first instanceof Error ? first.message : String(first);
-              if (!TRANSIENT.test(text) || /SESSION_EXPIRED/.test(text)) throw first;
+              if (first instanceof UnitTimeoutError || !TRANSIENT.test(text) || /SESSION_EXPIRED/.test(text)) throw first;
               log(`${u.orderId}/${u.unitId} ${text.split("\n")[0].slice(0, 120)} — retrying once`);
               outcome = await attempt();
             }
@@ -522,10 +557,18 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
             // The page it broke on, for the next person reading this failure.
             fs.mkdirSync(artifactDir, { recursive: true });
             const base = path.join(artifactDir, `${u.unitId}-${lastStep || "start"}`);
-            await page.screenshot({ path: `${base}.png`, fullPage: true }).catch(() => undefined);
+            await withTimeout(page.screenshot({ path: `${base}.png`, fullPage: true }), 15_000, "screenshot").catch(() => undefined);
             await finish(u, "failed", message.slice(0, 500));
             // Every tab shares the login: once it is gone, the rest are failed, not attempted.
             if (/SESSION_EXPIRED/.test(message)) sessionDead = true;
+            if (err instanceof UnitTimeoutError) {
+              // The tab is not trusted any more: drop it and carry on in a fresh one.
+              log(`${u.orderId}/${u.unitId} replacing the hung tab`);
+              await withTimeout(page.close(), 10_000, "close tab").catch(() => undefined);
+              page = await ctx.newPage();
+              await blockFlipkartLogout(page);
+              flow = new FlipkartCancel(page, (_lvl, msg) => log(msg));
+            }
           }
         }
       };

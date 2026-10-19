@@ -210,9 +210,11 @@ orderFetchRouter.post("/sync/stop", async (req, res) => {
 
 /**
  * Cancel Order Units. Body: { type: "unit" | "order", ids: "id id,id" | string[],
- * dryRun?: boolean }. Answers at once with what was queued and what was refused;
- * the units are cancelled by the worker (order-cancel queue), one account at a
- * time per account, accounts in parallel.
+ * accounts?: { [orderId]: email }, email?: string, dryRun?: boolean }. Answers
+ * at once with what was queued and what was refused; the units are cancelled by
+ * the worker (order-cancel queue), one account at a time per account, accounts
+ * in parallel. An Order ID never fetched into Order Units is read from Flipkart
+ * first through the Platform ID named for it (`accounts`, else `email`).
  */
 orderFetchRouter.post("/cancel", async (req, res) => {
   try {
@@ -221,9 +223,17 @@ orderFetchRouter.post("/cancel", async (req, res) => {
       res.status(400).json({ error: 'type must be "unit" or "order"' });
       return;
     }
+    const accounts: Record<string, string> = {};
+    if (req.body?.accounts && typeof req.body.accounts === "object") {
+      for (const [orderId, email] of Object.entries(req.body.accounts as Record<string, unknown>)) {
+        if (String(email || "").trim()) accounts[orderId] = String(email).trim().toLowerCase();
+      }
+    }
     const result = await requestCancellation(userIdFrom(req), {
       type,
       ids: parseIds(req.body?.ids),
+      accounts,
+      email: String(req.body?.email || "").trim().toLowerCase(),
       dryRun: req.body?.dryRun === true,
     });
     res.status(202).json(result);

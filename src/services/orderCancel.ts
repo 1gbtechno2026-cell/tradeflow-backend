@@ -7,9 +7,12 @@ import { fullOrderId } from "../automation/PaymentApiWatcher.js";
 import { config } from "../config.js";
 import { CancelRequest, type CancelUnitStatus, type ICancelUnit } from "../models/CancelRequest.js";
 import { Order } from "../models/Order.js";
+import type { APIRequestContext } from "playwright";
 import { getCancelQueue, type CancelJobData } from "../queue.js";
 import { blockFlipkartLogout, desktopContext, launchStealthBrowser, restoreFlipkartSession } from "./browser.js";
 import { lockAccount } from "./accountLock.js";
+import { fetchOrderDetails, mapApiUnitToOrder, openOrderApiSession } from "./orderApi.js";
+import { fallbackUnitId, saveMappedUnit, type OrderAccount } from "./orderFetch.js";
 import { claimProxyForWorker } from "./proxyPool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
 
@@ -19,6 +22,10 @@ import { resolveLoggedInSession } from "./sessionStore.js";
  *
  *   requestCancellation  resolve the typed ids to Order rows, reject what cannot
  *                        be cancelled, mark the rest queued, one job per account
+ *   pullUnknownOrders    an Order ID that was never fetched, when the caller
+ *                        names the Platform ID that placed it: read that one
+ *                        order through Flipkart's order API (every unit) and
+ *                        save it, so the cancel can go ahead without a Fetch
  *   runCancelJob         (worker) one browser per account, its units in turn,
  *                        each through FlipkartCancel, each result onto both the
  *                        CancelRequest and the Order row
@@ -32,12 +39,80 @@ const TERMINAL = /deliver|cancel|return|refund|fail/i;
 const IN_FLIGHT = new Set(["queued", "running"]);
 /** The account is busy (checkout, sync or another cancel) — try again after this. */
 const LOCK_RETRY_MS = 20_000;
+/** Unknown orders are read inside the request; keep that to seconds, not minutes. */
+const MAX_PULLED_ORDERS = 50;
 
 export interface CancelRequestInput {
   type: "unit" | "order";
   ids: string[];
+  /** Platform ID (email) per Order ID, for orders never fetched into Order Units. */
+  accounts?: Record<string, string>;
+  /** Platform ID (email) for every unknown Order ID not named in `accounts`. */
+  email?: string;
   /** Walk to REQUEST CANCELLATION and stop. For testing the path on a real unit. */
   dryRun?: boolean;
+}
+
+const NEEDS_EMAIL = "Not found in Order Units — add the Platform ID (email) that placed it, or fetch the account's orders first";
+
+/**
+ * Read the given orders from Flipkart through the named accounts and save
+ * every unit of each, exactly as a Fetch would (same mapper, same row shape,
+ * `applyCalendar: false` so the since-date window never drops one). Returns a
+ * reason per order that could not be read; the rest are now in Order Units.
+ */
+async function pullUnknownOrders(userId: string, orderIds: string[], emailFor: (orderId: string) => string) {
+  const errors = new Map<string, string>();
+  const byEmail = new Map<string, string[]>();
+  for (const orderId of orderIds) {
+    const email = emailFor(orderId);
+    if (!email) errors.set(orderId, NEEDS_EMAIL);
+    else if (byEmail.size >= MAX_PULLED_ORDERS) errors.set(orderId, `At most ${MAX_PULLED_ORDERS} unfetched orders per request — fetch the account's orders instead`);
+    else byEmail.set(email, [...(byEmail.get(email) || []), orderId]);
+  }
+
+  for (const [email, list] of byEmail) {
+    const session = await resolveLoggedInSession(email);
+    if (!session.ok) {
+      for (const orderId of list) errors.set(orderId, `${email}: ${session.reason} — re-login this ID`);
+      continue;
+    }
+    const account: OrderAccount = { id: new Types.ObjectId(session.platformId), email: session.email, cookies: session.cookies };
+    let ctx: APIRequestContext | null = null;
+    try {
+      ctx = await openOrderApiSession(session.cookies);
+      for (const orderId of list) {
+        try {
+          // The details page answers for any unit id of the order; the first
+          // call (guessed id) tells us the real unit ids, then one call per unit
+          // so each row carries its own tracking and money, as a Fetch does.
+          const first = await fetchOrderDetails(ctx, orderId, fallbackUnitId(orderId));
+          const unitIds = Object.keys(first.orderView.units || {});
+          if (!unitIds.length) {
+            errors.set(orderId, `${email}: Flipkart shows no units for this order on this Platform ID — is it the account that placed it?`);
+            continue;
+          }
+          for (const unitId of unitIds) {
+            const view = unitId === fallbackUnitId(orderId) ? first.orderView : (await fetchOrderDetails(ctx, orderId, unitId)).orderView;
+            await saveMappedUnit(userId, account, mapApiUnitToOrder(view, unitId), { applyCalendar: false });
+          }
+          console.log(`[cancel] pulled ${orderId} (${unitIds.length} unit${unitIds.length === 1 ? "" : "s"}) via ${email} for cancellation`);
+        } catch (err) {
+          const raw = (err instanceof Error ? err.message : String(err)).split("\n")[0];
+          // The details page comes back without an order view when this account
+          // never placed that order — say that, not the widget names.
+          const reason = /carried neither/.test(raw) ? "Flipkart shows no such order on this Platform ID — is it the account that placed it?" : raw.slice(0, 200);
+          errors.set(orderId, `${email}: ${reason}`);
+        }
+      }
+    } catch (err) {
+      const reason = (err instanceof Error ? err.message : String(err)).split("\n")[0].slice(0, 200);
+      for (const orderId of list) if (!errors.has(orderId)) errors.set(orderId, `${email}: ${reason}`);
+    } finally {
+      await ctx?.dispose().catch(() => undefined);
+    }
+  }
+  return errors;
 }
 
 function normaliseIds(type: "unit" | "order", ids: string[]): string[] {
@@ -55,19 +130,35 @@ export async function requestCancellation(userId: string, input: CancelRequestIn
   if (!ids.length) throw new Error(type === "unit" ? "Paste at least one Unit ID" : "Paste at least one Order ID");
   if (ids.length > 2000) throw new Error("At most 2000 ids per request");
 
-  const rows = await Order.find({
-    userId,
-    ...(type === "unit" ? { unit_id: { $in: ids } } : { order_id: { $in: ids } }),
-  })
-    .select("platform platform_email order_id unit_id item_id product_name status_key cancel_status")
-    .lean();
+  const select = "platform platform_email order_id unit_id item_id product_name status_key cancel_status";
+  const find = (list: string[]) =>
+    Order.find({ userId, ...(type === "unit" ? { unit_id: { $in: list } } : { order_id: { $in: list } }) })
+      .select(select)
+      .lean();
+  let rows = await find(ids);
+
+  // Order IDs we have never fetched: read them from Flipkart now when the
+  // caller says which Platform ID placed them, then look again.
+  const pullErrors = new Map<string, string>();
+  if (type === "order") {
+    const known = new Set(rows.map((r) => r.order_id));
+    const unknown = ids.filter((id) => !known.has(id));
+    if (unknown.length) {
+      const named = new Map(Object.entries(input.accounts || {}).map(([k, v]) => [fullOrderId(String(k).trim().toUpperCase()), String(v || "").trim().toLowerCase()]));
+      const fallback = String(input.email || "").trim().toLowerCase();
+      const errors = await pullUnknownOrders(userId, unknown, (orderId) => named.get(orderId) || fallback);
+      for (const [id, reason] of errors) pullErrors.set(id, reason);
+      const pulled = unknown.filter((id) => !errors.has(id));
+      if (pulled.length) rows = [...rows, ...(await find(pulled))];
+    }
+  }
 
   const rejected: Array<{ id: string; reason: string }> = [];
   const units: ICancelUnit[] = [];
   for (const id of ids) {
     const matches = rows.filter((r) => (type === "unit" ? r.unit_id === id : r.order_id === id));
     if (!matches.length) {
-      rejected.push({ id, reason: "Not found in Order Units — fetch the account's orders first" });
+      rejected.push({ id, reason: pullErrors.get(id) || (type === "order" ? NEEDS_EMAIL : "Not found in Order Units — fetch the account's orders first") });
       continue;
     }
     for (const r of matches) {

@@ -26,6 +26,10 @@ export interface ICancelRequest {
   type: "unit" | "order";
   input: string[];
   dryRun: boolean;
+  /** Dashboard user who submitted it (shown in the Cancellations history). */
+  createdBy: string;
+  /** Set when this request was made by "Retry failed" on another one. */
+  retryOf: string;
   status: "queued" | "running" | "done";
   units: ICancelUnit[];
   rejected: Array<{ id: string; reason: string }>;
@@ -55,6 +59,8 @@ const CancelRequestSchema = new Schema<ICancelRequest>(
     type: { type: String, enum: ["unit", "order"], required: true },
     input: { type: [String], default: [] },
     dryRun: { type: Boolean, default: false },
+    createdBy: { type: String, default: "" },
+    retryOf: { type: String, default: "" },
     status: { type: String, enum: ["queued", "running", "done"], default: "queued" },
     units: { type: [UnitSchema], default: [] },
     rejected: { type: [new Schema({ id: String, reason: String }, { _id: false })], default: [] },

@@ -10,6 +10,11 @@ export interface IOrderSyncSettings {
   fetchMode: "scrape" | "api";
   changedBy: string;
   changedAt: Date | null;
+  /** Cancel speed (services/orderCancel.ts): Chrome windows at once (accounts in parallel) and tabs per window (units of one account in parallel). 0 = not set, env/default applies. */
+  cancelWindows: number;
+  cancelTabs: number;
+  cancelChangedBy: string;
+  cancelChangedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -17,9 +22,13 @@ export interface IOrderSyncSettings {
 const OrderSyncSettingsSchema = new Schema<IOrderSyncSettings>(
   {
     userId: { type: Schema.Types.ObjectId, required: true, unique: true },
-    fetchMode: { type: String, enum: ["scrape", "api"], required: true },
+    fetchMode: { type: String, enum: ["scrape", "api"] },
     changedBy: { type: String, default: "" },
     changedAt: { type: Date, default: null },
+    cancelWindows: { type: Number, default: 0 },
+    cancelTabs: { type: Number, default: 0 },
+    cancelChangedBy: { type: String, default: "" },
+    cancelChangedAt: { type: Date, default: null },
   },
   { timestamps: true, collection: "order_sync_settings" }
 );

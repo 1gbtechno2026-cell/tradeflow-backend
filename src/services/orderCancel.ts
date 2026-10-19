@@ -7,7 +7,8 @@ import { fullOrderId } from "../automation/PaymentApiWatcher.js";
 import { config } from "../config.js";
 import { CancelRequest, type CancelUnitStatus, type ICancelUnit } from "../models/CancelRequest.js";
 import { Order } from "../models/Order.js";
-import type { APIRequestContext } from "playwright";
+import type { APIRequestContext, Page } from "playwright";
+import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
 import { getCancelQueue, type CancelJobData } from "../queue.js";
 import { blockFlipkartLogout, desktopContext, launchStealthBrowser, restoreFlipkartSession } from "./browser.js";
 import { lockAccount } from "./accountLock.js";
@@ -37,6 +38,8 @@ import { resolveLoggedInSession } from "./sessionStore.js";
 
 const TERMINAL = /deliver|cancel|return|refund|fail/i;
 const IN_FLIGHT = new Set(["queued", "running"]);
+/** Errors worth one more go in the same browser. */
+const TRANSIENT = /timeout|timed out|net::|ECONN|ETIMEDOUT|EAI_AGAIN|socket hang up|proxy|Target (page|context|browser).*closed|has been closed|navigation/i;
 /** The account is busy (checkout, sync or another cancel) — try again after this. */
 const LOCK_RETRY_MS = 20_000;
 /** Unknown orders are read inside the request; keep that to seconds, not minutes. */
@@ -51,6 +54,73 @@ export interface CancelRequestInput {
   email?: string;
   /** Walk to REQUEST CANCELLATION and stop. For testing the path on a real unit. */
   dryRun?: boolean;
+  /** Dashboard user submitting the request. */
+  by?: string;
+  /** The request this one retries the failed units of. */
+  retryOf?: string;
+}
+
+/** Seconds one unit takes in the cancel browser, from measured runs. */
+export const SECONDS_PER_UNIT = 6.5;
+/** How many accounts the cancel worker drives at once when nothing is saved (worker.ts). */
+export function cancelConcurrency() {
+  const env = Number(process.env.CANCEL_CONCURRENCY);
+  return Number.isFinite(env) && env > 0 ? Math.floor(env) : Math.max(1, config.workerConcurrency);
+}
+
+/**
+ * Cancel speed. `windows` = Chrome windows at once = accounts cancelled in
+ * parallel (the BullMQ concurrency; the worker follows changes within 10 s).
+ * `tabs` = tabs per window = units of ONE account cancelled in parallel, each
+ * tab its own FlipkartCancel on the same logged-in context. Units in flight =
+ * windows × tabs; each window is a Chrome (~400 MB), so the caps are about
+ * the machine, and tabs are capped low so one account never hammers Flipkart.
+ */
+export const SPEED_LIMITS = { windows: { min: 1, max: 6 }, tabs: { min: 1, max: 4 } } as const;
+
+export interface CancelSpeed {
+  windows: number;
+  tabs: number;
+  source: "ui" | "env";
+  changedBy: string;
+  changedAt: Date | null;
+  limits: typeof SPEED_LIMITS;
+  secondsPerUnit: number;
+}
+
+function clampSpeed(value: unknown, limit: { min: number; max: number }): number | null {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.max(limit.min, Math.min(limit.max, n));
+}
+
+export async function resolveCancelSpeed(userId: string): Promise<CancelSpeed> {
+  const row = Types.ObjectId.isValid(userId) ? await OrderSyncSettings.findOne({ userId }).lean().catch(() => null) : null;
+  const windows = clampSpeed(row?.cancelWindows, SPEED_LIMITS.windows);
+  const tabs = clampSpeed(row?.cancelTabs, SPEED_LIMITS.tabs);
+  return {
+    windows: windows ?? Math.min(SPEED_LIMITS.windows.max, cancelConcurrency()),
+    tabs: tabs ?? 1,
+    source: windows || tabs ? "ui" : "env",
+    changedBy: row?.cancelChangedBy || "",
+    changedAt: row?.cancelChangedAt ?? null,
+    limits: SPEED_LIMITS,
+    secondsPerUnit: SECONDS_PER_UNIT,
+  };
+}
+
+export async function setCancelSpeed(userId: string, input: { windows?: unknown; tabs?: unknown }, by: string): Promise<CancelSpeed> {
+  const current = await resolveCancelSpeed(userId);
+  const windows = input.windows === undefined ? current.windows : clampSpeed(input.windows, SPEED_LIMITS.windows);
+  const tabs = input.tabs === undefined ? current.tabs : clampSpeed(input.tabs, SPEED_LIMITS.tabs);
+  if (!windows || !tabs) throw new Error(`windows must be ${SPEED_LIMITS.windows.min}–${SPEED_LIMITS.windows.max} and tabs ${SPEED_LIMITS.tabs.min}–${SPEED_LIMITS.tabs.max}`);
+  await OrderSyncSettings.updateOne(
+    { userId },
+    { $set: { cancelWindows: windows, cancelTabs: tabs, cancelChangedBy: by || "", cancelChangedAt: new Date() }, $setOnInsert: { userId } },
+    { upsert: true }
+  );
+  console.log(`[cancel] speed ${current.windows}×${current.tabs} → ${windows}×${tabs} (windows × tabs) by ${by || "dashboard"}`);
+  return resolveCancelSpeed(userId);
 }
 
 const NEEDS_EMAIL = "Not found in Order Units — add the Platform ID (email) that placed it, or fetch the account's orders first";
@@ -153,12 +223,53 @@ export async function requestCancellation(userId: string, input: CancelRequestIn
     }
   }
 
+  const { units, rejected } = classify(type, ids, rows, (id) => pullErrors.get(id));
+
+  const request = await CancelRequest.create({
+    userId: new Types.ObjectId(userId),
+    type,
+    input: ids,
+    dryRun: Boolean(input.dryRun),
+    createdBy: String(input.by || "").trim(),
+    retryOf: String(input.retryOf || ""),
+    status: units.length ? "queued" : "done",
+    units,
+    rejected,
+    finishedAt: units.length ? null : new Date(),
+  });
+  const requestId = String(request._id);
+
+  if (units.length) {
+    await Order.updateMany(
+      { userId, unit_id: { $in: units.map((u) => u.unitId) } },
+      {
+        $set: {
+          cancel_status: "queued",
+          cancel_request_id: requestId,
+          cancel_requested_at: new Date(),
+          cancel_requested_by: String(input.by || "").trim(),
+          cancel_error: "",
+        },
+      }
+    );
+    const emails = [...new Set(units.map((u) => u.email))];
+    const queue = getCancelQueue();
+    await queue.addBulk(emails.map((email) => ({ name: "cancel", data: { requestId, email }, opts: { jobId: `${requestId}-${email}` } })));
+  }
+
+  return publicRequest(request.toObject());
+}
+
+type KnownRow = { platform?: string; platform_email: string; order_id: string; unit_id: string; item_id?: string; product_name?: string; status_key?: string; cancel_status?: string };
+
+/** The typed ids against the Order rows: what will be queued and what is refused, with the reason. */
+function classify(type: "unit" | "order", ids: string[], rows: KnownRow[], reasonFor: (id: string) => string | undefined) {
   const rejected: Array<{ id: string; reason: string }> = [];
   const units: ICancelUnit[] = [];
   for (const id of ids) {
     const matches = rows.filter((r) => (type === "unit" ? r.unit_id === id : r.order_id === id));
     if (!matches.length) {
-      rejected.push({ id, reason: pullErrors.get(id) || (type === "order" ? NEEDS_EMAIL : "Not found in Order Units — fetch the account's orders first") });
+      rejected.push({ id, reason: reasonFor(id) || (type === "order" ? NEEDS_EMAIL : "Not found in Order Units — fetch the account's orders first") });
       continue;
     }
     for (const r of matches) {
@@ -184,30 +295,57 @@ export async function requestCancellation(userId: string, input: CancelRequestIn
       }
     }
   }
+  return { units, rejected };
+}
 
-  const request = await CancelRequest.create({
-    userId: new Types.ObjectId(userId),
+/**
+ * What a request would do, without doing it: nothing is queued and unknown
+ * orders are not pulled. For the popup's confirmation line.
+ */
+export async function previewCancellation(userId: string, input: CancelRequestInput) {
+  const type = input.type === "unit" ? "unit" : "order";
+  const ids = normaliseIds(type, input.ids);
+  if (!ids.length) throw new Error(type === "unit" ? "Paste at least one Unit ID" : "Paste at least one Order ID");
+  if (ids.length > 2000) throw new Error("At most 2000 ids per request");
+  const rows: KnownRow[] = await Order.find({ userId, ...(type === "unit" ? { unit_id: { $in: ids } } : { order_id: { $in: ids } }) })
+    .select("platform platform_email order_id unit_id item_id product_name status_key cancel_status")
+    .lean();
+  const known = new Set(rows.map((r) => (type === "unit" ? r.unit_id : r.order_id)));
+  const unknown = ids.filter((id) => !known.has(id));
+  const named = new Map(Object.entries(input.accounts || {}).map(([k, v]) => [fullOrderId(String(k).trim().toUpperCase()), String(v || "").trim().toLowerCase()]));
+  const fallback = String(input.email || "").trim().toLowerCase();
+  const withEmail = type === "order" ? unknown.filter((id) => named.get(id) || fallback) : [];
+  const { units, rejected } = classify(type, ids.filter((id) => known.has(id)), rows, () => undefined);
+  const reasons: Record<string, number> = {};
+  for (const r of rejected) reasons[r.reason] = (reasons[r.reason] || 0) + 1;
+  const accounts = new Set(units.map((u) => u.email)).size;
+  const speed = await resolveCancelSpeed(userId);
+  return {
     type,
-    input: ids,
-    dryRun: Boolean(input.dryRun),
-    status: units.length ? "queued" : "done",
-    units,
-    rejected,
-    finishedAt: units.length ? null : new Date(),
-  });
-  const requestId = String(request._id);
+    ids: ids.length,
+    units: units.length,
+    orders: new Set(units.map((u) => u.orderId)).size,
+    accounts,
+    unknownWithEmail: withEmail.length,
+    unknownNeedingEmail: unknown.length - withEmail.length,
+    rejected: rejected.length,
+    reasons,
+    windows: speed.windows,
+    tabs: speed.tabs,
+    concurrency: speed.windows,
+    // Accounts in parallel up to `windows`, each account's units in parallel up to `tabs`.
+    estimateSeconds: Math.ceil((units.length * SECONDS_PER_UNIT) / Math.max(1, Math.min(accounts || 1, speed.windows) * speed.tabs)) + withEmail.length,
+  };
+}
 
-  if (units.length) {
-    await Order.updateMany(
-      { userId, unit_id: { $in: units.map((u) => u.unitId) } },
-      { $set: { cancel_status: "queued", cancel_request_id: requestId, cancel_requested_at: new Date(), cancel_error: "" } }
-    );
-    const emails = [...new Set(units.map((u) => u.email))];
-    const queue = getCancelQueue();
-    await queue.addBulk(emails.map((email) => ({ name: "cancel", data: { requestId, email }, opts: { jobId: `${requestId}-${email}` } })));
-  }
-
-  return publicRequest(request.toObject());
+/** A new request made of the failed units of an earlier one. Flipkart's refusals (not_cancellable) are not retried. */
+export async function retryCancelRequest(userId: string, requestId: string, by: string) {
+  if (!Types.ObjectId.isValid(requestId)) return null;
+  const row = await CancelRequest.findOne({ _id: requestId, userId }).lean();
+  if (!row) return null;
+  const failed = row.units.filter((u) => u.status === "failed").map((u) => u.unitId);
+  if (!failed.length) throw new Error("Nothing to retry — this request has no failed units");
+  return requestCancellation(userId, { type: "unit", ids: failed, dryRun: row.dryRun, by, retryOf: requestId });
 }
 
 export async function getCancelRequest(userId: string, requestId: string) {
@@ -221,10 +359,12 @@ export async function listCancelRequests(userId: string, limit = 20) {
   return rows.map(publicRequest);
 }
 
-function publicRequest(r: {
+export function publicRequest(r: {
   _id: unknown;
   type: string;
   dryRun?: boolean;
+  createdBy?: string;
+  retryOf?: string;
   status: string;
   units: ICancelUnit[];
   rejected: Array<{ id: string; reason: string }>;
@@ -236,6 +376,8 @@ function publicRequest(r: {
     id: String(r._id),
     type: r.type,
     dryRun: Boolean(r.dryRun),
+    createdBy: r.createdBy || "",
+    retryOf: r.retryOf || "",
     status: r.status,
     createdAt: r.createdAt ?? null,
     finishedAt: r.finishedAt ?? null,
@@ -323,43 +465,71 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
     const egress = await claimProxyForWorker(config.workerId).catch(() => null);
     const browser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
     const artifactDir = path.resolve("debug/cancel-runs", requestId);
+    const speed = await resolveCancelSpeed(String(request.userId)).catch(() => null);
+    const tabs = Math.max(1, Math.min(speed?.tabs || 1, units.length));
     try {
       const ctx = await desktopContext(browser);
-      const page = await ctx.newPage();
-      await blockFlipkartLogout(page);
-      await restoreFlipkartSession(page, session.cookies);
-      const flow = new FlipkartCancel(page, (_lvl, msg) => log(msg));
+      const first = await ctx.newPage();
+      await blockFlipkartLogout(first);
+      await restoreFlipkartSession(first, session.cookies);
+      // More tabs share the context (and so the login); each runs its own flow.
+      const pages: Page[] = [first];
+      for (let i = 1; i < tabs; i++) {
+        const p = await ctx.newPage();
+        await blockFlipkartLogout(p);
+        pages.push(p);
+      }
+      if (tabs > 1) log(`${units.length} units across ${tabs} tabs`);
 
-      for (const u of units) {
-        await setUnit(requestId, u.unitId, { status: "running", startedAt: new Date() });
-        await Order.updateOne({ userId: request.userId, unit_id: u.unitId }, { $set: { cancel_status: "running" } });
-        let lastStep = "";
-        try {
-          const outcome: CancelOutcome = await flow.cancelUnit(
-            { orderId: u.orderId, unitId: u.unitId, itemId: u.itemId },
-            { dryRun: request.dryRun, onStep: async (name) => void (lastStep = name) }
-          );
-          const note = "feeNote" in outcome && outcome.feeNote ? ` — fee: ${outcome.feeNote}` : "";
-          if (outcome.kind === "cancelled") {
-            await finish(u, "cancelled", `${outcome.message}${outcome.refundTat ? ` · ${outcome.refundTat}` : ""}${note}`);
-          } else if (outcome.kind === "dry_run") {
-            await finish(u, "dry_run", `${outcome.message}${note}`);
-          } else {
-            await finish(u, "not_cancellable", outcome.message);
+      const pending = [...units];
+      let sessionDead = false;
+      const runTab = async (page: Page) => {
+        const flow = new FlipkartCancel(page, (_lvl, msg) => log(msg));
+        for (;;) {
+          const u = pending.shift();
+          if (!u) return;
+          if (sessionDead) {
+            await finish(u, "failed", "Session expired — re-login this ID");
+            continue;
           }
-        } catch (err) {
-          const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
-          // The page it broke on, for the next person reading this failure.
-          fs.mkdirSync(artifactDir, { recursive: true });
-          const base = path.join(artifactDir, `${u.unitId}-${lastStep || "start"}`);
-          await page.screenshot({ path: `${base}.png`, fullPage: true }).catch(() => undefined);
-          await finish(u, "failed", message.slice(0, 500));
-          if (/SESSION_EXPIRED/.test(message)) {
-            for (const rest of units.slice(units.indexOf(u) + 1)) await finish(rest, "failed", "Session expired — re-login this ID");
-            break;
+          await setUnit(requestId, u.unitId, { status: "running", startedAt: new Date() });
+          await Order.updateOne({ userId: request.userId, unit_id: u.unitId }, { $set: { cancel_status: "running" } });
+          let lastStep = "";
+          try {
+            // One automatic retry for network-class trouble (timeouts, proxy,
+            // a closed target); never for an expired session or Flipkart's answer.
+            const attempt = () =>
+              flow.cancelUnit({ orderId: u.orderId, unitId: u.unitId, itemId: u.itemId }, { dryRun: request.dryRun, onStep: async (name) => void (lastStep = name) });
+            let outcome: CancelOutcome;
+            try {
+              outcome = await attempt();
+            } catch (first) {
+              const text = first instanceof Error ? first.message : String(first);
+              if (!TRANSIENT.test(text) || /SESSION_EXPIRED/.test(text)) throw first;
+              log(`${u.orderId}/${u.unitId} ${text.split("\n")[0].slice(0, 120)} — retrying once`);
+              outcome = await attempt();
+            }
+            const note = "feeNote" in outcome && outcome.feeNote ? ` — fee: ${outcome.feeNote}` : "";
+            if (outcome.kind === "cancelled") {
+              await finish(u, "cancelled", `${outcome.message}${outcome.refundTat ? ` · ${outcome.refundTat}` : ""}${note}`);
+            } else if (outcome.kind === "dry_run") {
+              await finish(u, "dry_run", `${outcome.message}${note}`);
+            } else {
+              await finish(u, "not_cancellable", outcome.message);
+            }
+          } catch (err) {
+            const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+            // The page it broke on, for the next person reading this failure.
+            fs.mkdirSync(artifactDir, { recursive: true });
+            const base = path.join(artifactDir, `${u.unitId}-${lastStep || "start"}`);
+            await page.screenshot({ path: `${base}.png`, fullPage: true }).catch(() => undefined);
+            await finish(u, "failed", message.slice(0, 500));
+            // Every tab shares the login: once it is gone, the rest are failed, not attempted.
+            if (/SESSION_EXPIRED/.test(message)) sessionDead = true;
           }
         }
-      }
+      };
+      await Promise.all(pages.map((p) => runTab(p)));
     } finally {
       await browser.close().catch(() => undefined);
     }

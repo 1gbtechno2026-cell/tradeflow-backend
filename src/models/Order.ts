@@ -83,6 +83,8 @@ export interface IOrder {
   cancel_status: string;
   cancel_request_id: string;
   cancel_requested_at: Date | null;
+  /** Dashboard user who asked for the cancellation. */
+  cancel_requested_by: string;
   cancel_error: string;
   refund_status: string | null;
   refund_amount: string | null;
@@ -197,6 +199,7 @@ const OrderSchema = new Schema<IOrder>(
     cancel_status: { type: String, default: "" },
     cancel_request_id: { type: String, default: "" },
     cancel_requested_at: { type: Date, default: null },
+    cancel_requested_by: { type: String, default: "" },
     cancel_error: { type: String, default: "" },
     refund_status: { type: String, default: null },
     refund_amount: { type: String, default: null },

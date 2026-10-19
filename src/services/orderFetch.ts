@@ -1189,7 +1189,6 @@ export async function saveMappedUnit(
         is_bae_order: false,
         is_invoice_downloaded: false,
         invoice_path: "",
-        cancelled_from_bae: false,
         imei: null,
         ...(await cardFieldsFor(userId, account.email, mapped.order_id).catch(() => ({}))),
         fetch_source: "api",
@@ -1198,6 +1197,8 @@ export async function saveMappedUnit(
         ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
         last_error: "",
       },
+      // Set by the cancel worker when the dashboard cancelled this unit; a later Update must not clear it.
+      $setOnInsert: { cancelled_from_bae: false },
     },
     { upsert: true }
   );
@@ -2060,7 +2061,6 @@ export async function scrapeAndSave(
           ? (String(pageData.pageText || "").match(/Total refund[^.!]{0,80}/i) || [null])[0]
           : null,
         cancelled_date: cancelledAt ? new Date(cancelledAt) : cancelled ? orderDate : null,
-        cancelled_from_bae: false,
         cancelled_by_user: /as per your request|cancelled by you|you cancelled/i.test(
           `${trackingText} ${pageData.pageText || ""}`
         ),
@@ -2074,6 +2074,8 @@ export async function scrapeAndSave(
         ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
         last_error: "",
       },
+      // Set by the cancel worker when the dashboard cancelled this unit; a later Update must not clear it.
+      $setOnInsert: { cancelled_from_bae: false },
     },
     { upsert: true }
   );

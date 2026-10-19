@@ -9,7 +9,7 @@ import {
   startOrderFetch,
   stopOrderFetch,
 } from "../services/orderFetch.js";
-import { getCancelRequest, listCancelRequests, requestCancellation } from "../services/orderCancel.js";
+import { getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import {
   getOrderUpdateJob,
   startOrderUpdate,
@@ -235,6 +235,7 @@ orderFetchRouter.post("/cancel", async (req, res) => {
       accounts,
       email: String(req.body?.email || "").trim().toLowerCase(),
       dryRun: req.body?.dryRun === true,
+      by: String(req.body?.by || "").trim(),
     });
     res.status(202).json(result);
   } catch (err) {
@@ -242,9 +243,57 @@ orderFetchRouter.post("/cancel", async (req, res) => {
   }
 });
 
+/** Same body as POST /cancel; answers what it would queue / refuse, with an ETA. Nothing is written. */
+orderFetchRouter.post("/cancel/preview", async (req, res) => {
+  try {
+    const type = String(req.body?.type || "").toLowerCase();
+    if (type !== "unit" && type !== "order") {
+      res.status(400).json({ error: 'type must be "unit" or "order"' });
+      return;
+    }
+    const accounts: Record<string, string> = {};
+    if (req.body?.accounts && typeof req.body.accounts === "object") {
+      for (const [orderId, email] of Object.entries(req.body.accounts as Record<string, unknown>)) {
+        if (String(email || "").trim()) accounts[orderId] = String(email).trim().toLowerCase();
+      }
+    }
+    res.json(await previewCancellation(userIdFrom(req), { type, ids: parseIds(req.body?.ids), accounts, email: String(req.body?.email || "").trim().toLowerCase() }));
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not preview the cancellation" });
+  }
+});
+
+/** A new request from the failed units of :id. Body: { by?: string, userId?: string }. */
+orderFetchRouter.post("/cancel/:id/retry", async (req, res) => {
+  try {
+    const result = await retryCancelRequest(userIdFrom(req), req.params.id, String(req.body?.by || "").trim());
+    if (!result) {
+      res.status(404).json({ error: "Cancel request not found" });
+      return;
+    }
+    res.status(202).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not retry the cancellation" });
+  }
+});
+
 orderFetchRouter.get("/cancel", async (req, res) => {
   const userId = String(req.query.userId || "").trim() || workspaceUserId();
   res.json({ requests: await listCancelRequests(userId, Number(req.query.limit) || 20) });
+});
+
+/** Cancel speed: { windows, tabs, source, changedBy, changedAt, limits }. PUT body: { windows?, tabs?, by? }. Applies to the next job, no restart. */
+orderFetchRouter.get("/cancel/settings", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  res.json(await resolveCancelSpeed(userId));
+});
+
+orderFetchRouter.put("/cancel/settings", async (req, res) => {
+  try {
+    res.json(await setCancelSpeed(userIdFrom(req), { windows: req.body?.windows, tabs: req.body?.tabs }, String(req.body?.by || "").trim()));
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not save the cancel speed" });
+  }
 });
 
 orderFetchRouter.get("/cancel/:id", async (req, res) => {

@@ -4,7 +4,7 @@ import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createSyncWorke
 import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
-import { runCancelJob } from "./services/orderCancel.js";
+import { resolveCancelSpeed, runCancelJob } from "./services/orderCancel.js";
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
 
 /**
@@ -110,6 +110,19 @@ async function main() {
       console.error(`[worker] FAILED ${CANCEL_QUEUE} job=${job?.id}:`, err.message);
     });
     cancelWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${CANCEL_QUEUE}):`, err.message));
+    // The dashboard's cancel speed (windows = accounts at once) applies to the
+    // next job without a restart; tabs per window are read per job.
+    let windows = cancelConcurrency;
+    const follow = async () => {
+      const speed = await resolveCancelSpeed(config.userId).catch(() => null);
+      if (speed && speed.windows !== windows) {
+        console.log(`[worker] cancel windows ${windows} → ${speed.windows} (${speed.source}${speed.changedBy ? `, ${speed.changedBy}` : ""})`);
+        cancelWorker.concurrency = speed.windows;
+        windows = speed.windows;
+      }
+    };
+    void follow();
+    setInterval(() => void follow(), 10_000).unref();
     names.push([CANCEL_QUEUE, cancelConcurrency]);
   }
   // Order sync: finished checkouts' orders into Order Units, plus the sweep.

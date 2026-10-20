@@ -909,9 +909,13 @@ function parseTracking(raw: string): ITrackingStage[] {
     const [statusRaw, rest = ""] = chunk.split("|||");
     const status = statusRaw.replace(/\s+/g, " ").trim().replace(/^Out For Delivery$/i, "Out for delivery");
     if (!status) continue;
-    const pending = /^(Refund|Delivery Expected)$/i.test(status) || /expected by/i.test(rest);
     const body = rest.replace(/\s+/g, " ").trim();
     const steps = parseStepsFromBody(body, status);
+    // A stage is pending when it is a promise ("Delivery Expected", "Refund",
+    // or only an "expected by" line) — not when it already carries dated steps.
+    // Flipkart writes "expected by …" under a Shipped stage whose steps say
+    // "picked up" / "arrived at facility"; that unit is shipped, not confirmed.
+    const pending = /^(Refund|Delivery Expected)$/i.test(status) || (/expected by/i.test(rest) && !steps.some((s) => s.progress.some((p) => p.date)));
     const stageDate = bestDateTime(body) || (steps[0]?.progress[0]?.date ? new Date(steps[0].progress[0].date) : null);
     if (!steps.length && stageDate) {
       steps.push({
@@ -2001,7 +2005,10 @@ export async function scrapeAndSave(
           ? "Returned"
           : refunded
             ? "Refunded"
-            : current?.status || "";
+            : // The header says "Out For Delivery" before the timeline gets its stage.
+              /out for delivery/i.test(String(pageData.deliveryMessage || "")) && !/^(delivered|cancelled)$/i.test(String(current?.status || ""))
+              ? "Out for delivery"
+              : current?.status || "";
   const statusLabel = failed
     ? failState?.status_label || "Order not placed"
     : delivered

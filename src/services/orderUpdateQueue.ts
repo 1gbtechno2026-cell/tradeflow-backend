@@ -12,6 +12,7 @@ import { blockFlipkartLogout, closeBrowser, flipkartLoginUrl, launchStealthConte
 import { openOrderApiSession, OrderApiSessionError } from "./orderApi.js";
 import { apiScrapeAndSave, scrapeAndSave, type OrderAccount } from "./orderFetch.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
+import { stageOf } from "./orderLifecycle.js";
 import { resolveTargets, type UpdateTriggerInput } from "./orderUpdate.js";
 import { resolveLoggedInSession, workspaceUserId } from "./sessionStore.js";
 
@@ -83,6 +84,7 @@ export async function createUpdateRequest(userId: string, input: UpdateTriggerIn
       email: key,
       platformId: t.account.id,
       units: [],
+      total: 0,
       status: "queued" as const,
       done: 0,
       failed: 0,
@@ -94,6 +96,7 @@ export async function createUpdateRequest(userId: string, input: UpdateTriggerIn
       finishedAt: null,
     };
     acc.units.push({ orderId: t.card.orderId, itemId: t.card.itemId || "", unitId: t.card.unitId, orderUrl: t.card.orderUrl || "" });
+    acc.total = acc.units.length;
     byAccount.set(key, acc);
   }
   const [mode, speed] = await Promise.all([resolveOrderFetchMode(userId), resolveUpdateWindows(userId)]);
@@ -151,7 +154,8 @@ export async function listUpdateRequests(userId: string, limit = 20) {
 
 export function publicUpdateRequest(r: Partial<IOrderUpdateRequest> & { _id: unknown }) {
   const accounts = r.accounts || [];
-  const total = accounts.reduce((n, a) => n + (a.units?.length ?? 0), 0);
+  const unitsOf = (a: IUpdateAccount) => (a.total || a.units?.length || 0);
+  const total = accounts.reduce((n, a) => n + unitsOf(a), 0);
   const done = accounts.reduce((n, a) => n + a.done, 0);
   const failed = accounts.reduce((n, a) => n + a.failed, 0);
   const statusChanged = accounts.reduce((n, a) => n + (a.statusChanged || 0), 0);
@@ -178,14 +182,14 @@ export function publicUpdateRequest(r: Partial<IOrderUpdateRequest> & { _id: unk
       units: total,
       done,
       failed,
-      left: Math.max(0, total - done - failed - accounts.filter((a) => a.status === "cancelled").reduce((n, a) => n + (a.units?.length ?? 0) - a.done - a.failed, 0)),
+      left: Math.max(0, total - done - failed - accounts.filter((a) => a.status === "cancelled").reduce((n, a) => n + unitsOf(a) - a.done - a.failed, 0)),
       statusChanged,
       otpNew,
     },
     accounts: accounts.map((a) => ({
       email: a.email,
       status: a.status,
-      units: a.units?.length ?? 0,
+      units: unitsOf(a),
       done: a.done,
       failed: a.failed,
       statusChanged: a.statusChanged || 0,
@@ -213,7 +217,7 @@ export async function legacyStatusView(userId: string) {
   const pub = publicUpdateRequest(row);
   const running = row.status === "queued" || row.status === "running";
   const active = row.accounts.find((a) => a.status === "running");
-  const currentEmail = active ? `${active.email} ${active.done + active.failed}/${active.units.length}` : running ? `${pub.counts.accountsQueued} account(s) waiting for a window` : null;
+  const currentEmail = active ? `${active.email} ${active.done + active.failed}/${active.total || active.units.length}` : running ? `${pub.counts.accountsQueued} account(s) waiting for a window` : null;
   const start = row.startedAt || row.createdAt;
   const end = row.finishedAt || new Date();
   return {
@@ -354,7 +358,8 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
             result = await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
           }
           const after = await Order.findOne({ userId, unit_id: u.unitId }).select("status_key delivery_otp").lean();
-          const changed = Boolean(before && after && String(before.status_key || "") !== String(after.status_key || ""));
+          // A change of lifecycle stage — not a vocabulary swap between the API ("Approved") and the page ("Order Confirmed").
+          const changed = Boolean(before && after && stageOf(before.status_key) !== stageOf(after.status_key));
           const otp = Boolean(after?.delivery_otp && !before?.delivery_otp);
           await bumpAccount(requestId, me, { done: 1, ...(changed ? { statusChanged: 1 } : {}), ...(otp ? { otpNew: 1 } : {}) });
           if (changed || otp) {

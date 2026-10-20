@@ -22,6 +22,8 @@ export interface IUpdateAccount {
   email: string;
   platformId: Types.ObjectId | null;
   units: IUpdateUnitCard[];
+  /** units.length, kept as a number so list views can leave the cards out. */
+  total: number;
   status: UpdateAccountStatus;
   done: number;
   failed: number;
@@ -73,6 +75,7 @@ const AccountSchema = new Schema<IUpdateAccount>(
     email: { type: String, required: true, lowercase: true },
     platformId: { type: Schema.Types.ObjectId, default: null },
     units: { type: [UnitCardSchema], default: [] },
+    total: { type: Number, default: 0 },
     status: { type: String, enum: ["queued", "running", "done", "failed", "cancelled"], default: "queued" },
     done: { type: Number, default: 0 },
     failed: { type: Number, default: 0 },

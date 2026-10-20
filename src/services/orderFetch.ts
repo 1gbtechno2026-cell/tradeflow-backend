@@ -2020,6 +2020,13 @@ export async function scrapeAndSave(
       ? cancelledStage?.detailed_steps[0]?.step_text || "Cancelled on Flipkart"
       : null;
 
+  // A page that rendered nothing — no status, no timeline, no product — is a
+  // failed read, not an order with no data: saving it would blank a good row
+  // (seen 2026-10-20: five units of one order wiped by a 406 page fallback).
+  if (!failed && !statusKey && !tracking.length && !productName) {
+    throw new Error(`order page gave no data for ${card.orderId}/${unitKey} (no status, timeline or product) — row left as it was`);
+  }
+
   await Order.updateOne(
     { userId, unit_id: unitKey },
     {

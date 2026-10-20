@@ -520,17 +520,25 @@ async function setOrder(requestId: string, orderId: string, patch: Partial<ICanc
  * of the order will do — the answer lists every unit), so this is the same
  * data a Fetch maps, read with the real browser rather than our API client.
  */
-async function readOrderPage(page: Page, orderId: string): Promise<{ view: ApiOrderView | null; loginShown: boolean }> {
+async function readOrderPage(page: Page, orderId: string): Promise<{ view: ApiOrderView | null; loginShown: boolean; note: string }> {
   const unitId = fallbackUnitId(orderId);
   const dataPromise = page
     .waitForResponse((r) => /\/api\/4\/page\/fetch/i.test(r.url()) && /CX_ORDER_DETAIL_PAGE/.test(r.request().postData() || ""), { timeout: 30_000 })
     .catch(() => null);
   const q = new URLSearchParams({ order_id: orderId, unit_id: unitId, item_id: itemIdOf(unitId) });
   await page.goto(`https://www.flipkart.com/order_details?${q.toString()}`, { waitUntil: "domcontentloaded", timeout: 45_000 });
-  if (flipkartLoginUrl(page.url())) return { view: null, loginShown: true };
+  if (flipkartLoginUrl(page.url())) return { view: null, loginShown: true, note: "" };
   const res = await dataPromise;
   const raw = res ? await res.json().catch(() => null) : null;
-  return { view: raw ? orderViewFromPageFetch(raw) : null, loginShown: false };
+  const view = raw ? orderViewFromPageFetch(raw) : null;
+  if (view) return { view, loginShown: false, note: "" };
+  // No order in the page data. Flipkart's own words on the page (and where it
+  // sent us) are the only way to tell "wrong account" from "page broke".
+  const text = String(await page.evaluate(() => document.body?.innerText || "").catch(() => ""));
+  const line = text.split("\n").map((l) => l.trim()).find((l) => l && l.length < 160 && /not found|no order|couldn.t find|something went wrong|not right|unable|error|invalid/i.test(l));
+  const where = page.url().replace(/^https?:\/\/www\.flipkart\.com/, "").split("?")[0];
+  const note = [res ? "page data had no order" : "page data never arrived", line ? `Flipkart says "${line}"` : "", where !== "/order_details" ? `landed on ${where}` : ""].filter(Boolean).join(" · ");
+  return { view: null, loginShown: false, note };
 }
 
 /** The Order row, in the shape the order sync writes a cancelled unit in, until the next sync refines it. */
@@ -638,7 +646,9 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
           }
           const unitIds = Object.keys(read.view?.units || {});
           if (!read.view || !unitIds.length) {
-            await finishOrder(o, "failed", "Flipkart shows no such order on this Platform ID — is it the account that placed it?");
+            fs.mkdirSync(artifactDir, { recursive: true });
+            await withTimeout(first.screenshot({ path: path.join(artifactDir, `${o.orderId}-order-page.png`), fullPage: true }), 15_000, "screenshot").catch(() => undefined);
+            await finishOrder(o, "failed", `Flipkart shows no such order on this Platform ID — is it the account that placed it?${read.note ? ` (${read.note})` : ""}`);
             continue;
           }
           const added: ICancelUnit[] = [];

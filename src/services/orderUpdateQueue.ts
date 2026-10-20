@@ -5,6 +5,8 @@ import { config } from "../config.js";
 import { isDestroyedContext } from "../lib/evalOnPage.js";
 import { Order } from "../models/Order.js";
 import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
+import { OrderUnitEvent } from "../models/OrderUnitEvent.js";
+import { PlatformId } from "../models/PlatformId.js";
 import { OrderUpdateRequest, type IOrderUpdateRequest, type IUpdateAccount, type UpdateSource } from "../models/OrderUpdateRequest.js";
 import { getUpdateQueue, type UpdateJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
@@ -328,6 +330,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
       }
     }
     let via = api ? "api" : "page";
+    let noData = 0;
     try {
       for (let n = 0; n < account.units.length; n++) {
         const fresh = await OrderUpdateRequest.findById(requestId).select("status").lean();
@@ -372,10 +375,21 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
         } catch (err) {
           if (isDestroyedContext(err)) throw err;
           await bumpAccount(requestId, me, { failed: 1 });
-          await log("warn", `${u.orderId}/${u.unitId}: ${err instanceof Error ? err.message.split("\n")[0].slice(0, 200) : err}`);
+          const text = err instanceof Error ? err.message.split("\n")[0] : String(err);
+          if (/gave no data/.test(text)) noData++;
+          await log("warn", `${u.orderId}/${u.unitId}: ${text.slice(0, 200)}`);
         }
       }
       const final = (await OrderUpdateRequest.findById(requestId).select("accounts").lean())?.accounts.find((a) => a.email === me);
+      // Every unit's page rendered nothing and the API refused the session:
+      // the login is the problem, not the orders. Mark the Platform ID's last
+      // check as an error (Session Health → Suspect) and tell the dashboard.
+      if (noData > 0 && (final?.done ?? 0) === 0 && noData === account.units.length) {
+        const reason = `Update: ${noData} order page(s) rendered nothing and the API refused the session — re-check this ID`;
+        await PlatformId.updateOne({ _id: acct.id }, { $set: { lastChecked: new Date(), sessionCheck: { at: new Date(), outcome: "error", reason, via: "worker" } } }).catch(() => undefined);
+        await OrderUnitEvent.create({ userId: request.userId, orderId: "", unitId: "", email: me, productName: "", type: "account_unreadable", at: new Date(), before: null, after: { units: noData, via, reason }, requestId, processed: false, processedAt: null }).catch(() => undefined);
+        await log("warn", `every order page rendered nothing (${noData}) — Platform ID marked for re-check`);
+      }
       await setAccount(requestId, me, {
         status: "done",
         via,

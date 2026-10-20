@@ -13,8 +13,11 @@ import mongoose, { Schema, type Types } from "mongoose";
  *   address_seen     first time this unit's delivery address is recorded
  *                    (baseline; the dashboard checks it against the book)
  *   address_changed  the delivery address differs from the previous refresh
+ *   account_unreadable  every unit of an account failed with an empty order
+ *                    page (and the API refused the session): the Platform ID
+ *                    needs a re-check, not more refreshes (orderId/unitId "")
  */
-export type UnitEventType = "stage_changed" | "otp_new" | "address_seen" | "address_changed";
+export type UnitEventType = "stage_changed" | "otp_new" | "address_seen" | "address_changed" | "account_unreadable";
 
 export interface IOrderUnitEvent {
   userId: Types.ObjectId;
@@ -36,11 +39,11 @@ export interface IOrderUnitEvent {
 const OrderUnitEventSchema = new Schema<IOrderUnitEvent>(
   {
     userId: { type: Schema.Types.ObjectId, required: true, index: true },
-    orderId: { type: String, required: true },
-    unitId: { type: String, required: true },
+    orderId: { type: String, default: "" },
+    unitId: { type: String, default: "" },
     email: { type: String, default: "", lowercase: true },
     productName: { type: String, default: "" },
-    type: { type: String, enum: ["stage_changed", "otp_new", "address_seen", "address_changed"], required: true },
+    type: { type: String, enum: ["stage_changed", "otp_new", "address_seen", "address_changed", "account_unreadable"], required: true },
     at: { type: Date, required: true },
     before: { type: Schema.Types.Mixed, default: null },
     after: { type: Schema.Types.Mixed, default: null },

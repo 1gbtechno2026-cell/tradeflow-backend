@@ -94,6 +94,8 @@ export interface CancelRequestInput {
   retryOf?: string;
   /** Internal (retry): urgent orders to read again, whatever `type` is. */
   extraOrders?: Array<{ orderId: string; email: string }>;
+  /** Internal (retry): when nothing would be queued, throw instead of recording an empty request. */
+  failIfEmpty?: boolean;
 }
 
 /** Seconds one unit takes in the cancel browser, from measured runs. */
@@ -286,6 +288,12 @@ export async function requestCancellation(userId: string, input: CancelRequestIn
   const urgentIds = new Set(urgentOrders.map((o) => o.orderId));
   const { units, rejected } = classify(type, ids.filter((id) => !urgentIds.has(id)), rows, (id) => pullErrors.get(id));
   const open = units.length > 0 || urgentOrders.length > 0;
+  if (!open && input.failIfEmpty) {
+    const reasons: Record<string, number> = {};
+    for (const r of rejected) reasons[r.reason] = (reasons[r.reason] || 0) + 1;
+    const why = Object.entries(reasons).map(([r, n]) => `${n} × ${r}`).join(", ");
+    throw new Error(`Nothing to retry — ${why || "every failed unit is already settled"}`);
+  }
 
   const request = await CancelRequest.create({
     userId: new Types.ObjectId(userId),
@@ -436,9 +444,10 @@ export async function retryCancelRequest(userId: string, requestId: string, by: 
       dryRun: row.dryRun,
       by,
       retryOf: requestId,
+      failIfEmpty: true,
     });
   }
-  return requestCancellation(userId, { type: "unit", ids: failedUnits, dryRun: row.dryRun, by, retryOf: requestId, extraOrders: failedOrders });
+  return requestCancellation(userId, { type: "unit", ids: failedUnits, dryRun: row.dryRun, by, retryOf: requestId, extraOrders: failedOrders, failIfEmpty: true });
 }
 
 export async function getCancelRequest(userId: string, requestId: string) {

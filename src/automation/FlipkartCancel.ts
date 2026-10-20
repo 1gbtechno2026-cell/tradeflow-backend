@@ -43,6 +43,9 @@ export interface CancelOptions {
    *  value `mind_changed` ("My reasons are not listed here") is the one. */
   reason?: string;
   comments?: string;
+  /** Flipkart's "CANCELLATION CONDITIONS" step (units packed together: cancelling one cancels the
+   *  others). Default true: Accept & Continue, and the note is carried into the result. */
+  acceptConditions?: boolean;
   /** Called at each screen, for screenshots. */
   onStep?: (name: string) => Promise<void>;
 }
@@ -186,11 +189,40 @@ export class FlipkartCancel {
 
     const continueBtn = this.page.getByRole("button", { name: /^continue$/i }).first();
     await continueBtn.waitFor({ state: "visible", timeout: 10_000 });
+    // The button enables a moment after the comment is typed; give it a few seconds.
+    const enabledBy = Date.now() + 6_000;
+    while (!(await continueBtn.isEnabled()) && Date.now() < enabledBy) await sleep(300);
     if (!(await continueBtn.isEnabled())) throw new Error("CONTINUE stayed disabled after reason and comment were filled");
     await continueBtn.click();
 
-    // ---- refund mode, then the one irreversible press ----------------------
+    // ---- conditions (only some orders) ------------------------------------
+    // Units packed together show a "CANCELLATION CONDITIONS" step first: "N more
+    // items will be cancelled — items in this order were packed together, we
+    // will be unable to deliver if any item is cancelled", with Accept &
+    // Continue. The whole order goes, which is what an order-level cancel asks
+    // for; accept, carry on, and say so in the result.
     const requestBtn = this.page.getByRole("button", { name: /request cancellation/i }).first();
+    const acceptBtn = this.page.getByText(/^\s*accept\s*(&|and)\s*continue\s*$/i).first();
+    let conditionsNote = "";
+    const nextBy = Date.now() + 20_000;
+    let next: "request" | "accept" | null = null;
+    while (!next && Date.now() < nextBy) {
+      if (await requestBtn.isVisible().catch(() => false)) next = "request";
+      else if (await acceptBtn.isVisible().catch(() => false)) next = "accept";
+      else await sleep(400);
+    }
+    if (next === "accept") {
+      if (opts.acceptConditions === false) {
+        return { kind: "not_cancellable", message: `Flipkart: ${this.conditionsText(await this.pageText()) || "cancelling this unit cancels the other items packed with it"} — not accepted` };
+      }
+      conditionsNote = this.conditionsText(await this.pageText());
+      this.log("warn", `[cancel] ${orderId}/${unitId}: conditions step — ${conditionsNote || "items packed together"}; accepting`);
+      await acceptBtn.click();
+      await sleep(800);
+      await step("conditions-accepted");
+    }
+
+    // ---- refund mode, then the one irreversible press ----------------------
     await requestBtn.waitFor({ state: "visible", timeout: 20_000 });
     // "Original Payment Mode" is preselected on the screens seen so far; a click
     // on its label is harmless when it already is, and picks it when it is not.
@@ -200,7 +232,7 @@ export class FlipkartCancel {
     await step("refund-mode");
 
     if (opts.dryRun) {
-      return { kind: "dry_run", message: "Stopped before REQUEST CANCELLATION (dry run)", feeNote };
+      return { kind: "dry_run", message: `Stopped before REQUEST CANCELLATION (dry run)${conditionsNote ? ` · conditions: ${conditionsNote}` : ""}`, feeNote };
     }
 
     const submitPromise = this.page
@@ -218,7 +250,7 @@ export class FlipkartCancel {
     if (answer?.success === true) {
       const refundTat = String(answer.refundTat || "");
       this.log("info", `[cancel] ${orderId}/${unitId}: cancelled — Flipkart answered success${refundTat ? ` (${refundTat})` : ""}`);
-      return { kind: "cancelled", message: "Cancellation requested on Flipkart", refundTat, feeNote };
+      return { kind: "cancelled", message: `Cancellation requested on Flipkart${conditionsNote ? ` · ${conditionsNote}` : ""}`, refundTat, feeNote };
     }
     if (answer) {
       throw new Error(`Flipkart refused the cancellation: ${String(answer.errorMessage || JSON.stringify(answer).slice(0, 300))}`);
@@ -269,6 +301,13 @@ export class FlipkartCancel {
     const ok = actions.find((a) => a.eligible === true);
     if (ok) return { eligible: true, reason: "" };
     return { eligible: false, reason: String(actions[0].eligibilityReason || "") };
+  }
+
+  /** The conditions step in one line: "2 more items will be cancelled · 3 items in this order were packed together…". */
+  private conditionsText(text: string): string {
+    const more = (text.match(/(\d+)\s+more items? will be cancelled/i) || [])[0] || "";
+    const packed = (text.match(/\d+\s+items? in this order were packed together[^.]*\./i) || [])[0] || "";
+    return [more, packed].filter(Boolean).join(" · ").trim();
   }
 
   private async pageText(): Promise<string> {

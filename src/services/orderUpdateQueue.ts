@@ -12,8 +12,8 @@ import { blockFlipkartLogout, closeBrowser, flipkartLoginUrl, launchStealthConte
 import { openOrderApiSession, OrderApiSessionError } from "./orderApi.js";
 import { apiScrapeAndSave, scrapeAndSave, type OrderAccount } from "./orderFetch.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
-import { stageOf } from "./orderLifecycle.js";
 import { resolveTargets, type UpdateTriggerInput } from "./orderUpdate.js";
+import { recordUnitChanges, snapshotUnit } from "./orderUnitEvents.js";
 import { resolveLoggedInSession, workspaceUserId } from "./sessionStore.js";
 
 /**
@@ -337,7 +337,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
         }
         const u = account.units[n];
         const card = { orderId: u.orderId, itemId: u.itemId, unitId: u.unitId, orderUrl: u.orderUrl, amount: "" };
-        const before = await Order.findOne({ userId, unit_id: u.unitId }).select("status_key delivery_otp").lean();
+        const before = await snapshotUnit(userId, u.unitId);
         try {
           let result: Awaited<ReturnType<typeof scrapeAndSave>>;
           if (api) {
@@ -357,13 +357,17 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           } else {
             result = await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
           }
-          const after = await Order.findOne({ userId, unit_id: u.unitId }).select("status_key delivery_otp").lean();
-          // A change of lifecycle stage — not a vocabulary swap between the API ("Approved") and the page ("Order Confirmed").
-          const changed = Boolean(before && after && stageOf(before.status_key) !== stageOf(after.status_key));
-          const otp = Boolean(after?.delivery_otp && !before?.delivery_otp);
-          await bumpAccount(requestId, me, { done: 1, ...(changed ? { statusChanged: 1 } : {}), ...(otp ? { otpNew: 1 } : {}) });
-          if (changed || otp) {
-            await log("info", `${u.orderId}/${u.unitId}: ${before?.status_key || "?"} → ${after?.status_key || result.statusKey || "?"}${otp ? ` · OTP ${after?.delivery_otp}` : ""}`);
+          const after = await snapshotUnit(userId, u.unitId);
+          // Stage changes (not a vocabulary swap between the API's "Approved" and the page's
+          // "Order Confirmed"), new OTPs and address changes become order_unit_events rows
+          // — the dashboard's alerts read those.
+          const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
+          await bumpAccount(requestId, me, { done: 1, ...(changes.stageChanged ? { statusChanged: 1 } : {}), ...(changes.otpNew ? { otpNew: 1 } : {}) });
+          if (changes.stageChanged || changes.otpNew || changes.addressChanged) {
+            await log(
+              "info",
+              `${u.orderId}/${u.unitId}: ${before?.status_key || "?"} → ${after?.status_key || result.statusKey || "?"}${changes.otpNew ? ` · OTP ${after?.delivery_otp}` : ""}${changes.addressChanged ? ` · ADDRESS CHANGED → ${after?.shipping_address?.text || "?"}` : ""}`
+            );
           }
         } catch (err) {
           if (isDestroyedContext(err)) throw err;

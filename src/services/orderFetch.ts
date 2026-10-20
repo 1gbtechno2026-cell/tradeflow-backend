@@ -18,7 +18,7 @@ import {
   restoreFlipkartSession,
   sleep,
 } from "./browser.js";
-import { openOrderApiSession, type MappedOrderUnit } from "./orderApi.js";
+import { addressHash, openOrderApiSession, type MappedOrderUnit, type ShippingAddress } from "./orderApi.js";
 import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSync.js";
 import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
@@ -469,6 +469,7 @@ const READ_PAGE = `() => {
     billingPhone: phone,
     billingName: billingName.replace(/\\s+/g, " ").trim(),
     pincode,
+    deliveryAddressText: String(deliveryBlock || "").replace(/\\s+/g, " ").trim().slice(0, 400),
     deliveryMessage: deliveryMessage.replace(/\\s+/g, " ").trim(),
     cashOnDelivery: /cash on delivery|\\bCOD\\b/i.test(compact),
     pageText: compact.slice(0, 18000),
@@ -2020,6 +2021,26 @@ export async function scrapeAndSave(
       ? cancelledStage?.detailed_steps[0]?.step_text || "Cancelled on Flipkart"
       : null;
 
+  // The delivery block as the page shows it: name is the billing/company line
+  // when one is present, the first line of the block otherwise.
+  const deliveryText = String(pageData.deliveryAddressText || "");
+  const pageShippingAddress: ShippingAddress | null = deliveryText
+    ? (() => {
+        const firstLine = deliveryText.split(/[,|]/)[0]?.trim() || "";
+        const a: ShippingAddress = {
+          name: String(pageData.billingName || "") || firstLine.slice(0, 80),
+          phone: String(pageData.billingPhone || ""),
+          pincode: String(pageData.pincode || ""),
+          city: "",
+          state: "",
+          line1: deliveryText.slice(0, 240),
+          line2: "",
+          text: deliveryText,
+        };
+        return a;
+      })()
+    : null;
+
   // A page that rendered nothing — no status, no timeline, no product — is a
   // failed read, not an order with no data: saving it would blank a good row
   // (seen 2026-10-20: five units of one order wiped by a 406 page fallback).
@@ -2062,6 +2083,8 @@ export async function scrapeAndSave(
         billing_phone_number: String(pageData.billingPhone || "") || null,
         billing_address_name: String(pageData.billingName || "") || null,
         billing_address_pincode: String(pageData.pincode || "") || null,
+        shipping_address: pageShippingAddress,
+        shipping_address_hash: addressHash(pageShippingAddress),
         is_invoice_downloaded: invoiceDownloaded,
         invoice_path: invoicePath,
         supercoin_amount_applied: Number(pageData.supercoin) || 0,

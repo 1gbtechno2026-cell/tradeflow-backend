@@ -51,6 +51,13 @@ export interface IOrder {
   billing_phone_number: string | null;
   billing_address_name: string | null;
   billing_address_pincode: string | null;
+  /** Delivery address as Flipkart shows it (services/orderApi.ts ShippingAddress) and its hash. */
+  shipping_address?: Record<string, string> | null;
+  shipping_address_hash?: string;
+  /** Address bookkeeping, written by the update worker (services/orderUnitEvents.ts). */
+  address_first_seen_at?: Date | null;
+  address_changed_at?: Date | null;
+  address_history?: Array<{ hash: string; address: Record<string, string> | null; seenAt: Date; until: Date }>;
   is_invoice_downloaded: boolean;
   invoice_path: string;
   invoice_s3_key: string;
@@ -173,6 +180,11 @@ const OrderSchema = new Schema<IOrder>(
     billing_phone_number: { type: String, default: null },
     billing_address_name: { type: String, default: null },
     billing_address_pincode: { type: String, default: null },
+    shipping_address: { type: Schema.Types.Mixed, default: null },
+    shipping_address_hash: { type: String, default: "" },
+    address_first_seen_at: { type: Date, default: null },
+    address_changed_at: { type: Date, default: null },
+    address_history: { type: [new Schema({ hash: String, address: Schema.Types.Mixed, seenAt: Date, until: Date }, { _id: false })], default: [] },
     is_invoice_downloaded: { type: Boolean, default: false },
     invoice_path: { type: String, default: "" },
     /** S3 key of the stored invoice PDF (services/invoiceCapture.ts). */

@@ -366,6 +366,48 @@ function shipmentPartnerFrom(unit: ApiUnit): string {
 }
 
 /** The fields scrapeAndSave() writes, from the API instead of the DOM. */
+export interface ShippingAddress {
+  name: string;
+  phone: string;
+  pincode: string;
+  city: string;
+  state: string;
+  line1: string;
+  line2: string;
+  /** Everything above in one line, for match-phrase checks and display. */
+  text: string;
+}
+
+/** Name + phone + pincode + lines, normalised: the parts a person changes when they redirect a parcel. */
+export function addressHash(a: ShippingAddress | null | undefined): string {
+  if (!a) return "";
+  const norm = (v: string) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const key = [norm(a.name), norm(a.phone), norm(a.pincode), norm(a.line1), norm(a.line2), norm(a.city)].join("|");
+  if (!key.replace(/\|/g, "").trim()) return "";
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+export function shippingAddressFrom(a: { name?: string; phoneNumber?: string; pinCode?: string; city?: string; state?: string; addressLine1?: string; addressLine2?: string } | null | undefined): ShippingAddress | null {
+  if (!a) return null;
+  const out: ShippingAddress = {
+    name: String(a.name || "").trim(),
+    phone: String(a.phoneNumber || "").trim(),
+    pincode: String(a.pinCode || "").trim(),
+    city: String(a.city || "").trim(),
+    state: String(a.state || "").trim(),
+    line1: String(a.addressLine1 || "").trim(),
+    line2: String(a.addressLine2 || "").trim(),
+    text: "",
+  };
+  out.text = [out.name, out.line1, out.line2, out.city, out.state, out.pincode, out.phone].filter(Boolean).join(", ");
+  return out.text ? out : null;
+}
+
 export interface MappedOrderUnit {
   order_id: string;
   item_id: string;
@@ -393,6 +435,12 @@ export interface MappedOrderUnit {
   billing_phone_number: string | null;
   billing_address_name: string | null;
   billing_address_pincode: string | null;
+  /** The delivery address Flipkart shows for this unit, and a hash of its
+   *  identifying parts — the update worker compares hashes between refreshes
+   *  (address change alerts) and the dashboard checks them against the
+   *  Address book (address mismatch alerts). */
+  shipping_address: ShippingAddress | null;
+  shipping_address_hash: string;
   supercoin_amount_applied: number;
   cash_on_delivery: boolean;
   refund_status: string | null;
@@ -526,6 +574,8 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
     billing_phone_number: String(billing.phoneNumber || view.customerInfo?.phoneNumber || "") || null,
     billing_address_name: String(billing.name || "").trim() || null,
     billing_address_pincode: String(billing.pinCode || "") || null,
+    shipping_address: shippingAddressFrom(view.addresses?.SHIPPING || view.addresses?.BILLING),
+    shipping_address_hash: addressHash(shippingAddressFrom(view.addresses?.SHIPPING || view.addresses?.BILLING)),
     supercoin_amount_applied: 0,
     cash_on_delivery: /cash on delivery/i.test(paymentMode),
     refund_status: refunds.length || refunded ? "refund" : null,

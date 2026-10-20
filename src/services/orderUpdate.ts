@@ -64,7 +64,7 @@ export interface UpdateTriggerInput {
   selectionMethod?: string;
 }
 
-type UpdateTarget = {
+export type UpdateTarget = {
   account: OrderAccount;
   card: OrderUnitCard;
 };
@@ -171,7 +171,8 @@ function cardFromDoc(row: {
   };
 }
 
-async function resolveTargets(userId: string, input: UpdateTriggerInput): Promise<UpdateTarget[]> {
+/** Shared with the worker-side update (orderUpdateQueue.ts): the same selection rules, whoever runs the refresh. */
+export async function resolveTargets(userId: string, input: UpdateTriggerInput): Promise<UpdateTarget[]> {
   const emails = [...new Set((input.emails || []).map((e) => e.toLowerCase()).filter(Boolean))];
   const orderIds = [...new Set((input.orderIds || []).map((id) => parseOrderId(id) || id.toUpperCase()).filter(Boolean))];
   const statuses = (input.orderStatus || []).map((s) => s.trim()).filter(Boolean);

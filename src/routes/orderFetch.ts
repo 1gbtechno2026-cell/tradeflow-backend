@@ -11,10 +11,18 @@ import {
 } from "../services/orderFetch.js";
 import { getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import {
-  getOrderUpdateJob,
-  startOrderUpdate,
-  stopOrderUpdate,
-} from "../services/orderUpdate.js";
+  cancelUpdateRequest,
+  createUpdateRequest,
+  getUpdateRequest,
+  legacyStatusView,
+  listUpdateRequests,
+  resolveUpdateWindows,
+  setUpdateWindows,
+  UPDATE_OFD_SWEEP_MS,
+  UPDATE_SCHEDULE_ENABLED,
+  UPDATE_SWEEP_MS,
+  WINDOW_LIMITS,
+} from "../services/orderUpdateQueue.js";
 
 export const orderFetchRouter = Router();
 
@@ -120,7 +128,7 @@ orderFetchRouter.put("/fetch/mode", async (req, res) => {
   }
   // Never flip under a run: the mode is read once at a run's start, and a
   // half-API half-page run would be unexplainable.
-  if (getOrderFetchJob(userId).running || getOrderUpdateJob(userId).running) {
+  if (getOrderFetchJob(userId).running || (await legacyStatusView(userId)).running) {
     res.status(409).json({ error: "A fetch or update is running — stop it or wait for it to finish, then switch" });
     return;
   }
@@ -159,20 +167,21 @@ orderFetchRouter.post("/update/trigger", async (req, res) => {
       ? req.body.order_status.map((item: unknown) => String(item || "").trim()).filter(Boolean)
       : [];
     const csvRows = parseCsvRows(req.body?.csv_rows || req.body?.csvRows);
-    await startOrderUpdate(userId, {
-      emails,
-      orderIds,
-      orderStatus,
-      csvRows,
-      selectionMethod: String(req.body?.selection_method || ""),
-    });
-    const job = getOrderUpdateJob(userId);
+    const source = String(req.body?.source || "") === "cancel" ? "cancel" : "manual";
+    // Queued on the worker (services/orderUpdateQueue.ts): one job per account.
+    const request = await createUpdateRequest(
+      userId,
+      { emails, orderIds, orderStatus, csvRows, selectionMethod: String(req.body?.selection_method || "") },
+      { source, by: String(req.body?.by || "").trim() }
+    );
     res.json({
-      message: "Order update triggered successfully",
+      message: "Order update queued on the worker",
       platform,
       selection_method: req.body?.selection_method || "default",
-      tasks_created: job.total,
-      windows: job.windows,
+      tasks_created: request.counts.units,
+      accounts: request.counts.accounts,
+      windows: request.windows,
+      request_id: request.id,
       timestamp: Math.floor(Date.now() / 1000),
     });
   } catch (err) {
@@ -180,28 +189,59 @@ orderFetchRouter.post("/update/trigger", async (req, res) => {
   }
 });
 
+/** Stops the newest open request (or `requestId`): queued accounts are removed, running ones finish their current unit. */
 orderFetchRouter.post("/update/stop", async (req, res) => {
   try {
     const userId = userIdFrom(req);
-    await stopOrderUpdate(userId);
-    res.json({ message: "Order update stopped. Chrome killed." });
+    const out = await cancelUpdateRequest(userId, String(req.body?.requestId || "") || undefined);
+    res.json({ message: out ? `Order update stopped — ${out.removed} account(s) removed from the queue` : "No order update is running", ...(out || {}) });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Could not stop" });
   }
 });
 
+/** The dashboard's status panel: same shape as the old in-process job, built from the newest request. */
 orderFetchRouter.get("/update/status", async (req, res) => {
   const userId = String(req.query.userId || "").trim() || workspaceUserId();
-  const job = getOrderUpdateJob(userId);
-  const resolved = await resolveOrderFetchMode(userId).catch(() => null);
-  res.json({ ...job, mode: job.running ? job.mode : resolved?.mode || job.mode, modeSource: resolved?.source || "env" });
+  res.json(await legacyStatusView(userId));
+});
+
+orderFetchRouter.get("/update/requests", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  res.json({ requests: await listUpdateRequests(userId, Number(req.query.limit) || 20) });
+});
+
+orderFetchRouter.get("/update/requests/:id", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  const row = await getUpdateRequest(userId, req.params.id);
+  if (!row) {
+    res.status(404).json({ error: "Update request not found" });
+    return;
+  }
+  res.json(row);
+});
+
+/** Update speed and schedules. PUT body: { windows, by? } — applies to the next job, no restart. */
+orderFetchRouter.get("/update/settings", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  const speed = await resolveUpdateWindows(userId);
+  res.json({ ...speed, limits: WINDOW_LIMITS, schedule: { enabled: UPDATE_SCHEDULE_ENABLED, activeEveryMs: UPDATE_SWEEP_MS, ofdEveryMs: UPDATE_OFD_SWEEP_MS } });
+});
+
+orderFetchRouter.put("/update/settings", async (req, res) => {
+  try {
+    const speed = await setUpdateWindows(userIdFrom(req), req.body?.windows, String(req.body?.by || "").trim());
+    res.json({ ...speed, limits: WINDOW_LIMITS });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not save the update speed" });
+  }
 });
 
 orderFetchRouter.post("/sync/stop", async (req, res) => {
   try {
     const userId = userIdFrom(req);
     await stopOrderFetch(userId);
-    await stopOrderUpdate(userId);
+    await cancelUpdateRequest(userId);
     res.json({ message: "Fetch and update stopped. Chrome killed." });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Could not stop" });

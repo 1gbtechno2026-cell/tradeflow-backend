@@ -163,3 +163,43 @@ export function createSyncWorker(
     maxStalledCount: 2,
   });
 }
+
+// ── Order update ───────────────────────────────────────────────────────────
+// "Update Order Units" (services/orderUpdateQueue.ts): one job per (update
+// request, account), accounts in parallel up to the worker's update windows.
+// The two schedules — every 6 h for all active units, every 2 h for units Out
+// for delivery — are BullMQ job schedulers on this same queue (name "sweep").
+
+export const UPDATE_QUEUE = "order-update";
+
+export interface UpdateJobData {
+  requestId: string;
+  email: string;
+  /** Scheduler ticks: "active" (6 h, every active unit) or "ofd" (2 h, Out for delivery). */
+  sweep?: "active" | "ofd";
+}
+
+let updateQueue: Queue<UpdateJobData> | null = null;
+
+export function getUpdateQueue(): Queue<UpdateJobData> {
+  if (!updateQueue) {
+    updateQueue = new Queue<UpdateJobData>(UPDATE_QUEUE, {
+      connection: redisConnection(),
+      defaultJobOptions: { attempts: 1, removeOnComplete: true, removeOnFail: true } satisfies JobsOptions,
+    });
+  }
+  return updateQueue;
+}
+
+export function createUpdateWorker(
+  concurrency: number,
+  processor: (job: Job<UpdateJobData>, token: string | undefined) => Promise<void>
+) {
+  return new Worker<UpdateJobData>(UPDATE_QUEUE, processor, {
+    connection: redisConnection(),
+    concurrency: Math.max(1, concurrency),
+    lockDuration: 10 * 60 * 1000,
+    stalledInterval: 60 * 1000,
+    maxStalledCount: 1,
+  });
+}

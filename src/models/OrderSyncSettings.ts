@@ -15,6 +15,10 @@ export interface IOrderSyncSettings {
   cancelTabs: number;
   cancelChangedBy: string;
   cancelChangedAt: Date | null;
+  /** Update speed (services/orderUpdateQueue.ts): accounts refreshed in parallel by the worker. 0 = UPDATE_CONCURRENCY / default. */
+  updateWindows: number;
+  updateChangedBy: string;
+  updateChangedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -29,6 +33,9 @@ const OrderSyncSettingsSchema = new Schema<IOrderSyncSettings>(
     cancelTabs: { type: Number, default: 0 },
     cancelChangedBy: { type: String, default: "" },
     cancelChangedAt: { type: Date, default: null },
+    updateWindows: { type: Number, default: 0 },
+    updateChangedBy: { type: String, default: "" },
+    updateChangedAt: { type: Date, default: null },
   },
   { timestamps: true, collection: "order_sync_settings" }
 );

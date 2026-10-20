@@ -48,6 +48,9 @@ export interface CancelOptions {
   acceptConditions?: boolean;
   /** Called at each screen, for screenshots. */
   onStep?: (name: string) => Promise<void>;
+  /** The order_details page's own data for this unit (raw CX_ORDER_DETAIL_PAGE
+   *  body), when it arrived — urgent cancels save the Order row from it. */
+  onOrderPage?: (raw: unknown) => Promise<void>;
 }
 
 export type CancelOutcome =
@@ -126,7 +129,7 @@ export class FlipkartCancel {
     // renders "Something's not right! Please try again". The order page's data
     // (CX_ORDER_DETAIL_PAGE, requested per unit) carries the CANCEL action
     // Flipkart draws its Cancel button from: eligible true/false plus a reason.
-    const eligibility = await this.readEligibility(orderId, unitId, input.itemId);
+    const eligibility = await this.readEligibility(orderId, unitId, input.itemId, opts.onOrderPage);
     await step("order-page");
     if (eligibility && !eligibility.eligible) {
       return { kind: "not_cancellable", message: `Flipkart: ${eligibility.reason || "not eligible for cancellation"}` };
@@ -271,7 +274,8 @@ export class FlipkartCancel {
   private async readEligibility(
     orderId: string,
     unitId: string,
-    itemId?: string
+    itemId?: string,
+    onOrderPage?: (raw: unknown) => Promise<void>
   ): Promise<{ eligible: boolean; reason: string } | null> {
     const odPromise = this.page
       .waitForResponse(
@@ -284,7 +288,9 @@ export class FlipkartCancel {
     if (flipkartLoginUrl(this.page.url())) throw new Error("SESSION_EXPIRED: Flipkart showed the login page");
     const res = await odPromise;
     await sleep(1500);
-    const body = res ? await jsonOf(res) : null;
+    const raw = res ? await res.json().catch(() => null) : null;
+    if (raw && onOrderPage) await onOrderPage(raw).catch((err) => this.log("warn", `[cancel] ${orderId}/${unitId}: order page data not saved — ${err instanceof Error ? err.message : err}`));
+    const body = raw ? ((raw as { RESPONSE?: Record<string, unknown> }).RESPONSE ?? (raw as Record<string, unknown>)) : null;
     if (!body) return null;
     const actions: Array<{ eligible?: unknown; eligibilityReason?: unknown }> = [];
     const walk = (v: unknown, depth: number) => {

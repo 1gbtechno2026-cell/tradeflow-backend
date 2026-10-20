@@ -21,22 +21,58 @@ export interface ICancelUnit {
   finishedAt: Date | null;
 }
 
+/**
+ * Urgent cancel: an Order ID never fetched, to be read in the Platform ID's
+ * own Chrome by the worker (order_details page) and then cancelled unit by
+ * unit — no API read at request time. `read` = units found and queued (they
+ * appear in `units`); `failed` = the page gave no order (wrong account, dead
+ * session, Flipkart error) with the reason in `message`.
+ */
+export type CancelOrderStatus = "queued" | "running" | "read" | "failed";
+
+export interface ICancelOrder {
+  orderId: string;
+  email: string;
+  status: CancelOrderStatus;
+  message: string;
+  unitsFound: number;
+  startedAt: Date | null;
+  finishedAt: Date | null;
+}
+
 export interface ICancelRequest {
   userId: Types.ObjectId;
   type: "unit" | "order";
   input: string[];
   dryRun: boolean;
+  /** Urgent: unknown orders are read in Chrome by the worker, not through the API first. */
+  urgent: boolean;
   /** Dashboard user who submitted it (shown in the Cancellations history). */
   createdBy: string;
   /** Set when this request was made by "Retry failed" on another one. */
   retryOf: string;
   status: "queued" | "running" | "done";
   units: ICancelUnit[];
+  /** Urgent-mode orders still to be read (or that could not be read). */
+  orders: ICancelOrder[];
   rejected: Array<{ id: string; reason: string }>;
   createdAt: Date;
   updatedAt: Date;
   finishedAt: Date | null;
 }
+
+const OrderSchema = new Schema<ICancelOrder>(
+  {
+    orderId: { type: String, required: true },
+    email: { type: String, required: true, lowercase: true },
+    status: { type: String, enum: ["queued", "running", "read", "failed"], default: "queued" },
+    message: { type: String, default: "" },
+    unitsFound: { type: Number, default: 0 },
+    startedAt: { type: Date, default: null },
+    finishedAt: { type: Date, default: null },
+  },
+  { _id: false }
+);
 
 const UnitSchema = new Schema<ICancelUnit>(
   {
@@ -59,10 +95,12 @@ const CancelRequestSchema = new Schema<ICancelRequest>(
     type: { type: String, enum: ["unit", "order"], required: true },
     input: { type: [String], default: [] },
     dryRun: { type: Boolean, default: false },
+    urgent: { type: Boolean, default: false },
     createdBy: { type: String, default: "" },
     retryOf: { type: String, default: "" },
     status: { type: String, enum: ["queued", "running", "done"], default: "queued" },
     units: { type: [UnitSchema], default: [] },
+    orders: { type: [OrderSchema], default: [] },
     rejected: { type: [new Schema({ id: String, reason: String }, { _id: false })], default: [] },
     finishedAt: { type: Date, default: null },
   },

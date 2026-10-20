@@ -234,6 +234,7 @@ orderFetchRouter.post("/cancel", async (req, res) => {
       ids: parseIds(req.body?.ids),
       accounts,
       email: String(req.body?.email || "").trim().toLowerCase(),
+      urgent: req.body?.urgent === true,
       dryRun: req.body?.dryRun === true,
       by: String(req.body?.by || "").trim(),
     });
@@ -257,7 +258,7 @@ orderFetchRouter.post("/cancel/preview", async (req, res) => {
         if (String(email || "").trim()) accounts[orderId] = String(email).trim().toLowerCase();
       }
     }
-    res.json(await previewCancellation(userIdFrom(req), { type, ids: parseIds(req.body?.ids), accounts, email: String(req.body?.email || "").trim().toLowerCase() }));
+    res.json(await previewCancellation(userIdFrom(req), { type, ids: parseIds(req.body?.ids), accounts, email: String(req.body?.email || "").trim().toLowerCase(), urgent: req.body?.urgent === true }));
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : "Could not preview the cancellation" });
   }

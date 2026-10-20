@@ -5,14 +5,14 @@ import { Types } from "mongoose";
 import { FlipkartCancel, itemIdOf, type CancelOutcome } from "../automation/FlipkartCancel.js";
 import { fullOrderId } from "../automation/PaymentApiWatcher.js";
 import { config } from "../config.js";
-import { CancelRequest, type CancelUnitStatus, type ICancelUnit } from "../models/CancelRequest.js";
+import { CancelRequest, type CancelOrderStatus, type CancelUnitStatus, type ICancelOrder, type ICancelUnit } from "../models/CancelRequest.js";
 import { Order } from "../models/Order.js";
 import type { APIRequestContext, Page } from "playwright";
 import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
 import { getCancelQueue, type CancelJobData } from "../queue.js";
-import { blockFlipkartLogout, desktopContext, launchStealthBrowser, restoreFlipkartSession } from "./browser.js";
+import { blockFlipkartLogout, desktopContext, flipkartLoginUrl, launchStealthBrowser, restoreFlipkartSession } from "./browser.js";
 import { lockAccount } from "./accountLock.js";
-import { fetchOrderDetails, mapApiUnitToOrder, openOrderApiSession } from "./orderApi.js";
+import { fetchOrderDetails, mapApiUnitToOrder, openOrderApiSession, orderViewFromPageFetch, type ApiOrderView } from "./orderApi.js";
 import { fallbackUnitId, saveMappedUnit, type OrderAccount } from "./orderFetch.js";
 import { claimProxyForWorker } from "./proxyPool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
@@ -27,6 +27,11 @@ import { resolveLoggedInSession } from "./sessionStore.js";
  *                        names the Platform ID that placed it: read that one
  *                        order through Flipkart's order API (every unit) and
  *                        save it, so the cancel can go ahead without a Fetch
+ *   urgent               the same unknown orders, but nothing is read at request
+ *                        time: the worker opens the Platform ID's own Chrome,
+ *                        goes to the order page, saves every unit it shows to
+ *                        Order Units (same mapper as a Fetch) and cancels them
+ *                        in that window — see readOrderPage / runCancelJob
  *   runCancelJob         (worker) one browser per account, its units in turn,
  *                        each through FlipkartCancel, each result onto both the
  *                        CancelRequest and the Order row
@@ -64,8 +69,12 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 }
 /** The account is busy (checkout, sync or another cancel) — try again after this. */
 const LOCK_RETRY_MS = 20_000;
-/** Unknown orders are read inside the request; keep that to seconds, not minutes. */
-const MAX_PULLED_ORDERS = 50;
+/** Unknown orders are read inside the request (about a second each); keep that to minutes at most. */
+const MAX_PULLED_ORDERS = 200;
+/** One order page in the cancel browser, urgent mode: navigate, wait for the page data, save the units. */
+export const SECONDS_PER_ORDER_PAGE = 8;
+/** An urgent order page that has not answered in this long is given up. */
+const ORDER_PAGE_TIMEOUT_MS = 90 * 1000;
 
 export interface CancelRequestInput {
   type: "unit" | "order";
@@ -74,12 +83,17 @@ export interface CancelRequestInput {
   accounts?: Record<string, string>;
   /** Platform ID (email) for every unknown Order ID not named in `accounts`. */
   email?: string;
+  /** Urgent: do not read unknown orders through the API now — the worker reads
+   *  each on its order page in the Platform ID's Chrome and cancels right there. */
+  urgent?: boolean;
   /** Walk to REQUEST CANCELLATION and stop. For testing the path on a real unit. */
   dryRun?: boolean;
   /** Dashboard user submitting the request. */
   by?: string;
   /** The request this one retries the failed units of. */
   retryOf?: string;
+  /** Internal (retry): urgent orders to read again, whatever `type` is. */
+  extraOrders?: Array<{ orderId: string; email: string }>;
 }
 
 /** Seconds one unit takes in the cancel browser, from measured runs. */
@@ -156,11 +170,15 @@ const NEEDS_EMAIL = "Not found in Order Units — add the Platform ID (email) th
 async function pullUnknownOrders(userId: string, orderIds: string[], emailFor: (orderId: string) => string) {
   const errors = new Map<string, string>();
   const byEmail = new Map<string, string[]>();
+  let pulled = 0;
   for (const orderId of orderIds) {
     const email = emailFor(orderId);
     if (!email) errors.set(orderId, NEEDS_EMAIL);
-    else if (byEmail.size >= MAX_PULLED_ORDERS) errors.set(orderId, `At most ${MAX_PULLED_ORDERS} unfetched orders per request — fetch the account's orders instead`);
-    else byEmail.set(email, [...(byEmail.get(email) || []), orderId]);
+    else if (pulled >= MAX_PULLED_ORDERS) errors.set(orderId, `At most ${MAX_PULLED_ORDERS} unfetched orders per request — split the list, or tick Urgent cancel`);
+    else {
+      byEmail.set(email, [...(byEmail.get(email) || []), orderId]);
+      pulled++;
+    }
   }
 
   for (const [email, list] of byEmail) {
@@ -229,54 +247,81 @@ export async function requestCancellation(userId: string, input: CancelRequestIn
       .lean();
   let rows = await find(ids);
 
-  // Order IDs we have never fetched: read them from Flipkart now when the
-  // caller says which Platform ID placed them, then look again.
+  // Order IDs we have never fetched. Normal: read them from Flipkart now
+  // through the Platform ID the caller named, then look again. Urgent: hand
+  // each to the worker, which reads it on the order page in that Platform ID's
+  // Chrome and cancels there — nothing is read here.
   const pullErrors = new Map<string, string>();
+  const urgentOrders: ICancelOrder[] = [];
+  const queueOrder = (orderId: string, email: string) => {
+    if (!urgentOrders.some((o) => o.orderId === orderId)) {
+      urgentOrders.push({ orderId, email, status: "queued", message: "", unitsFound: 0, startedAt: null, finishedAt: null });
+    }
+  };
   if (type === "order") {
     const known = new Set(rows.map((r) => r.order_id));
     const unknown = ids.filter((id) => !known.has(id));
     if (unknown.length) {
       const named = new Map(Object.entries(input.accounts || {}).map(([k, v]) => [fullOrderId(String(k).trim().toUpperCase()), String(v || "").trim().toLowerCase()]));
       const fallback = String(input.email || "").trim().toLowerCase();
-      const errors = await pullUnknownOrders(userId, unknown, (orderId) => named.get(orderId) || fallback);
-      for (const [id, reason] of errors) pullErrors.set(id, reason);
-      const pulled = unknown.filter((id) => !errors.has(id));
-      if (pulled.length) rows = [...rows, ...(await find(pulled))];
+      if (input.urgent) {
+        for (const id of unknown) {
+          const email = named.get(id) || fallback;
+          if (email) queueOrder(id, email);
+        }
+      } else {
+        const errors = await pullUnknownOrders(userId, unknown, (orderId) => named.get(orderId) || fallback);
+        for (const [id, reason] of errors) pullErrors.set(id, reason);
+        const pulled = unknown.filter((id) => !errors.has(id));
+        if (pulled.length) rows = [...rows, ...(await find(pulled))];
+      }
     }
   }
+  for (const o of input.extraOrders || []) {
+    const orderId = fullOrderId(String(o.orderId).trim().toUpperCase());
+    const email = String(o.email || "").trim().toLowerCase();
+    if (orderId && email) queueOrder(orderId, email);
+  }
 
-  const { units, rejected } = classify(type, ids, rows, (id) => pullErrors.get(id));
+  const urgentIds = new Set(urgentOrders.map((o) => o.orderId));
+  const { units, rejected } = classify(type, ids.filter((id) => !urgentIds.has(id)), rows, (id) => pullErrors.get(id));
+  const open = units.length > 0 || urgentOrders.length > 0;
 
   const request = await CancelRequest.create({
     userId: new Types.ObjectId(userId),
     type,
     input: ids,
     dryRun: Boolean(input.dryRun),
+    urgent: Boolean(input.urgent) || urgentOrders.length > 0,
     createdBy: String(input.by || "").trim(),
     retryOf: String(input.retryOf || ""),
-    status: units.length ? "queued" : "done",
+    status: open ? "queued" : "done",
     units,
+    orders: urgentOrders,
     rejected,
-    finishedAt: units.length ? null : new Date(),
+    finishedAt: open ? null : new Date(),
   });
   const requestId = String(request._id);
 
-  if (units.length) {
-    await Order.updateMany(
-      { userId, unit_id: { $in: units.map((u) => u.unitId) } },
-      {
-        $set: {
-          cancel_status: "queued",
-          cancel_request_id: requestId,
-          cancel_requested_at: new Date(),
-          cancel_requested_by: String(input.by || "").trim(),
-          cancel_error: "",
-        },
-      }
-    );
-    const emails = [...new Set(units.map((u) => u.email))];
+  if (open) {
+    if (units.length) {
+      await Order.updateMany(
+        { userId, unit_id: { $in: units.map((u) => u.unitId) } },
+        {
+          $set: {
+            cancel_status: "queued",
+            cancel_request_id: requestId,
+            cancel_requested_at: new Date(),
+            cancel_requested_by: String(input.by || "").trim(),
+            cancel_error: "",
+          },
+        }
+      );
+    }
+    const emails = [...new Set([...units.map((u) => u.email), ...urgentOrders.map((o) => o.email)])];
     const queue = getCancelQueue();
     await queue.addBulk(emails.map((email) => ({ name: "cancel", data: { requestId, email }, opts: { jobId: `${requestId}-${email}` } })));
+    if (urgentOrders.length) console.log(`[cancel ${requestId}] urgent: ${urgentOrders.length} order(s) to read in Chrome on ${new Set(urgentOrders.map((o) => o.email)).size} account(s)`);
   }
 
   return publicRequest(request.toObject());
@@ -342,6 +387,11 @@ export async function previewCancellation(userId: string, input: CancelRequestIn
   for (const r of rejected) reasons[r.reason] = (reasons[r.reason] || 0) + 1;
   const accounts = new Set(units.map((u) => u.email)).size;
   const speed = await resolveCancelSpeed(userId);
+  const urgent = Boolean(input.urgent);
+  const unknownAccounts = new Set(withEmail.map((id) => named.get(id) || fallback)).size;
+  // Urgent: each unknown order costs a page read in Chrome (accounts in parallel
+  // up to `windows`), and its units are cancelled after — count unknown.
+  const readSeconds = urgent ? Math.ceil((withEmail.length * SECONDS_PER_ORDER_PAGE) / Math.max(1, Math.min(unknownAccounts || 1, speed.windows))) : withEmail.length;
   return {
     type,
     ids: ids.length,
@@ -350,24 +400,45 @@ export async function previewCancellation(userId: string, input: CancelRequestIn
     accounts,
     unknownWithEmail: withEmail.length,
     unknownNeedingEmail: unknown.length - withEmail.length,
+    unknownAccounts,
+    urgent,
+    mode: urgent ? "chrome" : "api",
+    maxPulled: MAX_PULLED_ORDERS,
     rejected: rejected.length,
     reasons,
     windows: speed.windows,
     tabs: speed.tabs,
     concurrency: speed.windows,
+    secondsPerOrderPage: SECONDS_PER_ORDER_PAGE,
     // Accounts in parallel up to `windows`, each account's units in parallel up to `tabs`.
-    estimateSeconds: Math.ceil((units.length * SECONDS_PER_UNIT) / Math.max(1, Math.min(accounts || 1, speed.windows) * speed.tabs)) + withEmail.length,
+    estimateSeconds: Math.ceil((units.length * SECONDS_PER_UNIT) / Math.max(1, Math.min(accounts || 1, speed.windows) * speed.tabs)) + readSeconds,
   };
 }
 
-/** A new request made of the failed units of an earlier one. Flipkart's refusals (not_cancellable) are not retried. */
+/**
+ * A new request made of the failed parts of an earlier one: its failed units,
+ * and (urgent) the orders whose page could not be read. Flipkart's refusals
+ * (not_cancellable) are not retried.
+ */
 export async function retryCancelRequest(userId: string, requestId: string, by: string) {
   if (!Types.ObjectId.isValid(requestId)) return null;
   const row = await CancelRequest.findOne({ _id: requestId, userId }).lean();
   if (!row) return null;
-  const failed = row.units.filter((u) => u.status === "failed").map((u) => u.unitId);
-  if (!failed.length) throw new Error("Nothing to retry — this request has no failed units");
-  return requestCancellation(userId, { type: "unit", ids: failed, dryRun: row.dryRun, by, retryOf: requestId });
+  const failedUnits = row.units.filter((u) => u.status === "failed").map((u) => u.unitId);
+  const failedOrders = (row.orders || []).filter((o) => o.status === "failed").map((o) => ({ orderId: o.orderId, email: o.email }));
+  if (!failedUnits.length && !failedOrders.length) throw new Error("Nothing to retry — this request has no failed units");
+  if (!failedUnits.length) {
+    return requestCancellation(userId, {
+      type: "order",
+      ids: failedOrders.map((o) => o.orderId),
+      accounts: Object.fromEntries(failedOrders.map((o) => [o.orderId, o.email])),
+      urgent: true,
+      dryRun: row.dryRun,
+      by,
+      retryOf: requestId,
+    });
+  }
+  return requestCancellation(userId, { type: "unit", ids: failedUnits, dryRun: row.dryRun, by, retryOf: requestId, extraOrders: failedOrders });
 }
 
 export async function getCancelRequest(userId: string, requestId: string) {
@@ -385,19 +456,24 @@ export function publicRequest(r: {
   _id: unknown;
   type: string;
   dryRun?: boolean;
+  urgent?: boolean;
   createdBy?: string;
   retryOf?: string;
   status: string;
   units: ICancelUnit[];
+  orders?: ICancelOrder[];
   rejected: Array<{ id: string; reason: string }>;
   createdAt?: Date;
   finishedAt?: Date | null;
 }) {
   const count = (s: CancelUnitStatus) => r.units.filter((u) => u.status === s).length;
+  const orders = r.orders || [];
+  const countOrders = (s: CancelOrderStatus) => orders.filter((o) => o.status === s).length;
   return {
     id: String(r._id),
     type: r.type,
     dryRun: Boolean(r.dryRun),
+    urgent: Boolean(r.urgent),
     createdBy: r.createdBy || "",
     retryOf: r.retryOf || "",
     status: r.status,
@@ -412,8 +488,14 @@ export function publicRequest(r: {
       failed: count("failed"),
       dryRun: count("dry_run"),
       rejected: r.rejected.length,
+      // Urgent orders: still to be read in Chrome / read and queued / could not be read.
+      ordersTotal: orders.length,
+      ordersQueued: countOrders("queued") + countOrders("running"),
+      ordersRead: countOrders("read"),
+      ordersFailed: countOrders("failed"),
     },
     units: r.units,
+    orders,
     rejected: r.rejected,
   };
 }
@@ -424,6 +506,31 @@ async function setUnit(requestId: string, unitId: string, patch: Partial<ICancel
   const set: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(patch)) set[`units.$[u].${k}`] = v;
   await CancelRequest.updateOne({ _id: requestId }, { $set: set }, { arrayFilters: [{ "u.unitId": unitId }] });
+}
+
+async function setOrder(requestId: string, orderId: string, patch: Partial<ICancelOrder>) {
+  const set: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(patch)) set[`orders.$[o].${k}`] = v;
+  await CancelRequest.updateOne({ _id: requestId }, { $set: set }, { arrayFilters: [{ "o.orderId": orderId }] });
+}
+
+/**
+ * Urgent mode: the order as Flipkart's own order_details page shows it, in the
+ * logged-in Chrome. The page requests CX_ORDER_DETAIL_PAGE itself (any unit id
+ * of the order will do — the answer lists every unit), so this is the same
+ * data a Fetch maps, read with the real browser rather than our API client.
+ */
+async function readOrderPage(page: Page, orderId: string): Promise<{ view: ApiOrderView | null; loginShown: boolean }> {
+  const unitId = fallbackUnitId(orderId);
+  const dataPromise = page
+    .waitForResponse((r) => /\/api\/4\/page\/fetch/i.test(r.url()) && /CX_ORDER_DETAIL_PAGE/.test(r.request().postData() || ""), { timeout: 30_000 })
+    .catch(() => null);
+  const q = new URLSearchParams({ order_id: orderId, unit_id: unitId, item_id: itemIdOf(unitId) });
+  await page.goto(`https://www.flipkart.com/order_details?${q.toString()}`, { waitUntil: "domcontentloaded", timeout: 45_000 });
+  if (flipkartLoginUrl(page.url())) return { view: null, loginShown: true };
+  const res = await dataPromise;
+  const raw = res ? await res.json().catch(() => null) : null;
+  return { view: raw ? orderViewFromPageFetch(raw) : null, loginShown: false };
 }
 
 /** The Order row, in the shape the order sync writes a cancelled unit in, until the next sync refines it. */
@@ -467,12 +574,14 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
   const request = await CancelRequest.findById(requestId).lean();
   try {
     if (!request) return;
-    // Queued units, plus ones a hung or dead worker left "running" long ago.
+    const me = email.toLowerCase();
     const staleBefore = Date.now() - STALE_RUNNING_MS;
-    const units = request.units.filter(
-      (u) => u.email === email.toLowerCase() && (u.status === "queued" || (u.status === "running" && (!u.startedAt || new Date(u.startedAt).getTime() < staleBefore)))
-    );
-    if (!units.length) return;
+    const abandoned = (status: string, startedAt: Date | null | undefined) => status === "running" && (!startedAt || new Date(startedAt).getTime() < staleBefore);
+    // Queued units, plus ones a hung or dead worker left "running" long ago.
+    const units = request.units.filter((u) => u.email === me && (u.status === "queued" || abandoned(u.status, u.startedAt)));
+    // Urgent: orders of this account still to be read on their order page.
+    const orders = (request.orders || []).filter((o) => o.email === me && (o.status === "queued" || abandoned(o.status, o.startedAt)));
+    if (!units.length && !orders.length) return;
     const stale = units.filter((u) => u.status === "running").length;
     if (stale) console.log(`[cancel ${requestId}] ${email} re-picking ${stale} unit(s) left running by an earlier worker`);
     await CancelRequest.updateOne({ _id: requestId, status: "queued" }, { $set: { status: "running" } });
@@ -483,23 +592,102 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
       await applyToOrder(request.userId, u.unitId, status, message);
       log(`${u.orderId}/${u.unitId} → ${status}${message ? `: ${message}` : ""}`);
     };
+    const finishOrder = async (o: ICancelOrder, status: CancelOrderStatus, message: string, unitsFound = 0) => {
+      await setOrder(requestId, o.orderId, { status, message, unitsFound, finishedAt: new Date() });
+      log(`${o.orderId} order page → ${status}${message ? `: ${message}` : ""}`);
+    };
 
     const session = await resolveLoggedInSession(email);
     if (!session.ok) {
       for (const u of units) await finish(u, "failed", `Session: ${session.reason} — re-login this ID`);
+      for (const o of orders) await finishOrder(o, "failed", `Session: ${session.reason} — re-login this ID`);
       return;
     }
+    const account: OrderAccount = { id: new Types.ObjectId(session.platformId), email: session.email, cookies: session.cookies };
+    const userId = String(request.userId);
 
     const egress = await claimProxyForWorker(config.workerId).catch(() => null);
     const browser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
     const artifactDir = path.resolve("debug/cancel-runs", requestId);
-    const speed = await resolveCancelSpeed(String(request.userId)).catch(() => null);
-    const tabs = Math.max(1, Math.min(speed?.tabs || 1, units.length));
+    const speed = await resolveCancelSpeed(userId).catch(() => null);
     try {
       const ctx = await desktopContext(browser);
       const first = await ctx.newPage();
       await blockFlipkartLogout(first);
       await restoreFlipkartSession(first, session.cookies);
+      let sessionDead = false;
+
+      // ---- urgent: read each order on its page, save its units, queue them ----
+      // Units found here are pushed onto the request and cancelled below in the
+      // same browser. Each unit's own page visit (readEligibility) refreshes
+      // its Order row again right before the cancel, so Order Units carries
+      // what Flipkart showed at that moment.
+      const freshUnits = new Set<string>();
+      for (const o of orders) {
+        if (sessionDead) {
+          await finishOrder(o, "failed", "Session expired — re-login this ID");
+          continue;
+        }
+        await setOrder(requestId, o.orderId, { status: "running", startedAt: new Date() });
+        try {
+          const read = await withTimeout(readOrderPage(first, o.orderId), ORDER_PAGE_TIMEOUT_MS, `${o.orderId} order page`);
+          if (read.loginShown) {
+            sessionDead = true;
+            await finishOrder(o, "failed", "Session expired — re-login this ID");
+            continue;
+          }
+          const unitIds = Object.keys(read.view?.units || {});
+          if (!read.view || !unitIds.length) {
+            await finishOrder(o, "failed", "Flipkart shows no such order on this Platform ID — is it the account that placed it?");
+            continue;
+          }
+          const added: ICancelUnit[] = [];
+          const refused: Array<{ id: string; reason: string }> = [];
+          for (const unitId of unitIds) {
+            const mapped = mapApiUnitToOrder(read.view, unitId);
+            await saveMappedUnit(userId, account, mapped, { applyCalendar: false });
+            const row = await Order.findOne({ userId: request.userId, unit_id: unitId }).select("status_key cancel_status cancel_request_id product_name item_id").lean();
+            const label = `${o.orderId} / ${unitId}`;
+            const statusKey = String(row?.status_key || mapped.status_key || "");
+            if (TERMINAL.test(statusKey)) refused.push({ id: label, reason: `Already ${statusKey}` });
+            else if (IN_FLIGHT.has(String(row?.cancel_status || "")) && String(row?.cancel_request_id || "") !== requestId) refused.push({ id: label, reason: `Cancellation already ${row?.cancel_status}` });
+            else if (request.units.some((u) => u.unitId === unitId) || units.some((u) => u.unitId === unitId)) continue;
+            else {
+              added.push({
+                orderId: o.orderId,
+                unitId,
+                itemId: String(row?.item_id || "") || itemIdOf(unitId),
+                email: me,
+                productName: String(row?.product_name || mapped.product_name || ""),
+                status: "queued",
+                message: "",
+                startedAt: null,
+                finishedAt: null,
+              });
+            }
+          }
+          if (added.length) {
+            await CancelRequest.updateOne({ _id: requestId }, { $push: { units: { $each: added } } });
+            await Order.updateMany(
+              { userId: request.userId, unit_id: { $in: added.map((u) => u.unitId) } },
+              { $set: { cancel_status: "queued", cancel_request_id: requestId, cancel_requested_at: new Date(), cancel_requested_by: request.createdBy || "", cancel_error: "" } }
+            );
+            units.push(...added);
+            for (const u of added) freshUnits.add(u.unitId);
+          }
+          if (refused.length) await CancelRequest.updateOne({ _id: requestId }, { $push: { rejected: { $each: refused } } });
+          await finishOrder(o, "read", `${added.length} unit(s) queued${refused.length ? `, ${refused.length} refused` : ""}`, unitIds.length);
+        } catch (err) {
+          const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+          fs.mkdirSync(artifactDir, { recursive: true });
+          await withTimeout(first.screenshot({ path: path.join(artifactDir, `${o.orderId}-order-page.png`), fullPage: true }), 15_000, "screenshot").catch(() => undefined);
+          await finishOrder(o, "failed", message.slice(0, 500));
+          if (/SESSION_EXPIRED/.test(message)) sessionDead = true;
+        }
+      }
+      if (!units.length) return;
+
+      const tabs = Math.max(1, Math.min(speed?.tabs || 1, units.length));
       // More tabs share the context (and so the login); each runs its own flow.
       const pages: Page[] = [first];
       for (let i = 1; i < tabs; i++) {
@@ -510,7 +698,6 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
       if (tabs > 1) log(`${units.length} units across ${tabs} tabs`);
 
       const pending = [...units];
-      let sessionDead = false;
       const runTab = async (startPage: Page) => {
         let page = startPage;
         let flow = new FlipkartCancel(page, (_lvl, msg) => log(msg));
@@ -529,9 +716,17 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
             // a closed target); never for an expired session or Flipkart's answer.
             // Every attempt is capped: a tab that stops answering fails the
             // unit instead of holding this slot forever.
+            // Urgent-read units: the unit's own order page data, seen on the
+            // way to the cancel, is saved again so the row is current.
+            const onOrderPage = freshUnits.has(u.unitId)
+              ? async (raw: unknown) => {
+                  const view = orderViewFromPageFetch(raw);
+                  if (view?.units?.[u.unitId]) await saveMappedUnit(userId, account, mapApiUnitToOrder(view, u.unitId), { applyCalendar: false });
+                }
+              : undefined;
             const attempt = () =>
               withTimeout(
-                flow.cancelUnit({ orderId: u.orderId, unitId: u.unitId, itemId: u.itemId }, { dryRun: request.dryRun, onStep: async (name) => void (lastStep = name) }),
+                flow.cancelUnit({ orderId: u.orderId, unitId: u.unitId, itemId: u.itemId }, { dryRun: request.dryRun, onStep: async (name) => void (lastStep = name), onOrderPage }),
                 UNIT_TIMEOUT_MS,
                 `${u.orderId}/${u.unitId}`
               );
@@ -578,9 +773,9 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
     }
   } finally {
     await unlock();
-    // Done once no unit anywhere in the request is still waiting or running.
+    // Done once no unit — and no urgent order — anywhere in the request is still waiting or running.
     await CancelRequest.updateOne(
-      { _id: requestId, "units.status": { $nin: ["queued", "running"] } },
+      { _id: requestId, "units.status": { $nin: ["queued", "running"] }, "orders.status": { $nin: ["queued", "running"] } },
       { $set: { status: "done", finishedAt: new Date() } }
     );
   }

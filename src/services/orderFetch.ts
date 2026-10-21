@@ -22,6 +22,7 @@ import { addressHash, openOrderApiSession, type MappedOrderUnit, type ShippingAd
 import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSync.js";
 import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
+import { finishRun, startRun } from "./orderJobRuns.js";
 import { cardFieldsFor, checkoutOrderIdsFor } from "./orderLinks.js";
 import { captureInvoicesForAccount, type InvoiceMode } from "./invoiceCapture.js";
 import type { APIRequestContext } from "playwright";
@@ -1569,7 +1570,7 @@ export async function stopAllOrderFetch() {
   }
 }
 
-export async function startOrderFetch(userId: string, emails: string[], sinceDate: Date, opts: { invoices?: InvoiceMode } = {}) {
+export async function startOrderFetch(userId: string, emails: string[], sinceDate: Date, opts: { invoices?: InvoiceMode; trigger?: "user" | "system-cron"; by?: string } = {}) {
   assertIdleForFetch(userId);
   const job = state(userId);
   if (job.running) throw new Error("Order fetch is already running");
@@ -1658,6 +1659,15 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
   job.invoices = opts.invoices || "off";
   if (job.invoices !== "off") log(userId, "info", `Invoices: ${job.invoices === "new" ? "units enriched in this run" : "every delivered unit without a PDF"} → S3 (after enrichment, Chrome per unit)`);
   log(userId, "info", `Fetch mode: ${resolved.mode} (from ${resolved.source === "ui" ? "the dashboard switch" : "ORDER_FETCH_MODE in .env"})`);
+  // The panel's ledger row (services/orderJobRuns.ts): survives a restart, feeds "Sync Order Units From Platform".
+  await startRun(userId, "fetch", {
+    trigger: opts.trigger || "user",
+    by: opts.by || "",
+    total: queue.length,
+    message: `Fetch from ${job.sinceLabel} · ${queue.length} email(s) · ${windows} window(s) · ${resolved.mode}`,
+    meta: { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows, mode: resolved.mode, invoices: job.invoices },
+    failedItems: skipped.map((email) => ({ key: email, reason: "not logged in — skipped" })),
+  }).catch(() => undefined);
   beginTrace(userId, "fetch", { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows, mode: job.mode, modeSource: resolved.source });
   log(
     userId,
@@ -1674,6 +1684,18 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
     markFetchRunning(userId, false);
     if (!job.report.finishedAt) job.report.finishedAt = new Date().toISOString();
     tickElapsed(job);
+    const rep = job.report;
+    const total = rep.enrichQueued || rep.idsOpened || 0;
+    void finishRun(userId, "fetch", {
+      status: job.cancelled ? "stopped" : "completed",
+      total,
+      processed: rep.idsOpened || 0,
+      success: rep.idsScraped || 0,
+      failed: rep.idsFailed || 0,
+      cancelled: job.cancelled ? Math.max(0, total - (rep.idsOpened || 0)) : 0,
+      message: `${rep.accountsDone}/${rep.accountsQueued} email(s) · ${rep.idsDiscovered} unit IDs found, ${rep.idsNew} new, ${rep.idsScraped} saved, ${rep.idsFailed} failed, ${rep.idsSkippedOld} older than ${job.sinceLabel}`,
+      meta: { report: rep },
+    }).catch(() => undefined);
   });
 }
 

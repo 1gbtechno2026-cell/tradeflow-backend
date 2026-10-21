@@ -10,6 +10,7 @@ import {
   stopOrderFetch,
 } from "../services/orderFetch.js";
 import { getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
+import { listRuns, syncPanel } from "../services/orderJobRuns.js";
 import {
   cancelUpdateRequest,
   createUpdateRequest,
@@ -70,7 +71,7 @@ orderFetchRouter.post("/fetch/trigger", async (req, res) => {
     }
     const sinceDate = parseSinceDate(after);
     const userId = userIdFrom(req);
-    await startOrderFetch(userId, emails, sinceDate, { invoices: parseInvoiceMode(req.body?.invoices) });
+    await startOrderFetch(userId, emails, sinceDate, { invoices: parseInvoiceMode(req.body?.invoices), trigger: req.body?.trigger === "system-cron" ? "system-cron" : "user", by: String(req.body?.by || "").trim() });
     const job = getOrderFetchJob(userId);
     res.json({
       message: "Order fetch triggered successfully",
@@ -190,6 +191,22 @@ orderFetchRouter.post("/update/trigger", async (req, res) => {
 });
 
 /** Stops the newest open request (or `requestId`): queued accounts are removed, running ones finish their current unit. */
+/** "Sync Order Units From Platform": one row per job type (fetch, update, invoices placeholder, coupons, reschedule, cancel). */
+orderFetchRouter.get("/sync/panel", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim() || workspaceUserId();
+    res.json(await syncPanel(userId));
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Could not build the sync panel" });
+  }
+});
+
+orderFetchRouter.get("/sync/runs", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  const type = String(req.query.type || "") as "fetch" | "update" | "invoices" | "coupons" | "reschedule" | "cancel" | "";
+  res.json({ runs: await listRuns(userId, type || undefined, Number(req.query.limit) || 20) });
+});
+
 orderFetchRouter.post("/update/stop", async (req, res) => {
   try {
     const userId = userIdFrom(req);

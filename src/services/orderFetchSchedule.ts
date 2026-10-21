@@ -4,7 +4,7 @@ import { config } from "../config.js";
 import { OrderJobRun } from "../models/OrderJobRun.js";
 import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
 import { PlatformId } from "../models/PlatformId.js";
-import { cookiesFor, getOrderFetchJob, startOrderFetch } from "./orderFetch.js";
+import { getOrderFetchJob, startOrderFetch } from "./orderFetch.js";
 import { workspaceUserId } from "./sessionStore.js";
 
 /**
@@ -45,10 +45,17 @@ export async function setFetchSinceDays(userId: string, days: unknown, by: strin
   return resolveFetchSinceDays(userId);
 }
 
-/** Every logged-in Flipkart Platform ID with a saved session — what the scheduled run fetches. */
+/** Logged-in Flipkart Platform IDs with a saved session. Cookie blobs are ~19 KB each,
+ *  so the filter runs in the query (does the array have an element?) and only emails come back. */
+const WITH_SESSION = { userId: "", platform: "flipkart", status: "logged_in", sessionSavedAt: { $ne: null }, $or: [{ "sessionState.cookies.0": { $exists: true } }, { "sessionCookies.0": { $exists: true } }] };
+
 export async function scheduledFetchEmails(userId: string): Promise<string[]> {
-  const rows = await PlatformId.find({ userId, platform: "flipkart", status: "logged_in", sessionSavedAt: { $ne: null } }).select("email sessionCookies sessionState").sort({ createdAt: 1 }).lean();
-  return rows.filter((r) => cookiesFor(r).length > 0).map((r) => r.email);
+  const rows = await PlatformId.find({ ...WITH_SESSION, userId }).select("email").sort({ createdAt: 1 }).lean();
+  return rows.map((r) => r.email);
+}
+
+export async function scheduledFetchCount(userId: string): Promise<number> {
+  return PlatformId.countDocuments({ ...WITH_SESSION, userId });
 }
 
 /**
@@ -107,9 +114,9 @@ export function stopFetchSchedule(): void {
 
 export async function fetchScheduleStatus(userId: string) {
   const since = await resolveFetchSinceDays(userId);
-  const [lastRun, emails] = await Promise.all([
+  const [lastRun, loggedInIds] = await Promise.all([
     OrderJobRun.findOne({ userId, type: "fetch", trigger: "system-cron" }).sort({ createdAt: -1 }).select("status startedAt finishedAt total success failed message").lean(),
-    scheduledFetchEmails(userId),
+    scheduledFetchCount(userId),
   ]);
   return {
     enabled: FETCH_SCHEDULE_ENABLED,
@@ -117,7 +124,7 @@ export async function fetchScheduleStatus(userId: string) {
     timezone: FETCH_TIMEZONE,
     sinceDays: since.days,
     sinceSource: since.source,
-    loggedInIds: emails.length,
+    loggedInIds,
     windows: config.fetchWindowConcurrency || null,
     lastTick,
     lastScheduledRun: lastRun,

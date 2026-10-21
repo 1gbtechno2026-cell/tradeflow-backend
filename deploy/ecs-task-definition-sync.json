@@ -1,0 +1,38 @@
+{
+  "family": "tradeflow-sync",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "REPLACE_EXECUTION_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "tradeflow-sync",
+      "image": "390346501537.dkr.ecr.ap-south-1.amazonaws.com/tradeflow-fetch:latest",
+      "essential": true,
+      "command": ["npx", "tsx", "src/worker.ts"],
+      "environment": [
+        { "name": "WORKER_ROLES", "value": "sync" },
+        { "name": "WORKER_ID", "value": "sync-01" },
+        { "name": "SYNC_CONCURRENCY", "value": "4" },
+        { "name": "SYNC_SWEEP_MS", "value": "600000" },
+        { "name": "PROXY_MODE", "value": "required" },
+        { "name": "HEADLESS", "value": "true" },
+        { "name": "REDIS_URL", "value": "REPLACE_REDIS_URL" }
+      ],
+      "secrets": [
+        { "name": "MONGO_URI", "valueFrom": "REPLACE_SECRET_ARN:MONGO_URI::" },
+        { "name": "TRADE_FLOW_USER_ID", "valueFrom": "REPLACE_SECRET_ARN:TRADE_FLOW_USER_ID::" },
+        { "name": "PROXY_CRED_KEY", "valueFrom": "REPLACE_PROXY_CRED_KEY_SECRET_ARN" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/tradeflow-fetch",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "sync"
+        }
+      }
+    }
+  ]
+}

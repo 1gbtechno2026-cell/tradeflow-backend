@@ -51,8 +51,20 @@ export interface IOrder {
   billing_phone_number: string | null;
   billing_address_name: string | null;
   billing_address_pincode: string | null;
+  /** Delivery address as Flipkart shows it (services/orderApi.ts ShippingAddress) and its hash. */
+  shipping_address?: Record<string, string> | null;
+  shipping_address_hash?: string;
+  /** Address bookkeeping, written by the update worker (services/orderUnitEvents.ts). */
+  address_first_seen_at?: Date | null;
+  address_changed_at?: Date | null;
+  address_history?: Array<{ hash: string; address: Record<string, string> | null; seenAt: Date; until: Date }>;
   is_invoice_downloaded: boolean;
   invoice_path: string;
+  invoice_s3_key: string;
+  invoice_downloaded_at: Date | null;
+  invoice_size: number;
+  invoice_parts: Array<{ type: string; pages: number; invoiceNumber: string; bytes: number }>;
+  api_extra?: Record<string, unknown>;
   supercoin_amount_applied: number;
   is_bae_order: boolean;
   cash_on_delivery: boolean;
@@ -65,6 +77,22 @@ export interface IOrder {
   parent_card_number: string;
   card_number: string;
   ref_code: string;
+  /** From the checkout job that placed the order (services/orderLinks.ts):
+   *  "cod" / "card", the amount Flipkart charged, and its handling fee —
+   *  COD_FEE on cash on delivery, the card-type fee on a card. Blank on
+   *  orders no job of ours placed. */
+  payment_mode: string;
+  transaction_amount: string;
+  payment_fee: string;
+  payment_fee_details: string;
+  /** Cancellation requested from the dashboard (services/orderCancel.ts):
+   *  "" | queued | running | cancelled | not_cancellable | failed. */
+  cancel_status: string;
+  cancel_request_id: string;
+  cancel_requested_at: Date | null;
+  /** Dashboard user who asked for the cancellation. */
+  cancel_requested_by: string;
+  cancel_error: string;
   refund_status: string | null;
   refund_amount: string | null;
   refund_msg: string | null;
@@ -77,6 +105,11 @@ export interface IOrder {
   last_fetch: Date | null;
   since_date: Date | null;
   last_error: string;
+  /** Which reader wrote this document last: "scrape" (the pages) or "api"
+   *  (Flipkart's order APIs). Blank on documents older than the field. */
+  fetch_source?: string;
+  /** Courier on the shipped step ("Ekart Logistics"). */
+  shipment_partner_name?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -147,8 +180,22 @@ const OrderSchema = new Schema<IOrder>(
     billing_phone_number: { type: String, default: null },
     billing_address_name: { type: String, default: null },
     billing_address_pincode: { type: String, default: null },
+    shipping_address: { type: Schema.Types.Mixed, default: null },
+    shipping_address_hash: { type: String, default: "" },
+    address_first_seen_at: { type: Date, default: null },
+    address_changed_at: { type: Date, default: null },
+    address_history: { type: [new Schema({ hash: String, address: Schema.Types.Mixed, seenAt: Date, until: Date }, { _id: false })], default: [] },
     is_invoice_downloaded: { type: Boolean, default: false },
     invoice_path: { type: String, default: "" },
+    /** S3 key of the stored invoice PDF (services/invoiceCapture.ts). */
+    invoice_s3_key: { type: String, default: "" },
+    invoice_downloaded_at: { type: Date, default: null },
+    invoice_size: { type: Number, default: 0 },
+    /** The PDFs inside Flipkart's bundle, in merged order (product first). */
+    invoice_parts: { type: [new Schema({ type: String, pages: Number, invoiceNumber: String, bytes: Number }, { _id: false })], default: [] },
+    /** API-only extras from the order view (fsn, listing_id, prices…) — kept
+     *  so the dashboard's Product ID / Listing ID filters have something to match. */
+    api_extra: { type: Schema.Types.Mixed, default: undefined },
     supercoin_amount_applied: { type: Number, default: 0 },
     is_bae_order: { type: Boolean, default: false },
     cash_on_delivery: { type: Boolean, default: false },
@@ -157,6 +204,15 @@ const OrderSchema = new Schema<IOrder>(
     parent_card_number: { type: String, default: "" },
     card_number: { type: String, default: "" },
     ref_code: { type: String, default: "" },
+    payment_mode: { type: String, default: "" },
+    transaction_amount: { type: String, default: "" },
+    payment_fee: { type: String, default: "" },
+    payment_fee_details: { type: String, default: "" },
+    cancel_status: { type: String, default: "" },
+    cancel_request_id: { type: String, default: "" },
+    cancel_requested_at: { type: Date, default: null },
+    cancel_requested_by: { type: String, default: "" },
+    cancel_error: { type: String, default: "" },
     refund_status: { type: String, default: null },
     refund_amount: { type: String, default: null },
     refund_msg: { type: String, default: null },
@@ -169,6 +225,8 @@ const OrderSchema = new Schema<IOrder>(
     last_fetch: { type: Date, default: null },
     since_date: { type: Date, default: null },
     last_error: { type: String, default: "" },
+    fetch_source: { type: String, default: "" },
+    shipment_partner_name: { type: String, default: "" },
   },
   { timestamps: true }
 );

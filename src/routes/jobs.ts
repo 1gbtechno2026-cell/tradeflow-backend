@@ -4,11 +4,16 @@ import { z } from "zod";
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import { CheckoutBatch } from "../models/CheckoutBatch.js";
 import { getCheckoutQueue } from "../queue.js";
+import { JOB_CLASSES, jobClassFor } from "../services/jobClass.js";
 import { effectiveAttemptsFor, parseCreateJobBody, requiredOrdersFor } from "../services/jobRequest.js";
-import { initBatchCounters, readBatchProgress } from "../services/batchCounters.js";
+import { readBatchProgress, settleBatchIfCancelling } from "../services/batchCounters.js";
+import { config } from "../config.js";
 import { enqueueCheckoutJob } from "../services/checkoutEnqueue.js";
 import { requestSnapshot } from "../services/orderSnapshot.js";
 import { resolveAddress, resolveLoggedInSession, workspaceUserId } from "../services/sessionStore.js";
+import { toCardDetails } from "../services/paymentCards.js";
+import { resyncCheckoutJob } from "../services/orderSync.js";
+import type { AuthType } from "../paymentStrategies/types.js";
 import type { AddressDetails, JobRequestSnapshot, JobResultSnapshot } from "../types.js";
 
 export const jobsRouter = Router();
@@ -38,12 +43,18 @@ function publicJob(job: {
   errorCodeDisplay?: string;
   errorSource?: string;
   errorDetails?: string;
+  errorStage?: string;
+  /** Set the instant before Pay was pressed; a job with this and no order id
+   *  must be reconciled against Flipkart's orders, never re-run blindly. */
+  paymentStartedAt?: Date | null;
   filterReason?: string;
   failedAt?: Date | null;
   batchStatus?: string;
+  systemId?: string;
   logs?: unknown[];
   startedAt: Date | null;
   completedAt: Date | null;
+  orderSync?: unknown;
   createdAt: Date;
   updatedAt: Date;
 }) {
@@ -53,6 +64,7 @@ function publicJob(job: {
     batchId: job.batchId,
     email: job.email,
     userId: job.userId,
+    systemId: job.systemId || undefined,
     platform: job.request?.platform || "FLIPKART",
     status: job.status,
     step: job.step,
@@ -74,12 +86,16 @@ function publicJob(job: {
     errorCodeDisplay: job.errorCodeDisplay || undefined,
     errorSource: job.errorSource || undefined,
     errorDetails: job.errorDetails || undefined,
+    errorStage: job.errorStage || undefined,
+    paymentStartedAt: job.paymentStartedAt ?? null,
     filterReason: job.filterReason || undefined,
     failedAt: job.failedAt,
     batchStatus: job.batchStatus || undefined,
     logs: job.logs,
     startedAt: job.startedAt,
     completedAt: job.completedAt,
+    /** Whether this attempt's order reached Order Units (services/orderSync.ts). */
+    orderSync: job.orderSync ?? null,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   };
@@ -101,6 +117,11 @@ async function attachBatches<T extends { batchId: string; batchStatus?: string; 
       filterReason: j.filterReason || b.filterReason || undefined,
       batch: {
         batchStatus: b.batchStatus,
+        systemId: b.systemId || "",
+        cancelRequestedAt: b.cancelRequestedAt ?? null,
+        cancelRequestedBy: b.cancelRequestedBy || "",
+        cancelledAt: b.cancelledAt ?? null,
+        completedAt: b.completedAt ?? null,
         filterReason: b.filterReason,
         filteredCount: b.filteredCount,
         purchasedQuantity: b.purchasedQuantity,
@@ -166,6 +187,11 @@ jobsRouter.post("/", async (req, res) => {
     const effectiveAttempts = effectiveAttemptsFor(data.totalAttempts, requiredOrders);
     const jobs: Array<ReturnType<typeof publicJob>> = [];
     const request = requestSnapshot({ ...data, totalAttempts: effectiveAttempts });
+    // Unmasked, for the queue payload only. `request.cards` just above is the
+    // masked copy that gets persisted on the job document; the two must never be
+    // confused for one another.
+    const cards = toCardDetails(data.cards);
+    const authType = data.authType as AuthType | undefined;
 
     // Emails are assigned round-robin across requiredOrders jobs.
     // uniqueEmails.length may be < requiredOrders — the same logged-in ID is reused
@@ -219,10 +245,11 @@ jobsRouter.post("/", async (req, res) => {
     }
 
     if (!data.dryRun) {
-      await initBatchCounters(batchId);
+      // The batch document is the progress ledger (services/batchCounters.ts) and the unit of cancellation.
       await CheckoutBatch.create({
         batchId,
         userId,
+        systemId: config.systemId,
         batchStatus: "running",
         filterReason: null,
         filteredCount: 0,
@@ -231,6 +258,9 @@ jobsRouter.post("/", async (req, res) => {
         totalQuantity,
         quantityPerOrder: perOrderQty,
         totalAttempts: effectiveAttempts,
+        productUrl: data.productUrl,
+        paymentMode: data.paymentMode || "",
+        createdBy: String(req.header("x-requested-by") || ""),
       });
     }
 
@@ -253,6 +283,12 @@ jobsRouter.post("/", async (req, res) => {
         address,
         request,
         dryRun: data.dryRun,
+        paymentMode: data.paymentMode,
+        cardType: data.cardType,
+        authType,
+        corporateId: data.corporateId,
+        cardMaxUsage: data.cardMaxUsage,
+        cards,
       });
       if (!data.dryRun) {
         console.log(`[trade-flow] QUEUED ${session.email} job=${created._id} redis=${created.bullmqJobId || created._id}`);
@@ -300,6 +336,10 @@ jobsRouter.get("/", async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 80));
   const filter: Record<string, unknown> = { userId };
   if (status) filter.status = status;
+  // ?system=mine → only this deployment's jobs (pre-systemId rows count as ours); ?system=<id> → that one; default all.
+  const system = String(req.query.system || "").trim();
+  if (system === "mine") filter.systemId = { $in: [config.systemId, "", null] };
+  else if (system && system !== "all") filter.systemId = system;
   // Omit logs on list — unbounded log arrays OOM the API under jobs-proxy polling.
   const rows = await CheckoutJob.find(filter)
     .select("-logs")
@@ -312,7 +352,123 @@ jobsRouter.get("/", async (req, res) => {
   ]);
   const counts: Record<string, number> = {};
   for (const row of grouped) counts[String(row._id)] = row.n;
-  res.json({ jobs: await attachBatches(rows.map(publicJob)), counts, total: rows.length });
+  res.json({ jobs: await attachBatches(rows.map(publicJob)), counts, total: rows.length, systemId: config.systemId });
+});
+
+// ── Batch-level cancel ──────────────────────────────────────────────────────
+// "Stop placing": waiting attempts are cancelled and taken off this system's
+// queues, attempts still before Pay are marked cancelled and stop at the
+// runner's next checkpoint (which gives their reservation back), attempts past
+// Pay are left to finish — money is never left ambiguous. Nothing is deleted;
+// who / when / why is recorded on the batch. Idempotent.
+
+/** Every BullMQ entry of this batch still waiting in this system's queues. */
+async function removeQueuedForBatch(batchId: string): Promise<number> {
+  let removed = 0;
+  for (const cls of JOB_CLASSES) {
+    const q = getCheckoutQueue(cls);
+    const waiting = await q.getJobs(["waiting", "delayed", "prioritized", "paused"]);
+    for (const j of waiting) {
+      if (j.data?.batchId !== batchId) continue;
+      await j.remove().catch(() => undefined);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+type CancelBatchResult =
+  | { ok: false; status: 404 | 409; error: string; systemId?: string }
+  | {
+      ok: true;
+      batchId: string;
+      batchStatus: string;
+      systemId: string;
+      queuedCancelled: number;
+      removedFromQueue: number;
+      runningAborted: number;
+      finishingAfterPay: number;
+      purchasedQuantity: number;
+      attemptsUsed: number;
+      totalQuantity: number;
+      totalAttempts: number;
+    };
+
+async function cancelBatch(batchId: string, by: string, reason: string, force: boolean): Promise<CancelBatchResult> {
+  const batch = await CheckoutBatch.findOne({ batchId }).lean();
+  if (!batch) return { ok: false, status: 404, error: "Batch not found" };
+  const foreign = Boolean(batch.systemId) && batch.systemId !== config.systemId;
+  if (foreign && !force) {
+    return { ok: false, status: 409, error: `This batch belongs to system "${batch.systemId}" (this is "${config.systemId}"); cancel it from there, or pass force to mark it cancelled here (its queue entries there cannot be removed from here)`, systemId: batch.systemId };
+  }
+  const now = new Date();
+  await CheckoutBatch.updateOne(
+    { batchId, batchStatus: "running" },
+    { $set: { batchStatus: "cancelling", cancelRequestedAt: now, cancelRequestedBy: by, cancelReason: reason } }
+  );
+  // A batch already completed/exhausted can still have retries open; record the request without changing its status.
+  await CheckoutBatch.updateOne({ batchId, cancelRequestedAt: null }, { $set: { cancelRequestedAt: now, cancelRequestedBy: by, cancelReason: reason } });
+
+  const who = by || "operator";
+  const base = `Batch cancelled by ${who}${reason ? ` — ${reason}` : ""}`;
+  const queued = await CheckoutJob.updateMany(
+    { batchId, status: "queued" },
+    { $set: { status: "cancelled", step: "cancelled", completedAt: now }, $push: { logs: { at: now, level: "warn", step: "cancelled", message: base } } }
+  );
+  const removed = foreign ? 0 : await removeQueuedForBatch(batchId);
+  // Before Pay: the runner sees `cancelled` at its next checkpoint, closes Chrome and releases the reservation.
+  const aborted = await CheckoutJob.updateMany(
+    { batchId, status: "running", paymentStartedAt: null },
+    { $set: { status: "cancelled", step: "cancelled", completedAt: now }, $push: { logs: { at: now, level: "warn", step: "cancelled", message: `${base} — attempt stopped before Pay` } } }
+  );
+  const finishing = await CheckoutJob.countDocuments({ batchId, status: "running", paymentStartedAt: { $ne: null } });
+  const status = await settleBatchIfCancelling(batchId);
+  const after = await CheckoutBatch.findOne({ batchId }).lean();
+  console.log(`[trade-flow] batch ${batchId.slice(0, 8)} cancel by ${who}: queued ${queued.modifiedCount} · removed ${removed} · aborted ${aborted.modifiedCount} · finishing after Pay ${finishing} → ${status}`);
+  return {
+    ok: true,
+    batchId,
+    batchStatus: String(status ?? after?.batchStatus ?? "cancelling"),
+    systemId: after?.systemId || "",
+    queuedCancelled: queued.modifiedCount,
+    removedFromQueue: removed,
+    runningAborted: aborted.modifiedCount,
+    finishingAfterPay: finishing,
+    purchasedQuantity: after?.purchasedQuantity ?? 0,
+    attemptsUsed: after?.attemptsUsed ?? 0,
+    totalQuantity: after?.totalQuantity ?? 0,
+    totalAttempts: after?.totalAttempts ?? 0,
+  };
+}
+
+jobsRouter.post("/batch/:batchId/cancel", async (req, res) => {
+  const body = (req.body || {}) as { by?: unknown; reason?: unknown; force?: unknown };
+  const result = await cancelBatch(String(req.params.batchId), String(body.by || ""), String(body.reason || ""), body.force === true);
+  if (!result.ok) {
+    res.status(result.status).json({ error: result.error, systemId: result.systemId });
+    return;
+  }
+  res.json(result);
+});
+
+/** Empty this system's queue: cancel every batch of this workspace that still has open attempts here, then drop any stray entries. */
+jobsRouter.post("/cancel-all", async (req, res) => {
+  const body = (req.body || {}) as { by?: unknown; reason?: unknown };
+  const by = String(body.by || "");
+  const reason = String(body.reason || "queue emptied");
+  const userId = workspaceUserId();
+  const openBatches = (await CheckoutJob.distinct("batchId", { userId, status: { $in: ["queued", "running"] }, systemId: { $in: [config.systemId, "", null] } })) as string[];
+  const batches: CancelBatchResult[] = [];
+  for (const id of openBatches) batches.push(await cancelBatch(id, by, reason, false));
+  let strays = 0;
+  for (const cls of JOB_CLASSES) {
+    const q = getCheckoutQueue(cls);
+    const n = await q.getJobCounts("wait", "delayed", "prioritized");
+    strays += (n.wait || 0) + (n.delayed || 0) + (n.prioritized || 0);
+    await q.drain(true);
+  }
+  console.log(`[trade-flow] cancel-all by ${by || "operator"}: ${openBatches.length} batch(es), ${strays} stray queue entr${strays === 1 ? "y" : "ies"} drained`);
+  res.json({ systemId: config.systemId, batches, drainedStrays: strays });
 });
 
 jobsRouter.get("/batch/:batchId", async (req, res) => {
@@ -344,6 +500,19 @@ jobsRouter.get("/:id", async (req, res) => {
   res.json(publicJob(job));
 });
 
+/** Put this attempt's order into Order Units again (or for the first time) — the
+ *  manual lever for a sync that gave up, e.g. after the ID was re-logged in. */
+jobsRouter.post("/:id/order-sync", async (req, res) => {
+  const job = await CheckoutJob.findById(req.params.id).select("_id status");
+  if (!job) {
+    res.status(404).json({ error: "Job not found" });
+    return;
+  }
+  await resyncCheckoutJob(String(job._id));
+  const after = await CheckoutJob.findById(job._id).select("orderSync").lean();
+  res.status(202).json({ jobId: String(job._id), orderSync: after?.orderSync ?? null });
+});
+
 jobsRouter.post("/:id/cancel", async (req, res) => {
   const job = await CheckoutJob.findById(req.params.id);
   if (!job) {
@@ -358,7 +527,9 @@ jobsRouter.post("/:id/cancel", async (req, res) => {
     job.status === "dry_run" ||
     job.status === "completed_target_reached" ||
     job.status === "failed_attempt_budget_exhausted" ||
-    job.status === "filtered"
+    job.status === "filtered" ||
+    // Parked after Pay was pressed: cancelling would hide a possible charge.
+    job.status === "needs_reconciliation"
   ) {
     res.json(publicJob(job));
     return;
@@ -369,9 +540,17 @@ jobsRouter.post("/:id/cancel", async (req, res) => {
   job.logs.push({ at: new Date(), level: "warn", step: "cancelled", message: "Cancelled by API" });
   await job.save();
   try {
-    const queue = getCheckoutQueue();
+    // The job sits on its class's queue (and, if it was requeued while
+    // waiting for capacity, under a suffixed id on the same queue).
+    const req = job.request;
+    const queue = getCheckoutQueue(
+      jobClassFor({ paymentMode: req?.paymentMode, authType: req?.authType, corporateId: req?.corporateId })
+    );
     const queued = await queue.getJob(String(job._id));
     if (queued) await queued.remove();
+    for (const j of await queue.getDelayed()) {
+      if (String(j.id || "").startsWith(`${String(job._id)}-w`)) await j.remove().catch(() => undefined);
+    }
   } catch {
     /* ignore */
   }

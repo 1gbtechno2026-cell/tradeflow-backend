@@ -1,34 +1,56 @@
 import type { Page } from "playwright";
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
+import { FlipkartApiWatcher } from "../automation/FlipkartApiWatcher.js";
+import { PaymentApiWatcher, type PlacedOrderDetails } from "../automation/PaymentApiWatcher.js";
+import { closeReporter, openReporter, reporterFor } from "./jobReporter.js";
 import {
+  isBatchCancelled,
   readBatchProgress,
+  refundBatchAttempt,
   releaseBatchReservation,
   reserveBatchSlot,
-  markBatchFiltered,
+  settleBatchIfCancelling,
 } from "./batchCounters.js";
-import { CheckoutBatch } from "../models/CheckoutBatch.js";
+import { claimProxyForWorker, isProxyError, probeExitIp, recordProxyUse, reportProxyFailure } from "./proxyPool.js";
+import { setNavigationTimeoutScale } from "../automation/helpers.js";
 import {
   blockFlipkartLogout,
-  closeBrowser,
+  desktopContext,
   flipkartLoginUrl,
-  launchStealthContext,
+  launchMobileBrowser,
+  launchStealthBrowser,
+  mobileContext,
   restoreFlipkartSession,
   sleep,
 } from "./browser.js";
 import { config } from "../config.js";
-import { enqueueCheckoutJob } from "./checkoutEnqueue.js";
+import { enqueueCheckoutJob, requeueCheckoutJob } from "./checkoutEnqueue.js";
+import { jobClassFor } from "./jobClass.js";
+import { availablePhoneCapacity } from "./employeePhoneLease.js";
+import { cardPoolAdmission } from "./cardPool.js";
+import { getRedis } from "../lib/redis.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
+import { lockAccount } from "./accountLock.js";
+import { enqueueOrderSync } from "./orderSync.js";
+import { runPaymentPhase } from "./paymentPhase.js";
 import { FlipkartNetworkObserver } from "../automation/FlipkartNetworkObserver.js";
 import {
   CheckoutFailure,
-  classifyPageText,
   classifyThrownMessage,
   failureFields,
 } from "./checkoutErrors.js";
 import type { CheckoutJobData, JobRequestSnapshot, JobResultSnapshot, JobStatus, LogLevel } from "../types.js";
 
+/** Inside a run, lines go through the job's JobReporter (batched: one write per
+ *  flush instead of one per line). Outside one — claim-time messages before the
+ *  reporter exists — they are written directly, as before. */
 async function appendLog(jobId: string, level: LogLevel, message: string, step?: string) {
+  const reporter = reporterFor(jobId);
+  if (reporter) {
+    reporter.log(level, message, step);
+    return;
+  }
   console.log(`[${jobId}] [${level}]${step ? ` [${step}]` : ""} ${message}`);
     const update: Record<string, unknown> = {
       $push: { logs: { at: new Date(), level, step, message } },
@@ -38,12 +60,49 @@ async function appendLog(jobId: string, level: LogLevel, message: string, step?:
 }
 
 async function patchResult(jobId: string, patch: Partial<JobResultSnapshot>) {
+  const reporter = reporterFor(jobId);
+  if (reporter) {
+    reporter.patch(patch);
+    return;
+  }
   const set: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(patch)) {
     if (value === undefined) continue;
     set[`result.${key}`] = value;
   }
   if (Object.keys(set).length) await CheckoutJob.updateOne({ _id: jobId }, { $set: set });
+}
+
+/**
+ * The placed order's numbers, as result fields. From Flipkart's own gateway
+ * and confirmation responses (PaymentApiWatcher.placedOrderDetails) — the
+ * confirmation PAGE says only "Order Placed" behind a scratch card.
+ */
+export function orderDetailFields(d: PlacedOrderDetails | null | undefined, placedAt = new Date()): Partial<JobResultSnapshot> {
+  if (!d) return {};
+  const promiseDate =
+    d.promiseDays != null ? new Date(placedAt.getTime() + d.promiseDays * 24 * 60 * 60 * 1000) : undefined;
+  return {
+    ...(d.transactionAmount ? { transactionAmount: d.transactionAmount } : {}),
+    ...(d.cartAfterCardOffer ? { cartAfterCardOffer: d.cartAfterCardOffer } : {}),
+    ...(d.paymentFee ? { paymentFee: d.paymentFee } : {}),
+    ...(d.paymentFeeDetails ? { paymentFeeDetails: d.paymentFeeDetails } : {}),
+    ...(d.shippingAmount ? { shippingAmount: d.shippingAmount } : {}),
+    ...(d.discountPct ? { discountPct: d.discountPct } : {}),
+    ...(d.mrp ? { mrp: d.mrp } : {}),
+    // The product page's price read is unreliable (empty on the keychain);
+    // Flipkart's own unit price from the confirmation data fills the gap.
+    ...(d.unitPrice ? { unitPrice: d.unitPrice } : {}),
+    ...(d.bankTransactionId ? { bankTransactionId: d.bankTransactionId } : {}),
+    ...(d.pgTransactionId ? { pgTransactionId: d.pgTransactionId } : {}),
+    ...(d.bankName ? { bankName: d.bankName } : {}),
+    ...(d.cardBrand ? { cardBrand: d.cardBrand } : {}),
+    ...(d.supercoinsApplied ? { supercoinsApplied: d.supercoinsApplied } : {}),
+    ...(d.giftCardApplied ? { giftCardApplied: d.giftCardApplied } : {}),
+    ...(d.promiseDays != null ? { promiseDays: d.promiseDays, promiseDate } : {}),
+    ...(d.orderStatus ? { orderStatus: d.orderStatus } : {}),
+    ...(d.sellerName ? { sellerName: d.sellerName } : {}),
+  };
 }
 
 function batchLimits(data: CheckoutJobData) {
@@ -59,9 +118,10 @@ async function finishWithoutChrome(
   step: string,
   message: string,
   level: LogLevel = "info",
-  extra?: { failedStep?: string; filterReason?: string; batchStatus?: string; failure?: CheckoutFailure }
+  extra?: { failedStep?: string; failure?: CheckoutFailure }
 ) {
   const mapped = extra?.failure;
+  await reporterFor(jobId)?.beforeTerminal();
   await CheckoutJob.updateOne(
     { _id: jobId, status: { $ne: "cancelled" } },
     {
@@ -69,11 +129,9 @@ async function finishWithoutChrome(
         status,
         step,
         failedStep: extra?.failedStep || mapped?.failedStep || (status.startsWith("failed") ? step : ""),
-        error: status === "skipped" || status.startsWith("failed") || status === "filtered" ? message : "",
-        failureMessage: extra?.failedStep === "out_of_stock_pincode" || extra?.failedStep === "batch_filtered" || mapped ? message : "",
+        error: status === "skipped" || status.startsWith("failed") ? message : "",
+        failureMessage: mapped ? message : "",
         ...(mapped ? failureFields(mapped) : {}),
-        filterReason: extra?.filterReason || "",
-        batchStatus: extra?.batchStatus || "",
         completedAt: new Date(),
       },
       $push: { logs: { at: new Date(), level, step, message } },
@@ -92,10 +150,8 @@ async function maybeEnqueueRetry(
   if (latest?.status === "cancelled") return;
   const { quantityPerOrder, totalQuantity, totalAttempts } = batchLimits(data);
   const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
-  if (progress.status === "filtered") {
-    console.log(
-      `[${data.jobId}] [info] [batch] filtered (${progress.filterReason || "out_of_stock_pincode"}) — no retry`
-    );
+  if (isBatchCancelled(progress.status)) {
+    console.log(`[${data.jobId}] [info] [batch] batch cancelled — no retry`);
     return;
   }
   if (progress.status === "completed" || progress.purchasedQuantity >= totalQuantity) {
@@ -124,6 +180,16 @@ async function maybeEnqueueRetry(
     address: data.address,
     request,
     isRetry: true,
+    // Carried from the payload we were handed, not re-read from Mongo: the
+    // persisted snapshot's cards are masked, so a retry that rebuilt them from
+    // `request` would queue a job holding "54XXXXXXXX000759" and fail at the
+    // bank with nothing in the logs to explain why.
+    paymentMode: data.paymentMode,
+    cardType: data.cardType,
+    authType: data.authType,
+    corporateId: data.corporateId,
+    cardMaxUsage: data.cardMaxUsage,
+    cards: data.cards,
   });
   console.log(
     `[${data.jobId}] [info] [batch] retry queued job=${job._id} after ${reason} (purchased=${progress.purchasedQuantity}/${totalQuantity} attempts=${progress.attemptsUsed}/${totalAttempts})`
@@ -136,26 +202,187 @@ async function maybeEnqueueRetry(
  * - Chrome is a throwaway window; we never click Flipkart Logout.
  * - Closing the window only drops local cookies in that process.
  */
+/**
+ * Exercise the payment phase without touching a real bank page.
+ *
+ * Defaults to ON deliberately. Flipkart's payments-page selectors are not written
+ * yet (paymentPhase.fillFlipkartCardForm), so a live run would stop mid-flow with
+ * a card already chosen; and the first real charge should be a decision someone
+ * makes explicitly, not something that happens because a default flipped. Set
+ * PAYMENT_DRY_RUN=false once the selectors land and you mean it.
+ */
+const PAYMENT_DRY_RUN = process.env.PAYMENT_DRY_RUN !== "false";
+
+/** Flipkart's E002 page. "Deliver to" present means a real checkout, not the error. */
+async function checkoutShowsE002(page: Page): Promise<boolean> {
+  const text = String(await page.evaluate(() => document.body?.innerText || "").catch(() => ""));
+  return /Something went wrong/i.test(text) && !/Deliver to/i.test(text);
+}
+
+/** How quiet a `running` job's heartbeat must go before another worker may take
+ *  it. Comfortably longer than HEARTBEAT_MS so a slow page never looks dead. */
+const CLAIM_STALE_MS = Number(process.env.CHECKOUT_CLAIM_STALE_MS || 10 * 60 * 1000);
+const HEARTBEAT_MS = Number(process.env.CHECKOUT_HEARTBEAT_MS || 60 * 1000);
+/** How long an otp-phone job waits before asking again when no handset is free. */
+const PHONE_WAIT_MS = Number(process.env.PHONE_WAIT_MS || 20 * 1000);
+/** Upper bound on one job's hold of a Flipkart account; released on exit. */
+
+/**
+ * Take exclusive ownership of a job, or report that someone else has it.
+ *
+ * One findOneAndUpdate, so two workers handed the same job cannot both win —
+ * which matters because the delivery guarantee is about to change. BullMQ holds a
+ * Redis lock per job today, so `findById` then `save()` was safe; SQS Standard is
+ * at-least-once BY DESIGN, and the same message WILL occasionally be delivered
+ * twice. Without this, the second delivery opens a second Chrome on the same
+ * order and the product is bought twice.
+ *
+ * The filter also readmits a job whose worker died: `running` with a heartbeat
+ * older than CLAIM_STALE_MS. Without that clause the claim would be permanent and
+ * a killed worker would strand its order forever — BullMQ's stalledInterval does
+ * this job today and SQS has no equivalent.
+ */
+async function claimCheckoutJob(jobId: string, runId: string) {
+  const staleBefore = new Date(Date.now() - CLAIM_STALE_MS);
+  return CheckoutJob.findOneAndUpdate(
+    {
+      _id: jobId,
+      $or: [
+        { status: "queued" },
+        // Reclaim only a *silent* running job. heartbeatAt null means it was
+        // claimed before this field existed, or claimed and never beat once.
+        // NEVER one that had already pressed Pay (paymentStartedAt set): money
+        // may have moved, and a second run would buy the product twice. Those
+        // go to needs_reconciliation in runCheckoutJob instead.
+        { status: "running", heartbeatAt: { $lt: staleBefore }, paymentStartedAt: null },
+        { status: "running", heartbeatAt: null, startedAt: { $lt: staleBefore }, paymentStartedAt: null },
+      ],
+    },
+    {
+      $set: {
+        status: "running",
+        step: "session",
+        startedAt: new Date(),
+        heartbeatAt: new Date(),
+        claimedBy: runId,
+      },
+    },
+    { new: true }
+  );
+}
+
 export async function runCheckoutJob(data: CheckoutJobData) {
-  const job = await CheckoutJob.findById(data.jobId);
-  if (!job) throw new Error(`Job ${data.jobId} not found`);
-  if (job.status === "cancelled") return;
+  const runId = `${data.jobId}:${Date.now().toString(36)}`;
+  const existing = await CheckoutJob.findById(data.jobId).select("status claimedBy");
+  if (!existing) throw new Error(`Job ${data.jobId} not found`);
+  if (existing.status === "cancelled") return;
+
+  const job = await claimCheckoutJob(data.jobId, runId);
+  if (!job) {
+    // A worker that died AFTER pressing Pay leaves a silent `running` job with
+    // paymentStartedAt set. It must not be re-run — the bank may have charged
+    // and Flipkart may have placed the order — so it is parked for a person or
+    // for reconciliation against Flipkart's orders, with whatever is known.
+    const staleBefore = new Date(Date.now() - CLAIM_STALE_MS);
+    const parked = await CheckoutJob.findOneAndUpdate(
+      {
+        _id: data.jobId,
+        status: "running",
+        paymentStartedAt: { $ne: null },
+        $or: [{ heartbeatAt: { $lt: staleBefore } }, { heartbeatAt: null, startedAt: { $lt: staleBefore } }],
+      },
+      {
+        $set: { status: "needs_reconciliation", step: "needs_reconciliation", completedAt: new Date() },
+        $push: {
+          logs: {
+            at: new Date(),
+            level: "error",
+            step: "needs_reconciliation",
+            message:
+              "Worker went silent after Pay was pressed and before Flipkart confirmed. NOT re-run: " +
+              "check the account's My Orders / the bank for this attempt before doing anything with this job.",
+          },
+        },
+      },
+      { new: true }
+    ).select("result.flipkartOrderId");
+    if (parked) {
+      console.log(`[${data.jobId}] [error] [claim] silent after Pay — parked as needs_reconciliation (order id known: ${parked.result?.flipkartOrderId || "no"})`);
+      // Whatever Flipkart made of that attempt goes into Order Units.
+      await enqueueOrderSync(data.jobId);
+      return;
+    }
+    // Already finished, or another worker is actively on it. Either way this
+    // delivery must not open a browser — dropping it is the correct outcome, not
+    // an error, so the message is acknowledged and no attempt is consumed.
+    console.log(
+      `[${data.jobId}] [info] [claim] not claimable (status=${existing.status}` +
+        `${existing.claimedBy ? `, held by ${existing.claimedBy}` : ""}) — dropping this delivery`
+    );
+    return;
+  }
+
+  // Keeps the claim alive for as long as this worker is genuinely working. Also
+  // what a future SQS ChangeMessageVisibility heartbeat should ride alongside.
+  const heartbeat = setInterval(() => {
+    void CheckoutJob.updateOne(
+      { _id: data.jobId, claimedBy: runId },
+      { $set: { heartbeatAt: new Date() } }
+    ).catch(() => undefined);
+  }, HEARTBEAT_MS);
+  heartbeat.unref?.();
+  // All of this job's log lines and result fields go to Mongo through one
+  // batched reporter from here on (see jobReporter.ts); closed, with a final
+  // flush, whatever way the run ends.
+  const reporter = openReporter(data.jobId);
+  try {
+    return await runClaimedCheckoutJob(data, job);
+  } finally {
+    clearInterval(heartbeat);
+    await closeReporter(data.jobId);
+    console.log(`[${data.jobId}] [info] [reporter] ${reporter.writes} batched write(s) for this job`);
+    // Hand the order to the sync worker (a few ms, never throws, never waits on
+    // Flipkart): paid or failed, it lands in Order Units without a manual fetch.
+    await enqueueOrderSync(data.jobId);
+  }
+}
+
+async function runClaimedCheckoutJob(
+  data: CheckoutJobData,
+  job: NonNullable<Awaited<ReturnType<typeof claimCheckoutJob>>>
+) {
 
   const { quantityPerOrder, totalQuantity, totalAttempts } = batchLimits(data);
-  const already = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
-  if (already.status === "filtered") {
-    await finishWithoutChrome(
-      data.jobId,
-      "skipped",
-      "batch_filtered",
-      `Batch already filtered (${already.filterReason || "out_of_stock_pincode"}) — Chrome not opened`,
-      "warn",
-      {
-        failedStep: "batch_filtered",
-        filterReason: already.filterReason || "out_of_stock_pincode",
-        batchStatus: "filtered",
-      }
-    );
+
+  // ADMISSION, before an attempt is reserved: a job that cannot pay right now
+  // — no handset free under its corporate, every card paused — waits, it does
+  // not fail, and the batch's attempt budget is untouched. Failing here used to
+  // cost an attempt per wait, which at 50 phones and 1,000 orders would have
+  // spent the budget on nothing.
+  const cls = jobClassFor(data);
+  if (cls === "otp-phone" && data.cardType) {
+    const cap = await availablePhoneCapacity({ cardTypeName: data.cardType, corporateId: data.corporateId || undefined }).catch(() => null);
+    if (cap && cap.claimable <= 0) {
+      await requeueCheckoutJob(
+        data,
+        PHONE_WAIT_MS,
+        `No free handset under ${data.corporateId || data.cardType} (${cap.totalOnboarded} onboarded` +
+          `${cap.onlineOnly ? ", online only" : ""})`
+      );
+      return;
+    }
+  }
+  if (cls !== "cod" && data.cards?.length) {
+    const pool = await cardPoolAdmission(data.batchId, data.cards.length, data.cardMaxUsage).catch(() => null);
+    if (pool && pool.usable <= 0 && pool.paused > 0) {
+      const wait = Math.min(Math.max((pool.resumeAtMs ?? 0) - Date.now(), 30_000), 10 * 60 * 1000);
+      await requeueCheckoutJob(data, wait, `Every usable card is paused (${pool.paused} paused, ${pool.dead} dead, ${pool.capped} at their cap)`);
+      return;
+    }
+  }
+  const unlockAccount = await lockAccount(data.email, job.claimedBy || String(job._id));
+  if (!unlockAccount) {
+    await requeueCheckoutJob(data, 15_000, `${data.email} already has an order in progress (one job per account at a time)`);
     return;
   }
 
@@ -172,6 +399,7 @@ export async function runCheckoutJob(data: CheckoutJobData) {
       "batch",
       `Batch target already reached (purchased ${slot.purchasedQuantity}/${totalQuantity}) — Chrome not opened`
     );
+    await unlockAccount();
     return;
   }
   if (slot.kind === "skip_exhausted") {
@@ -182,22 +410,12 @@ export async function runCheckoutJob(data: CheckoutJobData) {
       `Attempt budget exhausted (${slot.attemptsUsed}/${totalAttempts}, purchased ${slot.purchasedQuantity}/${totalQuantity}) — Chrome not opened`,
       "error"
     );
+    await unlockAccount();
     return;
   }
-
-  if (slot.kind === "skip_filtered") {
-    await finishWithoutChrome(
-      data.jobId,
-      "skipped",
-      "batch_filtered",
-      `Batch already filtered (${slot.filterReason || "out_of_stock_pincode"}) — Chrome not opened`,
-      "warn",
-      {
-        failedStep: "batch_filtered",
-        filterReason: slot.filterReason || "out_of_stock_pincode",
-        batchStatus: "filtered",
-      }
-    );
+  if (slot.kind === "skip_cancelled") {
+    await finishWithoutChrome(data.jobId, "cancelled", "cancelled", `Batch cancelled by operator (purchased ${slot.purchasedQuantity}/${totalQuantity}) — Chrome not opened`, "warn");
+    await unlockAccount();
     return;
   }
 
@@ -211,10 +429,9 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     );
   };
 
-  job.status = "running";
-  job.startedAt = new Date();
-  job.step = "session";
-  await job.save();
+  // status/step/startedAt were set by claimCheckoutJob — re-saving them here
+  // would overwrite the claim's own fields and, worse, a full save() of this
+  // document could clobber a concurrent cancel.
   await appendLog(
     data.jobId,
     "info",
@@ -242,10 +459,57 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     return;
   }
 
-  const launched = await launchStealthContext({ headless: config.headless });
-  const page: Page = await launched.context.newPage();
+  /**
+   * TWO browsers, because Flipkart is two sites and this job needs one leg on each.
+   *
+   * FlipkartCheckout is m-site automation — it looks for #msite-bottomsheet and
+   * drives the page with touchscreen.tap — and Flipkart chooses which site to serve
+   * from the User-Agent. Running the whole job in the desktop context (what this
+   * did until now) meant every location/pincode check silently matched nothing, so
+   * the delivery pincode was never set, Flipkart dropped the item server side, and
+   * the job died with "Your cart is empty! / Enter Delivery Pincode" — a failure
+   * that reads exactly like a selector bug and is not one.
+   *
+   * The account pages, the address book and the cart are fine on desktop and are
+   * left there; only the add-to-cart -> checkout -> payments leg moves.
+   * Proven by scripts/testFlowCli.ts: `npm run test:flow -- happy` reaches
+   * pay.flipkart.com with the item in the cart.
+   */
+  // Egress: this worker's proxy from the pool, re-read per job so a change in
+  // the dashboard applies to the next order. In `required` mode a job with no
+  // proxy waits rather than leaving from this machine's own address — and the
+  // attempt it reserved is given back, because Flipkart never saw it.
+  let egress: Awaited<ReturnType<typeof claimProxyForWorker>> = null;
+  try {
+    egress = await claimProxyForWorker(config.workerId);
+  } catch (err) {
+    console.warn(`[${data.jobId}] [warn] [proxy] pool unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!egress && config.proxyMode === "required") {
+    await releaseReservation();
+    await refundBatchAttempt(data.batchId);
+    await requeueCheckoutJob(data, config.proxyWaitMs, `no free proxy for worker ${config.workerId} (PROXY_MODE=required)`);
+    await unlockAccount();
+    return;
+  }
+
+  // A tunnel adds latency to every request of every page: give page loads
+  // twice the time when the job leaves through a proxy. Process-wide, which
+  // is right — every job in this process uses the same proxy.
+  if (egress) setNavigationTimeoutScale(Math.max(2, Number(process.env.NAV_TIMEOUT_SCALE || 1)));
+
+  // One watcher across both legs — see testFlow for why.
+  const apiWatcher = new FlipkartApiWatcher();
+  const deskBrowser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
+  const deskContext = await desktopContext(deskBrowser);
+    apiWatcher.attach(deskContext);
+  let mobBrowser: Awaited<ReturnType<typeof launchMobileBrowser>> | null = null;
+  let paymentApi: PaymentApiWatcher | null = null;
+  // Reassigned when the job moves to the mobile leg; everything below reads
+  // whichever page is current.
+  let page: Page = await deskContext.newPage();
   await blockFlipkartLogout(page);
-  const netObserver = FlipkartNetworkObserver.attach(page);
+  let netObserver = FlipkartNetworkObserver.attach(page);
   const address = { ...data.address };
 
   const log = (level: LogLevel, message: string, step?: string) => {
@@ -254,51 +518,6 @@ export async function runCheckoutJob(data: CheckoutJobData) {
 
   const jobPincode = (address.checkoutPincode || address.pincode || "").replace(/\D/g, "").slice(-6);
 
-  const applyOutOfStockFilter = async (rawMessage: string, failure?: CheckoutFailure) => {
-    const mapped =
-      failure ||
-      classifyPageText(rawMessage, jobPincode) ||
-      new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", rawMessage);
-    console.log(
-      `[${data.jobId}] [info] [batch] filtered: ${mapped.code} for pincode ${jobPincode} — batch stopped, no retry`
-    );
-    log("error", rawMessage, mapped.failedStep);
-    await releaseReservation();
-    const filteredCount = await markBatchFiltered(data.batchId, "out_of_stock_pincode");
-    const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
-    await CheckoutBatch.findOneAndUpdate(
-      { batchId: data.batchId },
-      {
-        $set: {
-          batchStatus: "filtered",
-          filterReason: "out_of_stock_pincode",
-          filteredCount,
-          purchasedQuantity: progress.purchasedQuantity,
-          attemptsUsed: progress.attemptsUsed,
-        },
-      }
-    );
-    const now = new Date();
-    await CheckoutJob.updateOne(
-      { _id: data.jobId, status: { $ne: "cancelled" } },
-      {
-        $set: {
-          status: "filtered",
-          step: mapped.failedStep,
-          filterReason: "out_of_stock_pincode",
-          failedAt: now,
-          batchStatus: "filtered",
-          completedAt: now,
-          ...failureFields(mapped),
-        },
-      }
-    );
-    await CheckoutJob.updateMany(
-      { batchId: data.batchId, _id: { $ne: data.jobId } },
-      { $set: { batchStatus: "filtered", filterReason: "out_of_stock_pincode" } }
-    );
-  };
-
   log(
     "info",
     `${config.headless ? "Opened headless Chromium" : "Opened headed Chrome"}. Session cookies are copied into this window only — Mongo login is not modified, Logout is blocked.`,
@@ -306,11 +525,29 @@ export async function runCheckoutJob(data: CheckoutJobData) {
   );
 
   let checkout: FlipkartCheckout | undefined;
+  // Once Pay has been pressed, a tunnel error is NOT re-queued: money may have
+  // moved, and the paymentStartedAt rule (never re-run blindly) applies.
+  let payPressed = false;
   try {
+    // Prove the tunnel before a single Flipkart request: the address Flipkart
+    // sees goes on the order row, and a dead proxy fails HERE as PROXY_FAILED
+    // (re-queued, attempt refunded) instead of minutes later as a page timeout
+    // blamed on the platform ID.
+    if (egress) {
+      const exitIp = await probeExitIp(deskContext);
+      log("info", `[proxy] egress ${egress.label} → exit IP ${exitIp} (worker ${config.workerId})`, "session");
+      await recordProxyUse(egress.id, data.jobId, exitIp);
+      await patchResult(data.jobId, { egressProxy: egress.label, exitIp });
+    } else {
+      log("warn", `[proxy] no proxy — leaving from this machine's own address (PROXY_MODE=${config.proxyMode})`, "session");
+      await patchResult(data.jobId, { egressProxy: "direct" });
+    }
+
     log("info", `Restoring Flipkart session for ${session.email}`, "session");
     await restoreFlipkartSession(page, session.cookies);
 
     checkout = new FlipkartCheckout(page, data.productUrl, log);
+    checkout.api = apiWatcher;
     checkout.setCheckoutFlags(jobPincode, data.gstMandatory ?? job.request?.gstMandatory ?? true);
     log("info", "Using FlipkartCheckout (Buying-bot add-to-cart / place-order strategies)", "session");
 
@@ -324,7 +561,12 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     const mobile = await checkout.fetchAccountMobile();
     if (mobile) {
       const normalised = mobile.replace(/\D/g, "").slice(-10);
-      if (normalised) address.mobile = normalised;
+      if (normalised) {
+        address.mobile = normalised;
+        // The dashboard's address has no phone; the one on the Flipkart
+        // address IS the account's. Recorded so the order row can show it.
+        await patchResult(data.jobId, { billingPhone: normalised });
+      }
       await checkout.ensureAddressForAccount(address, mobile);
       log("info", `Pre-flight done: one Flipkart address, mobile ending ${normalised.slice(-4)}`, "preflight");
     } else {
@@ -335,8 +577,38 @@ export async function runCheckoutJob(data: CheckoutJobData) {
       throw new Error("Session expired: Flipkart showed the login page during pre-flight");
     }
 
+    // ---- desktop leg done; everything from here is the m-site ----------------
+    netObserver.dispose();
+    await deskContext.close().catch(() => undefined);
+    mobBrowser = await launchMobileBrowser({ headless: config.headless, proxy: egress?.proxy });
+    const mobContext = await mobileContext(mobBrowser);
+    apiWatcher.attach(mobContext);
+    paymentApi = new PaymentApiWatcher().attach(mobContext);
+    page = await mobContext.newPage();
+    await blockFlipkartLogout(page);
+    netObserver = FlipkartNetworkObserver.attach(page);
+    await restoreFlipkartSession(page, session.cookies);
+
+    const ua = await page.evaluate(() => navigator.userAgent).catch(() => "");
+    if (!/Mobile|Android/i.test(ua)) {
+      // Loud, because this is the exact failure that masqueraded as a selector
+      // bug: without a mobile UA the m-site selectors below cannot match, and the
+      // job would fail several minutes later for an unrelated-looking reason.
+      throw new Error(`Mobile context is not mobile (ua="${ua.slice(0, 80)}") — m-site selectors cannot match`);
+    }
+    log("info", `Switched to the m-site (${config.mobileDevice})`, "session");
+
+    // Establish the m-site session before pasting a deep product link. Handing
+    // Flipkart a product URL in a session it has not set up is one of the ways
+    // the cart silently drops the item.
+    await page.goto("https://www.flipkart.com/", { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+    await page.waitForLoadState("load", { timeout: 15_000 }).catch(() => undefined);
+
     log("info", "Opening product page", "product");
-    checkout.setProductUrl(data.productUrl);
+    checkout = new FlipkartCheckout(page, data.productUrl, log);
+    checkout.api = apiWatcher;
+    checkout.setCheckoutFlags(jobPincode, data.gstMandatory ?? job.request?.gstMandatory ?? true);
     await checkout.navigateToProduct();
     const details = await checkout.captureProductDetails();
     job.product = details;
@@ -366,11 +638,10 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     }
     const oosOnProduct = await checkout.detectOutOfStockForPincode(jobPincode);
     if (oosOnProduct.matched) {
-      await applyOutOfStockFilter(
+      throw new CheckoutFailure(
+        "PRODUCT_NOT_SERVICEABLE",
         oosOnProduct.rawMessage || `Currently out of stock for ${jobPincode}`
       );
-      await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-      return;
     }
     await checkout.gotoViewCart();
     try {
@@ -386,9 +657,7 @@ export async function runCheckoutJob(data: CheckoutJobData) {
 
     const oosOnCart = await checkout.detectOutOfStockForPincode(jobPincode);
     if (oosOnCart.matched) {
-      await applyOutOfStockFilter(oosOnCart.rawMessage || `Currently out of stock for ${jobPincode}`);
-      await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-      return;
+      throw new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", oosOnCart.rawMessage || `Currently out of stock for ${jobPincode}`);
     }
 
     if (data.deliverySlaDays == null) {
@@ -427,6 +696,32 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     log("info", "Place Order → viewcheckout for GST, then Continue", "product");
     await checkout.clickPlaceOrder();
 
+    // Flipkart answers "Something went wrong! E002" when viewcheckout is opened
+    // without a real Place Order behind it. Going back to the cart and placing
+    // again clears it; retrying in place does not.
+    for (let retry = 1; retry <= 2 && (await checkoutShowsE002(page)); retry++) {
+      log("warn", `Checkout shows "Something went wrong" — Place Order again (${retry}/2)`, "order-summary");
+      await checkout.gotoViewCart();
+      await checkout.clickPlaceOrder();
+    }
+    if (await checkoutShowsE002(page)) {
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        'Checkout keeps showing "Something went wrong! E002" after Place Order'
+      );
+    }
+
+    // Refuse to pay for something we did not add. A checkout session left over
+    // from an earlier run looks entirely normal until the order confirmation.
+    const checkoutText = String(await page.evaluate(() => document.body?.innerText || "").catch(() => ""));
+    const modelKey = details.model.slice(0, 24).toLowerCase();
+    if (modelKey && checkoutText && !checkoutText.toLowerCase().includes(modelKey)) {
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        `Checkout does not show "${details.model}" — refusing to continue with a different product`
+      );
+    }
+
     log("info", "viewcheckout: qty / address / GST then Continue", "order-summary");
     await checkout.verifyAddressOnOrderSummary(
       address,
@@ -458,47 +753,118 @@ export async function runCheckoutJob(data: CheckoutJobData) {
     });
     await job.save();
     await patchResult(data.jobId, { paymentUrl: page.url() });
+
+    // Reaching payment is no longer the end of the road for a card order. The
+    // reservation is held until the payment phase resolves: releasing it here
+    // would let a sibling job claim the slot this order is about to spend.
+    const payment = await runPaymentPhase({
+      page,
+      data,
+      log,
+      dryRun: PAYMENT_DRY_RUN,
+      paymentApi,
+      // Durable, direct, awaited — not through the batched reporter — because
+      // this is the line between "safe to re-run" and "money may have moved".
+      onBeforePay: async () => {
+        payPressed = true;
+        await CheckoutJob.updateOne({ _id: data.jobId }, { $set: { paymentStartedAt: new Date() } });
+      },
+    });
+    if (payment.attempted) {
+      if (!payment.ok) {
+        // Which card the failed attempt went on, before the failure is recorded.
+        if (payment.cardUsed) await patchResult(data.jobId, payment.cardUsed);
+        throw payment.failure;
+      }
+      await reporterFor(data.jobId)?.beforeTerminal();
+      job.status = "paid";
+      job.step = "paid";
+      job.completedAt = new Date();
+      await job.save();
+      // result is null for COD — no card, no bank, nothing to record about either.
+      await patchResult(data.jobId, {
+        ...(payment.result
+          ? {
+              cardTypeName: payment.result.cardTypeName,
+              cardLast4: payment.result.cardLast4,
+              authType: payment.result.authType,
+              employeeId: payment.result.employeeId,
+              authenticatedAt: payment.result.authenticatedAt,
+            }
+          : {}),
+        ...(payment.confirmation?.orderId ? { flipkartOrderId: payment.confirmation.orderId } : {}),
+        ...(payment.confirmation?.referenceId ? { flipkartReferenceId: payment.confirmation.referenceId } : {}),
+        ...(payment.confirmation?.amount ? { transactionAmount: payment.confirmation.amount } : {}),
+        ...orderDetailFields(payment.confirmation?.details),
+        ...(payment.cardUsed ?? {}),
+      });
+      log(
+        "info",
+        payment.cardId
+          ? `Payment authenticated with card ${payment.cardId} (${payment.ordersOnCard} order(s) on it in this batch)`
+          : "COD order placed",
+        "paid"
+      );
+    } else {
+      log("info", `Stopping at payment page — ${payment.reason}`, "payment");
+    }
     reservationHeld = false;
     const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
     log(
       "info",
-      `Stopped at payment page: ${page.url()} — leaving Chrome open so you can watch (batch purchased ${progress.purchasedQuantity}/${totalQuantity}, attempts ${progress.attemptsUsed}/${totalAttempts}${progress.status === "completed" ? ", batch complete" : ""})`,
+      `${payment.attempted ? "Finished on" : "Stopped at payment page:"} ${page.url().split("?")[0]} — leaving Chrome open so you can watch (batch purchased ${progress.purchasedQuantity}/${totalQuantity}, attempts ${progress.attemptsUsed}/${totalAttempts}${progress.status === "completed" ? ", batch complete" : ""})`,
       "payment"
     );
     await sleep(config.keepBrowserOpenMs);
   } catch (err) {
+    const rawMessage = err instanceof Error ? err.message : String(err);
+
+    // The tunnel failed, not the order. The proxy takes the blame (dead after
+    // PROXY_DEAD_AFTER), the attempt goes back to the batch, and the job is
+    // re-queued so the next pick leaves through a different proxy. No status
+    // of "failed" and no error code on the job: Flipkart never saw it.
+    if (egress && !payPressed && isProxyError(rawMessage)) {
+      const retired = await reportProxyFailure(egress.id, rawMessage.split("\n")[0]);
+      log(
+        "warn",
+        `[proxy] ${egress.label} failed: ${rawMessage.split("\n")[0].slice(0, 200)}` +
+          `${retired ? " — marked DEAD" : ""}; attempt refunded, job re-queued`,
+        "session"
+      );
+      await releaseReservation();
+      await refundBatchAttempt(data.batchId);
+      await requeueCheckoutJob(data, config.proxyWaitMs, `proxy ${egress.label} failed — PROXY_FAILED`);
+      return;
+    }
+
     for (const s of netObserver.getBlocks().slice(-3)) {
       log("warn", `[net] ${s.kind}: ${s.text} — ${s.url}`, "net");
     }
-    if (err instanceof OutOfStockPincodeError) {
-      await applyOutOfStockFilter(err.rawMessage);
-      await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-      return;
+    // Every failure is THIS job's failure, recorded on this job with its own
+    // reason. Out of stock / not deliverable used to stop the whole batch here;
+    // they no longer do — the next platform ID gets its own attempt, because a
+    // product Flipkart refuses to one account may still be sold to another.
+    let failure = err instanceof CheckoutFailure ? err : null;
+    if (!failure && err instanceof OutOfStockPincodeError) {
+      failure = new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", err.rawMessage);
     }
-    if (err instanceof CheckoutFailure && err.filterBatch) {
-      await applyOutOfStockFilter(err.details, err);
-      await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-      return;
-    }
-    const rawMessage = err instanceof Error ? err.message : String(err);
     if (
-      /Execution context was destroyed|most likely because of a navigation/i.test(rawMessage) &&
-      checkout
+      !failure &&
+      checkout &&
+      /Execution context was destroyed|most likely because of a navigation/i.test(rawMessage)
     ) {
       const oos = await checkout.detectOutOfStockForPincode(jobPincode).catch(() => ({ matched: false as const }));
       if (oos.matched) {
-        await applyOutOfStockFilter(oos.rawMessage || `Currently out of stock for ${jobPincode}`);
-        await sleep(Math.min(config.keepBrowserOpenMs, 15000));
-        return;
+        failure = new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", oos.rawMessage || `Currently out of stock for ${jobPincode}`);
       }
     }
-    let failure = err instanceof CheckoutFailure ? err : null;
     if (!failure && checkout) {
       failure = await checkout.detectCheckoutBlocker(jobPincode).catch(() => null);
     }
     if (!failure) failure = classifyThrownMessage(rawMessage);
     const failedStep = failure.failedStep;
     log("error", `${failure.display}: ${failure.details}`, failedStep);
+    await reporterFor(data.jobId)?.beforeTerminal();
     await CheckoutJob.updateOne(
       { _id: data.jobId, status: { $ne: "cancelled" } },
       {
@@ -511,12 +877,20 @@ export async function runCheckoutJob(data: CheckoutJobData) {
       }
     );
     await releaseReservation();
-    await maybeEnqueueRetry(data, job.userId, failedStep, job.request);
+    if (failure.noRetry) {
+      log("info", `${failure.code} is a verdict on this platform ID — not re-queued; the batch continues with the next ID`, "batch");
+    } else {
+      await maybeEnqueueRetry(data, job.userId, failedStep, job.request);
+    }
     await sleep(Math.min(config.keepBrowserOpenMs, 15000));
   } finally {
     netObserver.dispose();
-    await closeBrowser(launched.browser, launched.context);
+    await deskBrowser.close().catch(() => undefined);
+    await mobBrowser?.close().catch(() => undefined);
     const latest = await CheckoutJob.findById(data.jobId).select("status");
     if (latest?.status === "cancelled") await releaseReservation();
+    await unlockAccount();
+    // A batch being cancelled is done the moment its last open attempt ends.
+    await settleBatchIfCancelling(data.batchId).catch(() => undefined);
   }
 }

@@ -3,22 +3,33 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-   "scripts": {
+  "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "postinstall": "npm run build",
     "start": "node dist/index.js",
     "worker": "tsx src/worker.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:otp": "tsx src/scripts/otpParseTest.ts",
+    "test:flow": "tsx src/scripts/testFlowCli.ts",
+    "test:cancel": "tsx src/scripts/cancelTestCli.ts",
+    "test:otp-plumbing": "tsx src/scripts/otpPlumbingTest.ts",
+    "backfill:order-ids": "tsx src/scripts/backfillOrderIds.ts",
+    "batches:backfill": "tsx src/scripts/backfillBatchCounters.ts",
+    "test:classify": "tsx src/scripts/classifyTest.ts",
+    "test:proxy-pool": "tsx src/scripts/proxyPoolTest.ts",
+    "orders:replay": "tsx src/scripts/replayOrderTrace.ts"
   },
-
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1151.0",
     "bullmq": "^5.58.5",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "ioredis": "^5.7.0",
     "mongoose": "^8.16.0",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^1.1.4",
     "playwright": "1.63.0",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",

@@ -1,16 +1,25 @@
+import type { AuthType, CardDetails } from "./paymentStrategies/types.js";
+
 export type AddressType = "Home" | "Work";
 
 export type JobStatus =
   | "queued"
   | "running"
   | "reached_payment"
+  /** Bank authentication succeeded. Distinct from reached_payment, which now
+   *  only means "got as far as the payment page and stopped there". */
+  | "paid"
   | "failed"
   | "cancelled"
   | "skipped"
   | "dry_run"
   | "completed_target_reached"
   | "failed_attempt_budget_exhausted"
-  | "filtered";
+  | "filtered"
+  /** The worker died AFTER pressing Pay and before Flipkart confirmed. Money
+   *  may have moved. Nobody re-runs this; a person (or reconciliation against
+   *  Flipkart's orders) decides. */
+  | "needs_reconciliation";
 
 export type LogLevel = "info" | "warn" | "error";
 
@@ -57,6 +66,12 @@ export interface JobRequestSnapshot {
   platform: string;
   paymentMode: string;
   cardType: string;
+  /** Credential arm chosen for this batch — also its concurrency class:
+   *  "otp" needs a handset from the shared pool, password/pin do not. */
+  authType?: string;
+  corporateId?: string;
+  /** Orders one card may place in this batch; absent = no cap. */
+  cardMaxUsage?: number;
   sellerName: string;
   listingId: string;
   deliverySlaDays?: number;
@@ -80,11 +95,54 @@ export interface JobResultSnapshot {
   gstNumber: string;
   gstCompany: string;
   paymentUrl: string;
+  /** Full form, "OD" + 18 digits (…00) — what Flipkart's order pages use. */
   flipkartOrderId: string;
+  /** Short form, "OD" + 16 digits — what the confirmation URL carries. */
+  flipkartReferenceId?: string;
   transactionAmount: string;
   cartAfterCardOffer: string;
   cartAfterOfferPrelim: string;
   giftCardApplied: string;
+  /** From Flipkart's gateway response and order-confirmation data, read
+   *  passively after a placed order. Rupees as strings; see PaymentApiWatcher. */
+  paymentFee?: string;
+  /** Each applied charge by type ("CORP_CARD_FEE ₹1"), plus any adjustments. */
+  paymentFeeDetails?: string;
+  shippingAmount?: string;
+  discountPct?: string;
+  mrp?: string;
+  /** Flipkart's unit price from the confirmation data. */
+  unitPrice?: string;
+  bankTransactionId?: string;
+  pgTransactionId?: string;
+  bankName?: string;
+  cardBrand?: string;
+  supercoinsApplied?: string;
+  /** Flipkart's delivery promise in days from the order (sla.maxSla). */
+  promiseDays?: number;
+  promiseDate?: Date;
+  orderStatus?: string;
+  sellerName?: string;
+  /** The card the pool used for THIS order (a batch's CSV holds many).
+   *  Label and last-4s only. */
+  cardName?: string;
+  parentCardLast4?: string;
+  childCardLast4?: string;
+  /** The account's registered mobile, read from /account in pre-flight — the
+   *  phone on the delivery address, i.e. the order's billing phone. */
+  billingPhone?: string;
+  /** Which card type and credential arm actually authenticated. Last 4 only —
+   *  no full PAN is ever written to a persisted document. */
+  cardTypeName?: string;
+  cardLast4?: string;
+  authType?: string;
+  /** Set only when a corporate handset was leased for the OTP. */
+  employeeId?: string;
+  authenticatedAt?: Date;
+  /** Egress: the Proxy Pool row the worker left from ("host:port", or
+   *  "direct") and the public address Flipkart saw. */
+  egressProxy?: string;
+  exitIp?: string;
 }
 
 export interface CheckoutJobData {
@@ -102,4 +160,32 @@ export interface CheckoutJobData {
   gstMandatory?: boolean;
   address: AddressDetails;
   isRetry?: boolean;
+  /** COD | card | ... — decides whether a card is needed at all. */
+  paymentMode?: string;
+  /** Orders one card may place in this batch before the pool skips it. */
+  cardMaxUsage?: number;
+  cardType?: string;
+  authType?: AuthType;
+  corporateId?: string | null;
+  /**
+   * The cards this batch may pay with, UNMASKED — full PAN, CVV and the card
+   * type's credential. Nothing else in this codebase carries these: the stored
+   * request snapshot masks them (orderSnapshot.maskCards) and always will.
+   *
+   * They ride the queue payload because there is nowhere else yet to read them
+   * from — the order form holds cards in browser state only, and no collection
+   * persists them (Order.card_number is an unpopulated placeholder). That makes
+   * the payload the ONLY path from the operator's CSV to the bank's form.
+   *
+   * Consequences that are deliberately accepted for now, and the reason
+   * queue.ts drops completed AND failed jobs immediately rather than retaining
+   * them for 7/14 days:
+   *   - plaintext card data exists in Redis for the lifetime of the job
+   *   - it crosses the network if Redis is not on the same host
+   * SUPERSEDED: the batch's cards now live once per batch in Redis, encrypted
+   * (cardPool.storeCardPool, CARD_POOL_KEY), and a job carries only its
+   * batchId. This field is read only for payloads queued before that change,
+   * and never written by enqueueCheckoutJob any more.
+   */
+  cards?: CardDetails[];
 }

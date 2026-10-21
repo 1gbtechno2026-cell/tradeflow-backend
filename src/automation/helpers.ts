@@ -47,16 +47,29 @@ export async function waitForNav(page: Page, timeout = 10000) {
   await page.waitForLoadState("domcontentloaded", { timeout }).catch(() => {});
 }
 
+/**
+ * Multiplier on every page-load timeout below. 1 on a direct connection; the
+ * runner raises it for a job that leaves through a proxy (a tunnel adds
+ * latency to every request of a page) and NAV_TIMEOUT_SCALE in .env raises
+ * it on a slow machine. Timeouts are per attempt, so a doubled scale on a
+ * 12s / 2-attempt load allows 48s before the job gives up.
+ */
+let navigationTimeoutScale = Math.max(1, Number(process.env.NAV_TIMEOUT_SCALE || 1));
+export function setNavigationTimeoutScale(scale: number): void {
+  navigationTimeoutScale = Math.max(1, Number(scale) || 1);
+}
+
 export async function navigateWithRetry(
   page: Page,
   url: string,
   { timeoutMs = 10000, maxRetries = 5 } = {}
 ): Promise<void> {
   let lastErr = "";
+  const timeout = Math.round(timeoutMs * navigationTimeoutScale);
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      console.log(`Loading page (attempt ${attempt}/${maxRetries}): ${url}`);
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      console.log(`Loading page (attempt ${attempt}/${maxRetries}${timeout !== timeoutMs ? `, ${timeout}ms` : ""}): ${url}`);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout });
       console.log(`Page loaded: ${page.url()}`);
       return;
     } catch (err) {

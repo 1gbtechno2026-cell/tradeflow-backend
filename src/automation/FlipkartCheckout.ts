@@ -1,4 +1,6 @@
-import type { Page } from "playwright";
+import fs from "node:fs";
+import path from "node:path";
+import type { Locator, Page } from "playwright";
 import type { AddressDetails } from "../types.js";
 import {
   evaluate as evalPage,
@@ -10,12 +12,23 @@ import {
 } from "./helpers.js";
 import { sleep } from "../services/browser.js";
 import { CheckoutFailure, classifyPageText } from "../services/checkoutErrors.js";
+import type { FlipkartApiWatcher } from "./FlipkartApiWatcher.js";
 
 /** Remembered Flipkart checkout URLs when a button or page is missing. pageUID is per-session — omit it. */
 const VIEWCART_URL = "https://www.flipkart.com/viewcart?exploreMode=TRUE&preference=FLIPKART";
 const VIEWCHECKOUT_URL =
   "https://www.flipkart.com/viewcheckout?view=FLIPKART&marketplace=FLIPKART&tr_tenant=FLIPKART";
-const PAYMENTS_URL = "https://www.flipkart.com/payments";
+
+/**
+ * Flipkart's per-order cap, in its own words: "You can only purchase 14 units of …
+ * in a single order", "Only 2 units allowed per customer".
+ *
+ * From the reference flow. Matching the wording matters because Flipkart does not
+ * fail an over-limit quantity cleanly — it caps the number silently, or answers
+ * with a bare "Something went wrong", and this toast is the only place it says why.
+ */
+export const QTY_LIMIT_RE =
+  /can only (purchase|buy|order) \d+ (unit|item)s?|only \d+ (unit|item)s?\b.*(allowed|per (customer|order))|max(imum)? (quantity|qty|units?) (is|of|allowed)|quantity limit|can(not|'t) (buy|order) more than/i;
 
 export class OutOfStockPincodeError extends Error {
   readonly failedStep = "out_of_stock_pincode" as const;
@@ -53,6 +66,13 @@ const DELAYS = {
  */
 export class FlipkartCheckout {
   summaryQty = 0;
+  /**
+   * Flipkart's own API responses, when a caller attaches one. Optional on purpose:
+   * every use below falls back to the page checks, so the flow behaves exactly as
+   * before when it is absent.
+   */
+  api: FlipkartApiWatcher | null = null;
+
   private jobPincode = "";
   private gstMandatory = true;
 
@@ -403,11 +423,17 @@ export class FlipkartCheckout {
       }
       return { notifyBtn, body: document.body?.innerText || "" };
     });
-    if (scan.notifyBtn) {
-      return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
-    }
+    // Page text first: it ranks "out of stock for <pincode>" above a sold-out
+    // product, and ignores stock words when the page still offers Buy now / Add
+    // to cart (variant tiles and "similar products" say "Out of stock" all the
+    // time). The visible-button scan only decides when the text found nothing,
+    // and never on a page that is still purchasable — a "Notify Me" on some
+    // other tile is not a verdict on this product.
     const fromText = classifyPageText(scan.body, pincode);
     if (fromText) return fromText;
+    if (scan.notifyBtn && !/^\s*(buy now|add to cart)\b/im.test(scan.body)) {
+      return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
+    }
     const pdp = await this.scanFlipkartPdp();
     if (pdp.locationSliderOpen || pdp.notDeliverable) {
       if (pdp.locationSliderOpen) {
@@ -776,6 +802,7 @@ export class FlipkartCheckout {
       { label: "Add to Cart button (Buying-bot)", timeoutMs: 10000, maxRetries: 5 }
     );
 
+    const addSince = Date.now();
     const beforeAdd = await this.scanFlipkartPdp();
     if (beforeAdd.notDeliverable || beforeAdd.locationSliderOpen) {
       throw this.notAvailableOnPin(pincode || beforeAdd.selectedPincode);
@@ -939,6 +966,26 @@ export class FlipkartCheckout {
       added = (await this.headerCartCount()) > before || (await this.productLooksAddedToCart());
     }
 
+    // Flipkart's own answer, per listing. An error alongside presentInCart is a
+    // warning (it still went in); an error WITHOUT it is a refusal, and carries the
+    // reason — cart full, listing dead — which the page may never show.
+    if (this.api) {
+      await sleep(500);
+      for (const add of this.api.cartAdds.filter((c) => c.at >= addSince)) {
+        console.log(
+          `[API] add to cart ${add.listingId}: inCart=${add.presentInCart}` +
+            `${add.errorCode ? ` ${add.errorCode} "${add.errorMessage}"` : " ok"}`
+        );
+      }
+      const refused = this.api.refusedAdd(addSince);
+      if (refused) {
+        throw new CheckoutFailure(
+          "ADD_TO_CART_FAILED",
+          `${refused.errorMessage ?? "Add to cart refused"} [${refused.errorCode}]`
+        );
+      }
+    }
+
     const count = await this.headerCartCount();
     console.log(`[Checkout2/Buying-bot] after add, header cart count=${count} added=${added}`);
     if (!added && count < 1) {
@@ -985,64 +1032,69 @@ export class FlipkartCheckout {
       console.log("Not on viewcart — opening remembered viewcart before Place Order");
       await this.gotoViewCart();
     }
-    // Buying-bot placeOrder: div.css-146c3p1 "Place order" → yellow css-g5y9jx, touchscreen.tap
+    /**
+     * Click the real Place Order control, via a locator.
+     *
+     * This used to find any element whose text was "place order", walk UP for a
+     * styled ancestor, compute a centre point and touchscreen.tap() it. On the
+     * m-site cart that picked the wrong one: the page carries the string twice,
+     * and the tap landed at CSS (206, 387) — mid-page, in the product card —
+     * while the real yellow bar sits at (323, 749) on a 412x839 viewport. The tap
+     * hit nothing, nothing navigated, and the old fallback below then jumped to
+     * the remembered viewcheckout URL, which is exactly what makes Flipkart
+     * answer "Something went wrong! E002". The retry re-tapped the same empty
+     * spot, so it could never recover.
+     *
+     * A locator removes the whole class of problem: Playwright waits for the
+     * element to be visible, stable and hit-testable, scrolls it into view and
+     * clicks its real centre — and throws if something is covering it instead of
+     * silently clicking the overlay.
+     */
     console.log("[Checkout2/Buying-bot] Waiting for Place Order button...");
-    let placeBox: { x: number; y: number } | null = null;
-    for (let attempt = 0; attempt < 20; attempt++) {
-      placeBox = await this.evaluate(() => {
-        const labels = document.querySelectorAll("div.css-146c3p1, div, span, button");
-        for (const label of labels) {
-          const text = (label.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-          if (text === "place order") {
-            let el: HTMLElement | null = label as HTMLElement;
-            while (el) {
-              const style = el.getAttribute("style") || "";
-              if (
-                (el.classList.contains("css-g5y9jx") && style.includes("background-color")) ||
-                style.includes("background-color") ||
-                style.includes("cursor: pointer") ||
-                style.includes("cursor:pointer")
-              ) {
-                el.scrollIntoView({ block: "center" });
-                const rect = el.getBoundingClientRect();
-                if (rect.width >= 40 && rect.height >= 20) {
-                  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-                }
-              }
-              el = el.parentElement;
-            }
-            (label as HTMLElement).scrollIntoView({ block: "center" });
-            const rect = label.getBoundingClientRect();
-            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-          }
+    // Ordered most- to least-specific. getByRole first because the real control is
+    // a button; the text forms cover the m-site's div-based buttons.
+    const candidates = [
+      this.page.getByRole("button", { name: /^\s*place\s*order\s*$/i }),
+      this.page.locator('button:has-text("Place Order")'),
+      this.page.getByText(/^\s*place\s*order\s*$/i),
+    ];
+
+    let placeOrder: Locator | null = null;
+    for (let attempt = 0; attempt < 20 && !placeOrder; attempt++) {
+      for (const candidate of candidates) {
+        // .last() because Flipkart renders the sticky bottom bar after the
+        // in-flow copy, and the sticky one is the control a person actually taps.
+        const target = candidate.last();
+        if ((await target.count().catch(() => 0)) > 0 && (await target.isVisible().catch(() => false))) {
+          placeOrder = target;
+          break;
         }
-        return null;
-      });
-      if (placeBox) break;
-      if (attempt % 5 === 4) {
-        console.log(`Still looking for Place Order button (attempt ${attempt + 1}/20)...`);
       }
+      if (placeOrder) break;
+      if (attempt % 5 === 4) console.log(`Still looking for Place Order button (attempt ${attempt + 1}/20)...`);
       await sleep(500);
     }
 
-    if (!placeBox) {
-      console.log("Place Order button not found after 10s — using remembered viewcheckout URL");
-      await this.gotoViewCheckout();
-      return;
+    if (!placeOrder) {
+      // Loud, not silent. gotoViewCheckout() here is what produced E002 for every
+      // run that got this far: opening viewcheckout without a real Place Order
+      // behind it is precisely the state Flipkart rejects.
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        "Place Order button not found on the cart after 10s — refusing to open viewcheckout directly, which Flipkart answers with E002"
+      );
     }
 
-    await sleep(300);
-    try {
-      await this.page.touchscreen.tap(placeBox.x, placeBox.y);
-      console.log(`Tapped Place Order at (${placeBox.x.toFixed(0)}, ${placeBox.y.toFixed(0)})`);
-    } catch {
-      await this.page.mouse.click(placeBox.x, placeBox.y);
-      console.log(`Mouse clicked Place Order at (${placeBox.x.toFixed(0)}, ${placeBox.y.toFixed(0)})`);
-    }
+    const box = await placeOrder.boundingBox().catch(() => null);
+    await placeOrder.click({ timeout: 15_000 });
+    console.log(
+      `Clicked Place Order${box ? ` at (${(box.x + box.width / 2).toFixed(0)}, ${(box.y + box.height / 2).toFixed(0)})` : ""}`
+    );
+
     await sleep(DELAYS.long);
     const moved = await this.waitUntil(
       async () => /viewcheckout|\/payments|checkout|rv\/pay/i.test(this.page.url() || ""),
-      8000,
+      15000,
       120,
       "viewcheckout after Place Order"
     );
@@ -1052,8 +1104,10 @@ export class FlipkartCheckout {
       await this.gotoViewCheckout();
       return;
     }
-    console.log("Place Order did not navigate — using remembered viewcheckout URL");
-    await this.gotoViewCheckout();
+    throw new CheckoutFailure(
+      "UNABLE_TO_PLACE_ORDER",
+      `Place Order was clicked but the page stayed on ${this.page.url()} — not opening viewcheckout directly, which Flipkart answers with E002`
+    );
   }
 
   private async cartIsEmpty(): Promise<boolean> {
@@ -1087,7 +1141,16 @@ export class FlipkartCheckout {
         const btn = removeBtns().first();
         await btn.scrollIntoViewIfNeeded().catch(() => {});
         console.log(`[Cart] clicking Remove (${i})`);
-        await btn.click({ timeout: 5000 });
+        // A DOM click on the m-site can hang in "scrolling into view" with two
+        // Chromes on one laptop (addsobrap, 5 Oct: 5s timeout, job failed as
+        // UNKNOWN before the product was even opened). Fall back to a tap,
+        // which is what the rest of the m-site flow uses, before giving up.
+        try {
+          await btn.click({ timeout: 5000 });
+        } catch (err) {
+          console.log(`[Cart] Remove click did not complete (${err instanceof Error ? err.message.split("\n")[0] : String(err)}) — tapping instead`);
+          await removeBtns().first().tap({ timeout: 5000 });
+        }
         const emptied = await this.waitUntil(() => this.cartIsEmpty(), 3500, 120, "Your cart is empty after Remove");
         if (emptied) {
           console.log("[Cart] emptied — Your cart is empty!");
@@ -2347,6 +2410,14 @@ export class FlipkartCheckout {
 
         this.log("error", `Order summary verification failed at step "${failedStep}" (completed: ${completedSteps || "none"}): ${errMsg}`, failedStep);
 
+        // A Flipkart-side answer is FINAL: out of stock, "you can only purchase 16
+        // units", not deliverable, invalid GST. Refreshing cannot change any of
+        // them, and without this the loop burns three page loads and then re-wraps
+        // the failure as a plain Error — which classifies as UNKNOWN and discards
+        // both the code and Flipkart's own wording. That is exactly how a
+        // correctly-detected MAX_UNITS_REACHED reached the UI as "UNKNOWN".
+        if (err instanceof CheckoutFailure || err instanceof OutOfStockPincodeError) throw err;
+
         if (retry < MAX_RETRIES - 1) {
           console.log(`Refreshing page and retrying from "${failedStep}" step...`);
           // Refresh the order summary page to get a clean state for the failed step
@@ -2369,235 +2440,170 @@ export class FlipkartCheckout {
   // These run on the intermediate order summary page after Buy Now
   // ================================================================
 
+  /**
+   * Set the quantity on the order summary.
+   *
+   * Ported from the reference flow, which solves two things this did not.
+   *
+   * READING IT. The old reader scanned every pure-digit div and walked up for an
+   * ancestor mentioning "qty" — and the delivery address's PHONE NUMBER is a
+   * pure-digit div inside the same order-summary card, so it read 7256809635 as
+   * the quantity, tried to "correct" it, and silently continued at the wrong
+   * amount. "Qty: N" is the label the page actually renders; nothing else is read.
+   *
+   * CHANGING IT. The old writer clicked a fallback selector and looked for a div
+   * whose text was exactly "APPLY", which does not exist on this layout — so a
+   * quantity above 1 was never applied and the qty scenario could never reach a
+   * limit. Flipkart's picker lists the quantities it will allow, then a "more"
+   * entry for a free-text box. If the wanted number is listed, tap it. If it is
+   * not listed AND there is no "more", the list IS the allowed range and the
+   * request is over the limit — which is the QUANTITY_LIMIT signal, and the only
+   * reliable one, because Flipkart otherwise answers an over-limit quantity by
+   * quietly capping it or showing a bare "Something went wrong".
+   */
   private async verifyQuantityOnOrderSummary(expectedQty: number): Promise<void> {
     console.log(`Verifying quantity on order summary: expected=${expectedQty}`);
     this.summaryQty = expectedQty;
 
-    // Try to find the quantity displayed on the order summary page
-    let displayedQty = 0;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const qtyText = await this.evaluate(() => {
-        // Look for quantity near "Qty" text or a number near product info
-        const allDivs = Array.from(document.querySelectorAll("div"));
-        for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
-          // Flipkart often shows "Qty: N" or just the number next to product
-          if (/^[\d]+$/.test(txt) && d.offsetParent !== null) {
-            // Check if this div is near a qty-related parent
-            let el: HTMLElement | null = d.parentElement;
-            let found = false;
-            while (el && el !== document.body) {
-              const parentTxt = (el.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
-              if (parentTxt.includes("qty")) {
-                found = true;
-                break;
-              }
-              el = el.parentElement;
-            }
-            if (found) return txt;
-          }
-          // Also try: look for a div where the text starts with "Qty"
-          if (txt.toLowerCase().startsWith("qty")) {
-            const match = txt.match(/qty[:\s]*(\d+)/i);
-            if (match) return match[1];
-          }
-        }
-        // Fallback: look for any number input or select with quantity
-        const selects = document.querySelectorAll("select");
-        for (const s of selects) {
-          const parentTxt = ((s.closest("div")?.innerText) || "").toLowerCase();
-          if (parentTxt.includes("qty")) {
-            return (s as HTMLSelectElement).value;
-          }
-        }
-        // Fallback: look for a visible quantity input
-        const inputs = document.querySelectorAll("input");
-        for (const inp of inputs) {
-          const placeholder = (inp.getAttribute("placeholder") || "").toLowerCase();
-          const name = (inp.getAttribute("name") || "").toLowerCase();
-          if ((placeholder.includes("quantity") || name.includes("quantity")) && inp.value) {
-            return inp.value;
-          }
-        }
-        return null;
+    const readQty = async () =>
+      this.evaluate(() => {
+        const m = (document.body?.innerText || "").match(/Qty:\s*(\d+)/i);
+        return m ? Number(m[1]) : 0;
       });
 
-      if (qtyText) {
-        displayedQty = parseInt(qtyText, 10);
-        if (!isNaN(displayedQty)) break;
-      }
-      await sleep(300);
+    let displayedQty = 0;
+    for (let attempt = 0; attempt < 5 && !displayedQty; attempt++) {
+      displayedQty = await readQty();
+      if (!displayedQty) await sleep(300);
     }
-
-    if (displayedQty > 0) {
-      console.log(`Current quantity on summary: ${displayedQty}`);
-    } else {
-      console.log("Could not detect quantity on order summary page — assuming correct");
-      return;
-    }
-
+    if (!displayedQty) throw new Error('Could not read "Qty: N" on order summary');
+    console.log(`Current quantity on summary: ${displayedQty}`);
     if (displayedQty === expectedQty) {
       console.log("Quantity matches — no change needed");
-      this.summaryQty = displayedQty;
       return;
     }
 
-    console.log(`Quantity mismatch: ${displayedQty} vs ${expectedQty} — correcting...`);
-
-    // Click the Qty selector to open the quantity dropdown/dialog
-    // Pattern from setQuantity(): find div with class css-146c3p1 near "Qty"
-    let qtyClicked = false;
-    for (let attempt = 0; attempt < 3 && !qtyClicked; attempt++) {
-      const result = await this.evaluate(() => {
-        const allDivs = Array.from(document.querySelectorAll("div"));
-        for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim();
-          if (txt.toLowerCase().startsWith("qty")) {
-            // Walk up to find clickable parent
-            let el: HTMLElement | null = d;
-            while (el && el !== document.body) {
-              const style = el.getAttribute("style") || "";
-              if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
-                el.scrollIntoView({ block: "center" });
-                el.click();
-                return "clicked";
-              }
-              el = el.parentElement;
-            }
-            // Fallback: click the div itself
-            (d as HTMLElement).click();
-            return "clicked_fallback";
-          }
-        }
-        // Alternative: look for div with css-146c3p1 class that is near Qty text
-        for (const d of allDivs) {
-          const cls = d.className || "";
-          if (cls.includes("css-146c3p1")) {
-            let el: HTMLElement | null = d;
-            while (el && el !== document.body) {
-              const style = el.getAttribute("style") || "";
-              if (style.includes("cursor: pointer")) {
-                el.scrollIntoView({ block: "center" });
-                el.click();
-                return "clicked_css_class";
-              }
-              el = el.parentElement;
-            }
-          }
-        }
-        return null;
-      });
-
-      if (result) {
-        qtyClicked = true;
-        console.log(`Qty selector clicked (${result})`);
-        await sleep(300);
-      } else {
-        console.log(`Qty selector not found (attempt ${attempt + 1}/3)`);
-        await sleep(300);
-      }
-    }
-
-    if (!qtyClicked) {
-      console.log("WARNING: Could not open quantity selector — proceeding anyway");
-      return;
-    }
-
-    // Wait for the quantity dialog/dropdown to appear
-    let dialogReady = false;
-    for (let i = 0; i < 5 && !dialogReady; i++) {
-      dialogReady = await this.evaluate(() => {
-        return (
-          !!document.querySelector('input[placeholder*="Quantity" i]') ||
-          !!document.querySelector('input[placeholder*="Qty" i]') ||
-          !!document.querySelector(".css-146c3p1") ||
-          (document.body?.innerText || "").includes("APPLY")
-        );
-      });
-      if (!dialogReady) await sleep(300);
-    }
-
-    if (!dialogReady) {
-      console.log("WARNING: Quantity dialog did not appear — proceeding anyway");
-      return;
-    }
-
-    // Type the desired quantity into the input
-    await this.evaluate((qty: number) => {
-      // Try to find the quantity input
-      const selectors = [
-        'input[placeholder*="Quantity" i]',
-        'input[placeholder*="Qty" i]',
-        'input[name*="quantity" i]',
-      ];
-      for (const sel of selectors) {
-        const inp = document.querySelector(sel) as HTMLInputElement | null;
-        if (inp) {
-          inp.focus();
-          // Clear and type
-          inp.value = "";
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-          if (setter) setter.call(inp, String(qty));
-          else inp.value = String(qty);
-          inp.dispatchEvent(new Event("input", { bubbles: true }));
-          inp.dispatchEvent(new Event("change", { bubbles: true }));
-          return "typed";
-        }
-      }
-      return null;
-    }, expectedQty);
+    console.log(`Quantity mismatch: ${displayedQty} vs ${expectedQty} — opening Qty dropdown`);
+    const qtySince = Date.now();
+    await this.page.getByText(/^\s*Qty:\s*\d+\s*$/).first().tap({ timeout: 5000 });
     await sleep(500);
 
-    // Click APPLY button
-    let applied = false;
-    for (let attempt = 0; attempt < 3 && !applied; attempt++) {
-      const result = await this.evaluate(() => {
-        const allDivs = Array.from(document.querySelectorAll("div"));
-        for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toUpperCase();
-          if (txt === "APPLY") {
-            let el: HTMLElement | null = d;
-            while (el && el !== document.body) {
-              const style = el.getAttribute("style") || "";
-              if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
-                el.scrollIntoView({ block: "center" });
-                el.click();
-                return "clicked";
-              }
-              el = el.parentElement;
-            }
-            (d as HTMLElement).click();
-            return "clicked_fallback";
-          }
-        }
-        // Also try button
-        const buttons = document.querySelectorAll("button");
-        for (const btn of buttons) {
-          const txt = (btn.textContent || "").replace(/\s+/g, " ").trim().toUpperCase();
-          if (txt === "APPLY") {
-            (btn as HTMLElement).click();
-            return "clicked_button";
-          }
-        }
-        return null;
-      });
+    /** The numbers Flipkart is offering right now — the top of that list is the cap. */
+    const listedQtys = async (): Promise<number[]> =>
+      this.evaluate(() =>
+        (Array.from(document.querySelectorAll("div,span")) as HTMLElement[])
+          .filter((n) => n.children.length === 0 && /^\s*\d{1,2}\s*$/.test(n.textContent || ""))
+          .filter((n) => {
+            const r = n.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && r.y > 0 && r.y < window.innerHeight;
+          })
+          .map((n) => Number((n.textContent || "").trim()))
+      );
 
-      if (result) {
-        applied = true;
-        console.log(`Quantity APPLY clicked (${result})`);
-        await sleep(500);
-      } else {
-        console.log(`APPLY button not found (attempt ${attempt + 1}/3)`);
-        await sleep(300);
+    const quantityLimit = async (): Promise<CheckoutFailure> => {
+      const body = await this.evaluate(() => document.body?.innerText || "");
+      const msg = body
+        .split(/\n+/)
+        .map((l) => l.trim())
+        .find((l) => QTY_LIMIT_RE.test(l) && l.length < 200);
+      const nums = await listedQtys();
+      const max = nums.length ? Math.max(...nums) : 0;
+      return new CheckoutFailure(
+        "MAX_UNITS_REACHED",
+        msg || `Flipkart allows at most ${max || "fewer"} unit(s) of this product per order — requested ${expectedQty}`
+      );
+    };
+
+    const option = this.page.getByText(String(expectedQty), { exact: true });
+    let picked = false;
+    for (let i = (await option.count()) - 1; i >= 0 && !picked; i--) {
+      const el = option.nth(i);
+      if (!(await el.isVisible().catch(() => false))) continue;
+      await el
+        .tap({ timeout: 4000 })
+        .then(() => (picked = true))
+        .catch(() => undefined);
+    }
+
+    if (picked) {
+      console.log(`Picked ${expectedQty} from Qty dropdown`);
+    } else {
+      const more = this.page.getByText(/^\s*more\s*$/i).first();
+      if (!(await more.isVisible().catch(() => false))) {
+        // No "more" → the listed numbers are the whole allowed range.
+        throw await quantityLimit();
+      }
+      console.log(`${expectedQty} not listed — tapping "more"`);
+      await more.tap({ timeout: 5000 });
+      const input = this.page
+        .locator(
+          'input[placeholder*="Quantity" i], input[placeholder*="Qty" i], input[name*="quantity" i], input[inputmode="numeric"], input[type="number"], input[type="tel"]'
+        )
+        .first();
+      await input.waitFor({ state: "visible", timeout: 8000 });
+      await input.fill(String(expectedQty));
+      await this.page.getByText(/^\s*apply\s*$/i).first().tap({ timeout: 5000 });
+      console.log(`Typed ${expectedQty} and tapped APPLY`);
+    }
+
+    // Flipkart answers every quantity change, and the answer is the real verdict:
+    // "Successfully updated quantity ... to N", or "You can only purchase N units".
+    // actionSuccess stays true even when it silently CAPS the amount, so the
+    // message matters more than the flag.
+    const qtyAction = this.api ? await this.api.waitForAction("CHECKOUT_UPDATE_ITEM_QUANTITY", qtySince, 8000) : null;
+    if (qtyAction) {
+      const msg = qtyAction.messages.join(" ");
+      console.log(`[API] quantity update: success=${qtyAction.success} "${msg}"`);
+      if (QTY_LIMIT_RE.test(msg)) throw new CheckoutFailure("MAX_UNITS_REACHED", msg);
+      if (!qtyAction.success) {
+        throw new CheckoutFailure("MAX_UNITS_REACHED", `Flipkart refused the quantity change: ${msg || "no message"}`);
       }
     }
 
-    if (!applied) {
-      console.log("WARNING: Could not click APPLY — quantity may not be updated");
-    } else {
-      console.log(`Quantity updated to ${expectedQty} on order summary`);
+    const rejected = async () =>
+      this.evaluate(() => /Something went wrong/i.test(document.body?.innerText || ""));
+
+    let ok = false;
+    try {
+      ok = await this.waitUntil(
+        async () => (await readQty()) === expectedQty || (await rejected()),
+        10000,
+        200,
+        `Qty: ${expectedQty} on summary`
+      );
+    } catch (err) {
+      // Over-limit quantities also surface as "out of stock for <pin>" for the
+      // capped amount; the per-order cap is the real reason, so prefer it.
+      if (err instanceof CheckoutFailure) {
+        const limit = await quantityLimit();
+        if (QTY_LIMIT_RE.test(limit.details)) {
+          throw new CheckoutFailure("MAX_UNITS_REACHED", `${limit.details} (also: ${err.details})`);
+        }
+      }
+      throw err;
     }
+
+    const now = await readQty();
+    if (await rejected()) {
+      const limit = await quantityLimit();
+      if (QTY_LIMIT_RE.test(limit.details)) throw limit;
+      throw new CheckoutFailure(
+        "MAX_UNITS_REACHED",
+        `Flipkart rejected quantity ${expectedQty} ("Something went wrong!" right after setting it) — Qty stays ${now}`
+      );
+    }
+    if (!ok || now !== expectedQty) {
+      const limit = await quantityLimit();
+      const capped = now > displayedQty && now < expectedQty;
+      if (QTY_LIMIT_RE.test(limit.details) || capped) {
+        throw new CheckoutFailure("MAX_UNITS_REACHED", `${limit.details} (Qty shows ${now}, requested ${expectedQty})`);
+      }
+      throw new Error(`Quantity did not update (shows ${now}, want ${expectedQty})`);
+    }
+    this.summaryQty = now;
+    console.log(`Quantity updated to ${now} on order summary`);
   }
+
 
   private async verifyDeliveryAddressOnSummary(address: AddressDetails): Promise<void> {
     const effectivePincode = (address.checkoutPincode || address.pincode).trim();
@@ -2737,6 +2743,16 @@ export class FlipkartCheckout {
     }, 8000, 120, "GST Invoice on viewcheckout");
     if (!gstVisible) {
       if (gstMandatory) {
+        // Flipkart says so itself on low-value items: "Note: GST and No cost
+        // EMI will not be applicable" (the ₹189 keychain, 2026-10-02). Quote
+        // it, so the halt reads as Flipkart's rule rather than a missing block.
+        const note = await this.evaluate(() => {
+          const t = (document.body?.innerText || "").replace(/ /g, " ");
+          return t.split(/\n+/).map((l) => l.trim()).find((l) => /GST[^.\n]{0,40}not (?:be )?applicable/i.test(l)) || "";
+        }).catch(() => "");
+        if (note) {
+          throw new CheckoutFailure("GST_NOT_APPLICABLE", `${note} — GST Invoice is mandatory for this order, so it was not placed`);
+        }
         throw new CheckoutFailure(
           "GST_NOT_FOUND",
           "GST is not found on page — GST Invoice is required on viewcheckout to process this order"
@@ -2749,8 +2765,29 @@ export class FlipkartCheckout {
       throw new CheckoutFailure("GST_NOT_FOUND", "GST is not found on page — job has no GST number but GST is mandatory");
     }
     const gstinReady = await this.waitUntil(async () => Boolean((await this.locateGstInvoiceBlock()).gstin), 5000, 120, "GSTIN on GST Invoice block");
-    if (!gstinReady && gstMandatory) {
-      throw new CheckoutFailure("GST_NOT_FOUND", "GST is not found on page — GST Invoice label is there but no GSTIN was readable");
+    if (!gstinReady) {
+      // No GST saved on this account yet: the row is an unticked "Use GST Invoice"
+      // with no GSTIN under it. Ticking it opens the add drawer directly (there is
+      // no Change on this row), so go through the same picker path from there.
+      // This used to throw GST_NOT_FOUND, which made a fresh account unusable for
+      // any GST order.
+      console.log(`[GST] no GSTIN on GST Invoice — ticking Use GST Invoice to add ${gstNumber}`);
+      await this.clickGstInvoiceControl();
+      if (!(await this.waitUntil(() => this.gstPickerOpen(), 6000, 120, "GST drawer after ticking GST Invoice"))) {
+        throw new CheckoutFailure("GST_NOT_FOUND", "Ticked Use GST Invoice but the GST details drawer did not open");
+      }
+      await this.ensureCorrectGstInPicker(gstNumber, companyName);
+      await this.waitUntil(async () => {
+        const p = await this.locateGstInvoiceBlock();
+        return this.gstPanelMatches(p, gstNumber, companyName) && p.checked;
+      }, 5000);
+      const added = await this.locateGstInvoiceBlock();
+      console.log(`[GST] after add: checked=${added.checked} gstin=${added.gstin || "(none)"}`);
+      if (!this.gstPanelMatches(added, gstNumber, companyName) || !added.checked) {
+        throw new Error(`GST not correct after adding (have ${added.gstin || "none"}, want ${gstNumber})`);
+      }
+      console.log("GST invoice ticked with the correct GST");
+      return;
     }
 
     const panel = await this.locateGstInvoiceBlock();
@@ -2921,93 +2958,67 @@ export class FlipkartCheckout {
     });
   }
 
+  /**
+   * The m-site GST tick box is an <img> to the left of the "GST Invoice" label,
+   * not an <input type=checkbox> — so there is nothing to .click() in the DOM. The
+   * old version looked for a checkbox / role=checkbox / pointer ancestor and found
+   * none of them on this layout. Tap where the box is drawn, like a thumb would.
+   */
   private async clickGstInvoiceControl(): Promise<void> {
-    const clicked = await this.evaluate(() => {
-      const clickEl = (el: HTMLElement) => {
-        el.scrollIntoView({ block: "center" });
-        el.click();
-      };
-      const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]')) as HTMLInputElement[];
-      for (const box of boxes) {
-        let el: HTMLElement | null = box;
-        for (let i = 0; i < 8 && el; i++) {
-          if (/GST Invoice/i.test(el.innerText || "")) {
-            clickEl(box);
-            return "checkbox";
-          }
-          el = el.parentElement;
-        }
-      }
-      const aria = Array.from(document.querySelectorAll('[role="checkbox"]')) as HTMLElement[];
-      for (const cb of aria) {
-        let el: HTMLElement | null = cb;
-        for (let i = 0; i < 8 && el; i++) {
-          if (/GST Invoice/i.test(el.innerText || "")) {
-            clickEl(cb);
-            return "aria";
-          }
-          el = el.parentElement;
-        }
-      }
-      const nodes = Array.from(document.querySelectorAll("div,span,label,button")) as HTMLElement[];
-      for (const n of nodes) {
-        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
-        if (!/^Use GST Invoice$/i.test(t) && t !== "Use GST Invoice") continue;
-        let el: HTMLElement | null = n;
-        while (el && el !== document.body) {
-          const style = el.getAttribute("style") || "";
-          if (style.includes("cursor: pointer") || el.getAttribute("role") === "checkbox") {
-            clickEl(el);
-            return "label";
-          }
-          el = el.parentElement;
-        }
-        clickEl(n);
-        return "text";
-      }
-      return null;
-    });
-    if (!clicked) throw new Error("Could not tap Use GST Invoice / GST checkbox");
-    console.log(`[GST] tapped via ${clicked}`);
+    const label = this.page.getByText(/^\s*(Use )?GST Invoice\s*$/).first();
+    await label.scrollIntoViewIfNeeded({ timeout: 5000 });
+    const box = await label.boundingBox();
+    if (!box) throw new Error("Could not find GST Invoice label to tick");
+    const x = Math.max(8, box.x - 22);
+    const y = box.y + box.height / 2;
+    await this.page.touchscreen.tap(x, y);
+    console.log(`[GST] tapped GST Invoice tick box at (${x.toFixed(0)}, ${y.toFixed(0)})`);
   }
 
+  /**
+   * Tap the "Change" on the GST Invoice row.
+   *
+   * Ported from the reference flow. The previous version searched the located GST
+   * panel for a div with `cursor: pointer` whose text was exactly "Change" — and on
+   * the real checkout that found nothing, so a GST that genuinely needed changing
+   * failed with "GST Invoice Change button not found", three times, and the order
+   * stopped. Confirmed against the captured DOM of a failing run: the panel IS
+   * found and the GSTIN IS read, so the fault was only ever in locating this
+   * control.
+   *
+   * Geometry instead of DOM structure. The page has two "Change" links — one on the
+   * Deliver-to row, one on the GST row — and the GST one is the one vertically
+   * closest to the "GST Invoice" label. The 40px threshold is what stops it tapping
+   * the address's Change when the GST row has no Change at all, which would silently
+   * open the wrong drawer.
+   */
   private async clickGstChangeButton(): Promise<void> {
-    const box = await this.evaluate(() => {
-      const compact = (s: string) => (s || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-      const gstinRe = /\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b/i;
-      let label: HTMLElement | null = null;
-      for (const n of Array.from(document.querySelectorAll("div,span")) as HTMLElement[]) {
-        if (/^GST Invoice$/i.test(compact(n.textContent || ""))) {
-          label = n;
-          break;
-        }
+    const label = this.page.getByText(/^\s*(Use )?GST Invoice\s*$/).first();
+    await label.scrollIntoViewIfNeeded({ timeout: 5000 });
+    const labelBox = await label.boundingBox();
+    if (!labelBox) throw new Error("GST Invoice label not found");
+
+    const changes = this.page.getByText("Change", { exact: true });
+    const total = await changes.count();
+    let best = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < total; i++) {
+      const b = await changes.nth(i).boundingBox().catch(() => null);
+      if (!b) continue;
+      const dist = Math.abs(b.y + b.height / 2 - (labelBox.y + labelBox.height / 2));
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
       }
-      if (!label) return null;
-      label.scrollIntoView({ block: "center", inline: "nearest" });
-      let root: HTMLElement | null = label;
-      while (root && root !== document.body) {
-        const t = compact(root.innerText || "");
-        if (/GST Invoice/i.test(t) && gstinRe.test(t) && /\bChange\b/i.test(t) && t.length < 800) {
-          break;
-        }
-        root = root.parentElement;
-      }
-      if (!root || root === document.body) root = label.parentElement ?? label;
-      const pointers = Array.from(root.querySelectorAll("div")) as HTMLElement[];
-      const changePtrs = pointers.filter((d) => {
-        const style = d.getAttribute("style") || "";
-        return style.includes("cursor: pointer") && compact(d.innerText || "") === "Change";
-      });
-      const pointer = changePtrs[0];
-      if (!pointer) return null;
-      pointer.scrollIntoView({ block: "center", inline: "nearest" });
-      pointer.click();
-      const r = pointer.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, via: "pointer" };
-    });
-    if (!box) throw new Error("GST Invoice Change button not found (second Change, next to GST Invoice)");
-    console.log(`=== GST Invoice Change ${box.w.toFixed(0)}x${box.h.toFixed(0)} via ${box.via} ===`);
-    await this.tapPoint(box.x, box.y, "GST Invoice Change");
+    }
+    if (best < 0 || bestDist > 40) {
+      throw new Error(
+        `GST Invoice Change button not found next to the GST Invoice label ` +
+          `(${total} "Change" on the page, nearest ${bestDist === Infinity ? "none" : bestDist.toFixed(0) + "px"} away)`
+      );
+    }
+    await changes.nth(best).tap({ timeout: 5000 });
+    console.log(`=== GST Invoice Change tapped (Change #${best + 1}/${total}, ${bestDist.toFixed(0)}px from the label) ===`);
   }
 
 
@@ -3045,52 +3056,81 @@ export class FlipkartCheckout {
       return;
     }
 
-    if (drawer.hasEdit) {
-      console.log(`[GST] ${gstNumber} not in list — Edit the selected GST and refill`);
+    // ADD takes priority over EDIT — the reverse of what this used to do.
+    //
+    // Edit rewrites a GST the account already has. Ordering to a TRANSPARENTS DEALS
+    // address while the drawer holds DASHMOBILES' 06AALCD3578N1Z0, the old order
+    // picked Edit and tried to overwrite DASHMOBILES' saved GSTIN with TRANSPARENTS'
+    // — which would have corrupted that entry for every other order using it, on a
+    // shared account, silently. It also did not work: the drawer never closed and
+    // the run failed with "GST not correct after refill".
+    //
+    // Edit survives only as the fallback for a drawer that offers no "Add new",
+    // which is the one case where there is nothing else to try.
+    if (drawer.hasAddNew || !drawer.hasEdit) {
+      console.log(`[GST] ${gstNumber} not in drawer — Add new GST Details`);
+      await this.clickAddNewGstDetails();
+    } else {
+      console.log(`[GST] ${gstNumber} not in list and no Add option — Edit the selected GST and refill`);
       await this.clickGstEditInPicker();
-      const formReady = await this.waitForGstFormInputs(10000);
-      if (!formReady) throw new Error("GST Edit form inputs never appeared");
-      await this.fillGstForm(gstNumber, companyName);
-      await this.clickConfirmAndUseGst();
-      await this.waitUntil(async () => !(await this.gstPickerOpen()), 8000, 120, "GST drawer close after Edit");
-      return;
     }
-
-    console.log(`[GST] target not in drawer — Add new GST Details ${gstNumber}`);
-    await this.clickAddNewGstDetails();
     const formReady = await this.waitForGstFormInputs(10000);
-    if (!formReady) throw new Error("GST form inputs never appeared after Add new GST Details");
+    if (!formReady) throw new Error("GST form inputs never appeared");
     await this.fillGstForm(gstNumber, companyName);
+    const confirmSince = Date.now();
     await this.clickConfirmAndUseGst();
-    await this.waitUntil(async () => !(await this.gstPickerOpen()), 8000, 120, "GST drawer close after add");
+
+    // A drawer that stays open after Confirm means Flipkart REFUSED the GST, and it
+    // says why on that drawer. Without reading it the run reports "GST not correct
+    // after refill (have X, want Y)" — true, but it never says that Flipkart
+    // rejected the GSTIN, so the operator cannot tell a bad number from a bug.
+    const closed = await this.waitUntil(
+      async () => !(await this.gstPickerOpen()),
+      8000,
+      120,
+      "GST drawer close after add"
+    );
+    if (!closed) {
+      // Flipkart's answer, if the page asked it anything after Confirm. Passive.
+      const action = this.api ? await this.api.waitForAction(/GST/i, confirmSince, 1500) : null;
+      if (action) {
+        console.log(`[API] ${action.type}: success=${action.success}${action.messages.length ? ` "${action.messages.join(" ")}"` : ""}`);
+      }
+      const text = await this.evaluate(() => document.body?.innerText || "");
+      const msg =
+        action?.messages.join(" ") ||
+        text
+          .split(/\n+/)
+          .map((l) => l.trim())
+          // The form carries a standing note, "Incorrect GSTIN details will lead
+          // to order cancellation", on every open. It is not the rejection —
+          // skip it, or every refusal reports that sentence.
+          .filter((l) => !/will lead to order cancellation/i.test(l))
+          .find(
+            (l) =>
+              /invalid|valid gst|incorrect|not (a )?valid|does not match|already (exists|added)|mandatory|required/i.test(l) &&
+              l.length < 160
+          );
+      throw new CheckoutFailure(
+        "GST_SELECT_FAILED",
+        msg
+          ? `Flipkart rejected GST ${gstNumber}: ${msg}`
+          : `Flipkart did not accept GST ${gstNumber} — the Add GST form stayed open after Confirm`
+      );
+    }
   }
 
+  // Every control in the GST drawer below is tapped through a Playwright locator
+  // (touch), the way the reference flow does it. The versions these replace found
+  // the element in the DOM and called .click() on it, or computed a point and sent
+  // a mouse click — and on the m-site drawer that visibly did nothing: the form
+  // filled, "Confirm and Save" was "clicked" at 380x72, and the drawer stayed open
+  // with no error on it. `.last()` because the drawer is appended after the page
+  // content, so when both carry the same label the drawer's is the later one.
+
   private async clickGstEditInPicker(): Promise<void> {
-    const clicked = await this.evaluate(() => {
-      const compact = (s: string) => s.replace(/\s+/g, " ").trim();
-      const nodes = Array.from(document.querySelectorAll("div,span,button,a")) as HTMLElement[];
-      for (const n of nodes) {
-        if (compact(n.textContent || "") !== "Edit") continue;
-        let el: HTMLElement | null = n;
-        let inGst = false;
-        let pointer: HTMLElement = n;
-        for (let i = 0; i < 16 && el && el !== document.body; i++) {
-          const t = compact(el.innerText || "");
-          if (/Select GST Details/i.test(t) || (/GST/i.test(t) && t.length < 400)) inGst = true;
-          if ((el.getAttribute("style") || "").includes("cursor: pointer") || el.tagName === "BUTTON") {
-            pointer = el;
-          }
-          el = el.parentElement;
-        }
-        if (!inGst) continue;
-        pointer.scrollIntoView({ block: "center" });
-        pointer.click();
-        return true;
-      }
-      return false;
-    });
-    if (!clicked) throw new Error("GST Edit button not found in Select GST Details");
-    console.log("[GST] clicked Edit in picker");
+    await this.page.getByText("Edit", { exact: true }).last().tap({ timeout: 5000 });
+    console.log("[GST] tapped Edit in picker");
   }
 
   private async waitForGstPicker(timeoutMs: number): Promise<boolean> {
@@ -3115,230 +3155,160 @@ export class FlipkartCheckout {
   }
 
   private async selectGstRowInPicker(gstNumber: string): Promise<void> {
-    const clicked = await this.evaluate((gst: string) => {
-      const upper = gst.toUpperCase();
-      const nodes = Array.from(document.querySelectorAll("div,label,span,li")) as HTMLElement[];
-      let best: HTMLElement | null = null;
-      let bestLen = Infinity;
-      for (const n of nodes) {
-        const t = (n.innerText || "").replace(/\s+/g, " ").trim();
-        if (!t.toUpperCase().includes(upper)) continue;
-        if (/^Edit$/i.test(t)) continue;
-        if (t.length < bestLen && t.length < 240) {
-          best = n;
-          bestLen = t.length;
-        }
-      }
-      if (!best) return false;
-      let el: HTMLElement | null = best;
-      while (el && el !== document.body) {
-        const radio = el.querySelector('input[type="radio"]') as HTMLInputElement | null;
-        if (radio) {
-          radio.click();
-          el.click();
-          return true;
-        }
-        const style = el.getAttribute("style") || "";
-        if (style.includes("cursor: pointer") || el.getAttribute("role") === "radio") {
-          el.click();
-          return true;
-        }
-        el = el.parentElement;
-      }
-      best.click();
-      return true;
-    }, gstNumber);
-    if (!clicked) throw new Error(`Could not select GST row ${gstNumber} in picker`);
+    const row = this.page.getByText(new RegExp(`^\\s*${gstNumber}\\s*$`, "i")).last();
+    await row.tap({ timeout: 5000 });
+    console.log(`[GST] selected ${gstNumber} in picker`);
     await sleep(400);
   }
 
   private async clickAddNewGstDetails(): Promise<void> {
-    const clicked = await this.evaluate(() => {
-      const nodes = Array.from(document.querySelectorAll("div,span,button,a")) as HTMLElement[];
-      for (const n of nodes) {
-        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
-        if (!/Add new GST Details/i.test(t) || t.length > 40) continue;
-        let el: HTMLElement | null = n;
-        while (el && el !== document.body) {
-          const style = el.getAttribute("style") || "";
-          if (style.includes("cursor: pointer") || el.tagName === "BUTTON" || el.tagName === "A") {
-            el.scrollIntoView({ block: "center" });
-            el.click();
-            return true;
-          }
-          el = el.parentElement;
-        }
-        n.scrollIntoView({ block: "center" });
-        n.click();
-        return true;
-      }
-      return false;
-    });
-    if (!clicked) throw new Error("Could not click Add new GST Details");
-    console.log("[GST] clicked Add new GST Details");
+    await this.page.getByText(/^\s*\+?\s*Add new GST Details\s*$/i).last().tap({ timeout: 5000 });
+    console.log("[GST] tapped Add new GST Details");
     await sleep(800);
   }
 
   private async clickConfirmAndUseGst(): Promise<void> {
-    const box = await this.evaluate(() => {
-      const compact = (s: string) => s.replace(/\s+/g, " ").trim();
-      const labels = /^(Confirm and Use|Confirm and Save)$/i;
-      const hits: Array<{ x: number; y: number; w: number; h: number; bottom: number }> = [];
-      for (const n of Array.from(document.querySelectorAll("button,div,span")) as HTMLElement[]) {
-        if (!labels.test(compact(n.textContent || ""))) continue;
-        let el: HTMLElement | null = n;
-        let best = n;
-        while (el && el !== document.body) {
-          const r = el.getBoundingClientRect();
-          if (r.height >= 36 && r.height <= 88 && r.width >= 80) best = el;
-          if ((el.getAttribute("style") || "").includes("cursor: pointer")) {
-            best = el;
-            break;
-          }
-          el = el.parentElement;
-        }
-        const r = best.getBoundingClientRect();
-        if (r.width < 40 || r.height < 20) continue;
-        hits.push({ x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, bottom: r.bottom });
-      }
-      if (!hits.length) return null;
-      hits.sort((a, b) => b.bottom - a.bottom || b.w - a.w);
-      const pick = hits[0];
-      return { x: pick.x, y: pick.y, w: pick.w, h: pick.h };
-    });
-    if (box) {
-      console.log(`=== Confirm GST ${box.w.toFixed(0)}x${box.h.toFixed(0)} ===`);
-      await this.tapPoint(box.x, box.y, "Confirm and Use / Save");
-      return;
-    }
-    throw new Error("Could not click Confirm and Use / Confirm and Save");
+    const btn = this.page.getByText(/^\s*Confirm and (Use|Save)\s*$/i).last();
+    await btn.tap({ timeout: 5000 });
+    console.log("=== Confirm GST tapped ===");
   }
 
+  /** The real payment page: /payments WITH a checkout token, on pay.flipkart.com
+   *  or www.flipkart.com. The generic www.flipkart.com/payments without a token
+   *  is what the old fallback opened, and it has no card form. */
+  private onPaymentPage(): boolean {
+    try {
+      const u = new URL(this.page.url());
+      return /flipkart\.com$/i.test(u.hostname) && /\/payments/i.test(u.pathname) && u.searchParams.has("token");
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Tap Continue on viewcheckout and wait for the payment page.
+   *
+   * Ported from the reference flow, and with every "remembered URL" fallback
+   * removed. The old version, when Continue was not found or did not navigate
+   * within 8s, jumped to a hard-coded https://www.flipkart.com/payments — a
+   * page with no card form — and the job then failed as "Credit/Debit Card
+   * option not found", blaming the payment step for a checkout problem (the
+   * HDFC Submit Order run of 2026-10-02 did exactly this). A payment page that
+   * Continue did not open is not a payment page; the job fails here, saying so.
+   */
   private async clickContinueToCheckout(): Promise<void> {
-    console.log("Clicking Continue to proceed to checkout...");
+    console.log("Tapping Continue to proceed to payment...");
+    const contSince = Date.now();
 
-    // Wait for the Continue button to appear
-    let buttonFound = false;
-    for (let attempt = 0; attempt < 3 && !buttonFound; attempt++) {
-      try {
-        await this.waitForFunction(
-          () => {
-            const allDivs = Array.from(document.querySelectorAll("div"));
-            for (const d of allDivs) {
-              const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
-              // Flipkart Continue button often has "continue" text with green styling
-              if (txt === "continue" || txt === "continue ") {
-                return true;
-              }
-            }
-            // Also check buttons
-            const buttons = Array.from(document.querySelectorAll("button"));
-            for (const b of buttons) {
-              const txt = (b.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-              if (txt === "continue" || txt === "continue ") return true;
-            }
-            return false;
-          },
-          { timeout: 15000 }
-        );
-        buttonFound = true;
-      } catch (err) {
-        const msg = (err as Error).message;
-        if (msg.includes("detached") || msg.includes("Frame")) {
-          console.log("Frame detached while waiting for Continue (attempt " + (attempt + 1) + "/3)");
-          await sleep(500);
-        } else {
-          console.log("Continue button not found: " + msg);
+    // Two "Continue" labels can exist (one in a sticky footer); tap the one
+    // that is on screen, trying for up to ~20s while the page settles after
+    // the GST / address work.
+    const labels = this.page.getByText("Continue", { exact: true });
+    let tapped = false;
+    for (let attempt = 0; attempt < 40 && !tapped; attempt++) {
+      const vh = this.page.viewportSize()?.height ?? 900;
+      const cands: Array<{ i: number; onScreen: boolean; y: number }> = [];
+      const n = await labels.count().catch(() => 0);
+      for (let i = 0; i < n; i++) {
+        const el = labels.nth(i);
+        if (!(await el.isVisible().catch(() => false))) continue;
+        const b = await el.boundingBox().catch(() => null);
+        if (b) cands.push({ i, onScreen: b.y >= 0 && b.y + b.height <= vh, y: b.y });
+      }
+      cands.sort((a, b) => Number(b.onScreen) - Number(a.onScreen) || b.y - a.y);
+      for (const c of cands) {
+        try {
+          await labels.nth(c.i).tap({ timeout: 4000 });
+          tapped = true;
+          console.log(`Tapped Continue #${c.i + 1} (onScreen=${c.onScreen})`);
           break;
+        } catch {
+          /* try the next candidate */
         }
+      }
+      if (!tapped) await sleep(500);
+    }
+    if (!tapped) {
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        `Continue button not found on viewcheckout within 20s (on ${this.page.url().split("?")[0]})`
+      );
+    }
+
+    // CHECKOUT_PAYMENT_TOKEN_GENERATE is Flipkart deciding whether a payment page
+    // exists at all. When it refuses, it says why — and that reason never reaches
+    // the DOM, so without this the flow can only report "did not open payments".
+    const pay = this.api ? await this.api.waitForAction("CHECKOUT_PAYMENT_TOKEN_GENERATE", contSince, 15000) : null;
+    if (pay) {
+      console.log(
+        `[API] payment token: success=${pay.success} next=${(pay.landingUrl || "-").split("?")[0]}` +
+          `${pay.messages.length ? ` "${pay.messages.join(" ")}"` : ""}`
+      );
+      if (!pay.success || (!pay.landingUrl && pay.messages.length)) {
+        throw new CheckoutFailure(
+          "UNABLE_TO_PLACE_ORDER",
+          pay.messages.join(" ") || "Flipkart did not create the payment page"
+        );
       }
     }
 
-    if (!buttonFound) {
-      console.log("Continue not on this page — opening remembered payments URL");
-      await this.gotoPayments();
-      return;
+    let reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, "payment page after Continue");
+    if (!reached && pay?.landingUrl && /token=/.test(pay.landingUrl)) {
+      // Flipkart issued the token but the page did not navigate (seen on
+      // 2026-10-02: success=true, no landing action). The token URL is
+      // Flipkart's own for THIS checkout — not a remembered one — so opening
+      // it is the same thing the page would have done.
+      console.log("Payment token issued but the page stayed on viewcheckout — opening the token URL Flipkart returned");
+      await navigateWithRetry(this.page, pay.landingUrl, { timeoutMs: 15000, maxRetries: 2 }).catch(() => undefined);
+      reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 10_000, 150, "payment page via token URL");
     }
-
-    // Click the Continue button
-    let result: string | null = null;
-    for (let attempt = 0; attempt < 3 && !result; attempt++) {
-      result = await this.evaluate(() => {
-        // Try buttons first (most reliable)
-        const buttons = Array.from(document.querySelectorAll("button"));
-        for (const b of buttons) {
-          const txt = (b.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-          if (txt === "continue" || txt === "continue ") {
-            (b as HTMLElement).click();
-            return "clicked_button";
-          }
+    // Flipkart's own "Something went wrong! Please try again later. [Retry]"
+    // sheet in place of the payment page (actbogtee, 2026-10-04 21:46 IST: the
+    // token call never happened). Its Retry re-fires that call, so press it —
+    // at most twice — before deciding the page is stuck.
+    for (let retry = 0; !reached && retry < 2; retry++) {
+      const wentWrong = await this.evaluate(() => /Something went wrong/i.test(document.body?.innerText || "")).catch(() => false);
+      const retryBtn = this.page.getByText("Retry", { exact: true }).last();
+      if (!wentWrong || !(await retryBtn.isVisible().catch(() => false))) break;
+      console.log(`"Something went wrong" sheet after Continue — tapping its Retry (${retry + 1}/2)`);
+      const retrySince = Date.now();
+      await retryBtn.tap({ timeout: 4000 }).catch(() => undefined);
+      reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, `payment page after Retry ${retry + 1}`);
+      if (!reached && this.api) {
+        const p2 = await this.api.waitForAction("CHECKOUT_PAYMENT_TOKEN_GENERATE", retrySince, 2000);
+        if (p2?.landingUrl && /token=/.test(p2.landingUrl)) {
+          await navigateWithRetry(this.page, p2.landingUrl, { timeoutMs: 15000, maxRetries: 2 }).catch(() => undefined);
+          reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 10_000, 150, "payment page via token URL after Retry");
         }
-        // Try divs
-        const allDivs = Array.from(document.querySelectorAll("div"));
-        for (const d of allDivs) {
-          const txt = (d.innerText || "").replace(/\s+/g, " ").trim().toLowerCase();
-          if (txt === "continue" || txt === "continue ") {
-            // Walk up to find clickable parent
-            let el: HTMLElement | null = d;
-            while (el && el !== document.body) {
-              const style = el.getAttribute("style") || "";
-              if (style.includes("cursor: pointer") || el.getAttribute("role") === "button") {
-                el.scrollIntoView({ block: "center" });
-                el.click();
-                return "clicked_div";
-              }
-              el = el.parentElement;
-            }
-            // Fallback: click div itself
-            (d as HTMLElement).click();
-            return "clicked_div_fallback";
-          }
-        }
-        return null;
-      });
-
-      if (result) {
-        console.log(`Continue clicked (${result})`);
-        break;
-      } else {
-        console.log(`Continue not found (attempt ${attempt + 1}/3)`);
-        await sleep(300);
       }
     }
-
-    if (!result) {
-      console.log("Could not click Continue — opening remembered payments URL");
-      await this.gotoPayments();
-      return;
+    if (!reached && /viewcheckout/i.test(this.page.url())) {
+      // Still on checkout: the tap may have landed during a re-render. One
+      // more tap, then the verdict.
+      console.log("Still on viewcheckout after Continue — tapping once more");
+      const again = labels.last();
+      await again.tap({ timeout: 4000 }).catch(() => undefined);
+      reached = await this.waitUntil(() => Promise.resolve(this.onPaymentPage()), 15_000, 150, "payment page after second Continue");
     }
-
-    console.log("Waiting for Continue → /payments ...");
-    const reached = await this.waitUntil(
-      async () => /\/payments/i.test(this.page.url() || "") || !/viewcheckout/i.test(this.page.url() || ""),
-      8000,
-      120,
-      "payments after Continue"
-    );
-    if (/\/payments/i.test(this.page.url() || "")) {
-      console.log(`Continue navigation complete — ${this.page.url()}`);
-      return;
+    if (!reached) {
+      // Say what the page is showing, and keep a picture of it: a worker has
+      // no artifacts, and "did not open" on its own was unanswerable.
+      const shown = await this.evaluate(() => {
+        const sheet = document.getElementById("msite-bottomsheet");
+        const t = (sheet && (sheet as HTMLElement).innerText) || document.body?.innerText || "";
+        return t.replace(/\s+/g, " ").trim().slice(0, 240);
+      }).catch(() => "");
+      const shot = path.join("debug", "failures", `${new Date().toISOString().replace(/[:.]/g, "-")}-continue.png`);
+      await fs.promises.mkdir(path.dirname(shot), { recursive: true }).catch(() => undefined);
+      await this.page.screenshot({ path: shot, fullPage: true, timeout: 10_000 }).catch(() => undefined);
+      throw new CheckoutFailure(
+        "UNABLE_TO_PLACE_ORDER",
+        `Continue did not open the payment page (still on ${this.page.url().split("?")[0]}; ` +
+          `token ${pay ? (pay.landingUrl ? "issued with URL" : "issued without URL") : "not seen"}; ` +
+          `page says: "${shown}"; screenshot ${shot})`
+      );
     }
-    if (reached && !/viewcheckout/i.test(this.page.url() || "")) {
-      console.log(`Left viewcheckout — ${this.page.url()}`);
-      return;
-    }
-    console.log("Continue did not open payments — using remembered /payments URL");
-    await this.gotoPayments();
-  }
-
-  private async gotoPayments(): Promise<void> {
-    if (/\/payments/i.test(this.page.url() || "")) {
-      console.log(`Already on payments ${this.page.url()}`);
-      return;
-    }
-    console.log(`Jumping to remembered payments ${PAYMENTS_URL}`);
-    await navigateWithRetry(this.page, PAYMENTS_URL, { timeoutMs: 12000, maxRetries: 2 });
-    console.log(`On payments ${this.page.url()}`);
+    console.log(`Continue navigation complete — ${this.page.url().split("?")[0]}`);
   }
 
   private async ensureGstCheckboxTicked(): Promise<void> {
@@ -4141,60 +4111,27 @@ export class FlipkartCheckout {
     }
   }
 
+  /**
+   * Type into the drawer's inputs with Playwright `fill()` — real input events on
+   * the focused element — rather than setting `.value` and dispatching synthetic
+   * events from inside the page. The inputs are maxlength 15 (GSTIN) and 60
+   * (business name); `.last()` because the drawer's inputs come after any the page
+   * already had. Business name is optional on some forms, so it is filled only
+   * when the input is visible.
+   */
   private async fillGstForm(gstNumber: string, companyName: string): Promise<void> {
     console.log("Filling GST form...");
-
-    let filled = false;
-    for (let attempt = 0; attempt < 5 && !filled; attempt++) {
-      const result = await this.evaluate((gst: string, company: string) => {
-        // Find GST number input: maxlength=15
-        const gstEl = document.querySelector('input[maxlength="15"]') as HTMLInputElement | null;
-        // Find company name input: maxlength=60
-        const companyEl = document.querySelector('input[maxlength="60"]') as HTMLInputElement | null;
-
-        const filledGst = gstEl !== null;
-        const filledCompany = companyEl !== null;
-
-        if (gstEl) {
-          gstEl.focus();
-          gstEl.value = "";
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-          if (setter) setter.call(gstEl, gst);
-          else gstEl.value = gst;
-          gstEl.dispatchEvent(new Event("input", { bubbles: true }));
-          gstEl.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-        if (companyEl) {
-          companyEl.focus();
-          companyEl.value = "";
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-          if (setter) setter.call(companyEl, company);
-          else companyEl.value = company;
-          companyEl.dispatchEvent(new Event("input", { bubbles: true }));
-          companyEl.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-
-        return { filledGst, filledCompany };
-      }, gstNumber, companyName);
-
-      if (result.filledGst) {
-        console.log(`Entered GST number: ${gstNumber.slice(0, 2)}***${gstNumber.slice(-2)}`);
-      } else {
-        console.log(`WARNING: GST input [maxlength="15"] not found (attempt ${attempt + 1}/5)`);
-      }
-      if (result.filledCompany) {
-        console.log(`Entered company name: ${companyName}`);
-      } else {
-        console.log(`WARNING: Company input [maxlength="60"] not found (attempt ${attempt + 1}/5)`);
-      }
-
-      if (result.filledGst && result.filledCompany) {
-        filled = true;
-      } else {
-        await sleep(300);
-      }
+    const gstEl = this.page.locator('input[maxlength="15"]').last();
+    await gstEl.waitFor({ state: "visible", timeout: 8000 });
+    await gstEl.fill(gstNumber);
+    console.log(`Entered GST number: ${gstNumber.slice(0, 2)}***${gstNumber.slice(-2)}`);
+    const companyEl = this.page.locator('input[maxlength="60"]').last();
+    if (companyName && (await companyEl.isVisible().catch(() => false))) {
+      await companyEl.fill(companyName);
+      console.log(`Entered company name: ${companyName}`);
+    } else {
+      console.log("Company name input not shown — Flipkart fills business name from GSTIN");
     }
-
     await sleep(500);
   }
 

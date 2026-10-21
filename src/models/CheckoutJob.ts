@@ -29,6 +29,8 @@ export interface ICheckoutJob {
   errorCodeDisplay?: string;
   errorSource?: string;
   errorDetails?: string;
+  errorStage?: string;
+  paymentStartedAt?: Date | null;
   filterReason?: string;
   failedAt?: Date | null;
   batchStatus?: string;
@@ -39,7 +41,22 @@ export interface ICheckoutJob {
   logs: JobLog[];
   bullmqJobId?: string;
   startedAt: Date | null;
+  heartbeatAt?: Date | null;
+  claimedBy?: string;
+  /** Deployment that owns this job (config.systemId); only its workers consume or sweep it. */
+  systemId?: string;
   completedAt: Date | null;
+  /** Getting this attempt's order into Order Units (services/orderSync.ts). */
+  orderSync?: {
+    status: "pending" | "done" | "skipped" | "failed";
+    attempts: number;
+    lastError: string;
+    /** The order ids the sync wrote, including one discovered for a failed attempt. */
+    orderIds: string[];
+    units: number;
+    queuedAt: Date | null;
+    syncedAt: Date | null;
+  };
   createdAt: Date;
   updatedAt: Date;
 }
@@ -92,6 +109,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
         "queued",
         "running",
         "reached_payment",
+        "paid",
         "failed",
         "cancelled",
         "skipped",
@@ -99,6 +117,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
         "completed_target_reached",
         "failed_attempt_budget_exhausted",
         "filtered",
+        "needs_reconciliation",
       ],
       default: "queued",
       index: true,
@@ -111,6 +130,11 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
     errorCodeDisplay: { type: String, default: "" },
     errorSource: { type: String, default: "" },
     errorDetails: { type: String, default: "" },
+    errorStage: { type: String, default: "" },
+    /** Written durably the instant before Pay is pressed (or COD placed). A
+     *  job with this set and no order id must never be re-run automatically:
+     *  money may already have moved. See claimCheckoutJob. */
+    paymentStartedAt: { type: Date, default: null },
     filterReason: { type: String, default: "" },
     failedAt: { type: Date, default: null },
     batchStatus: { type: String, default: "" },
@@ -124,6 +148,13 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       platform: { type: String, default: "FLIPKART" },
       paymentMode: { type: String, default: "" },
       cardType: { type: String, default: "" },
+      // Declared explicitly because Mongoose is strict by default: a field
+      // present on JobRequestSnapshot but absent here is dropped on save without
+      // an error, so the snapshot would silently lose the two values the payment
+      // phase depends on for explaining itself after the fact.
+      authType: { type: String, default: "" },
+      corporateId: { type: String, default: "" },
+      cardMaxUsage: { type: Number },
       sellerName: { type: String, default: "" },
       listingId: { type: String, default: "" },
       deliverySlaDays: { type: Number },
@@ -156,17 +187,85 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       gstCompany: { type: String, default: "" },
       paymentUrl: { type: String, default: "" },
       flipkartOrderId: { type: String, default: "" },
+      flipkartReferenceId: { type: String, default: "" },
       transactionAmount: { type: String, default: "" },
       cartAfterCardOffer: { type: String, default: "" },
       cartAfterOfferPrelim: { type: String, default: "" },
       giftCardApplied: { type: String, default: "" },
+      cardTypeName: { type: String, default: "" },
+      cardLast4: { type: String, default: "" },
+      authType: { type: String, default: "" },
+      employeeId: { type: String, default: "" },
+      authenticatedAt: { type: Date, default: null },
+      // From Flipkart's gateway / order-confirmation responses after a placed
+      // order. Declared, or strict mode drops them silently on save.
+      paymentFee: { type: String, default: "" },
+      paymentFeeDetails: { type: String, default: "" },
+      shippingAmount: { type: String, default: "" },
+      discountPct: { type: String, default: "" },
+      mrp: { type: String, default: "" },
+      unitPrice: { type: String, default: "" },
+      bankTransactionId: { type: String, default: "" },
+      pgTransactionId: { type: String, default: "" },
+      bankName: { type: String, default: "" },
+      cardBrand: { type: String, default: "" },
+      supercoinsApplied: { type: String, default: "" },
+      promiseDays: { type: Number },
+      promiseDate: { type: Date, default: null },
+      orderStatus: { type: String, default: "" },
+      sellerName: { type: String, default: "" },
+      // The card the pool actually used for this order — the batch's CSV may
+      // hold many. Label and last-4s only; never a full PAN.
+      cardName: { type: String, default: "" },
+      parentCardLast4: { type: String, default: "" },
+      childCardLast4: { type: String, default: "" },
+      billingPhone: { type: String, default: "" },
+      // Egress: which Proxy Pool row the worker left from ("host:port") and the
+      // public address Flipkart saw. "direct" when no proxy was used.
+      egressProxy: { type: String, default: "" },
+      exitIp: { type: String, default: "" },
     },
     logs: { type: [JobLogSchema], default: [] },
     bullmqJobId: { type: String },
     startedAt: { type: Date, default: null },
+    /**
+     * Refreshed while a worker is actually running this job.
+     *
+     * Exists because "status is running" alone cannot tell a live worker from one
+     * that died mid-checkout. BullMQ hides that today behind its own Redis lock
+     * and stalled-job detection; SQS has neither. Once the transport moves, a job
+     * whose worker was killed would sit at `running` forever with nothing able to
+     * claim it. The heartbeat is what makes claimCheckoutJob's claim reclaimable
+     * rather than permanent.
+     */
+    heartbeatAt: { type: Date, default: null },
+    /** Which worker run holds the claim, so a stale reclaim is attributable. */
+    claimedBy: { type: String, default: "" },
+    systemId: { type: String, default: "", index: true },
     completedAt: { type: Date, default: null },
+    orderSync: {
+      type: new Schema(
+        {
+          status: { type: String, enum: ["pending", "done", "skipped", "failed"], default: "pending" },
+          attempts: { type: Number, default: 0 },
+          lastError: { type: String, default: "" },
+          orderIds: { type: [String], default: [] },
+          units: { type: Number, default: 0 },
+          queuedAt: { type: Date, default: null },
+          syncedAt: { type: Date, default: null },
+        },
+        { _id: false }
+      ),
+      default: undefined,
+    },
   },
   { timestamps: true, collection: "tradeflowjobs" }
 );
+
+// Backs the stale-claim reclaim: find `running` jobs whose heartbeat has gone
+// quiet without scanning the collection.
+CheckoutJobSchema.index({ status: 1, heartbeatAt: 1 });
+// Backs the order-sync sweep: finished jobs whose order has not reached Order Units.
+CheckoutJobSchema.index({ "orderSync.status": 1, completedAt: 1 });
 
 export const CheckoutJob = mongoose.model<ICheckoutJob>("CheckoutJob", CheckoutJobSchema);

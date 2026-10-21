@@ -18,6 +18,13 @@ import {
   restoreFlipkartSession,
   sleep,
 } from "./browser.js";
+import { addressHash, openOrderApiSession, type MappedOrderUnit, type ShippingAddress } from "./orderApi.js";
+import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSync.js";
+import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
+import { resolveOrderFetchMode } from "./orderSyncSettings.js";
+import { cardFieldsFor, checkoutOrderIdsFor } from "./orderLinks.js";
+import { captureInvoicesForAccount, type InvoiceMode } from "./invoiceCapture.js";
+import type { APIRequestContext } from "playwright";
 
 export interface FetchLog {
   time: string;
@@ -46,6 +53,12 @@ export interface FetchReport {
   withProduct: number;
   withTracking: number;
   withGst: number;
+  /** Units the list showed with a date before the since-date (indexed
+   *  skipped_old, never opened). One side of the fetch invariant. */
+  idsDroppedByDate: number;
+  /** Pending/failed index rows enriched although this run's list did not
+   *  show them (left over from an earlier run). The other side. */
+  idsCarried: number;
 }
 
 interface FetchJobState {
@@ -66,6 +79,10 @@ interface FetchJobState {
   windows: number;
   report: FetchReport;
   liveBrowsers: Array<{ browser: Browser; context: BrowserContext }>;
+  /** Effective mode for THIS run, resolved at start (dashboard setting, else env). */
+  mode: "scrape" | "api";
+  /** Invoice step for THIS run: off | new (units enriched now) | missing (every delivered unit without a PDF). */
+  invoices: InvoiceMode;
 }
 
 const jobs = new Map<string, FetchJobState>();
@@ -452,6 +469,7 @@ const READ_PAGE = `() => {
     billingPhone: phone,
     billingName: billingName.replace(/\\s+/g, " ").trim(),
     pincode,
+    deliveryAddressText: String(deliveryBlock || "").replace(/\\s+/g, " ").trim().slice(0, 400),
     deliveryMessage: deliveryMessage.replace(/\\s+/g, " ").trim(),
     cashOnDelivery: /cash on delivery|\\bCOD\\b/i.test(compact),
     pageText: compact.slice(0, 18000),
@@ -578,6 +596,8 @@ function emptyReport(): FetchReport {
     withProduct: 0,
     withTracking: 0,
     withGst: 0,
+    idsDroppedByDate: 0,
+    idsCarried: 0,
   };
 }
 
@@ -619,6 +639,8 @@ function state(userId: string): FetchJobState {
       windows: 1,
       report: emptyReport(),
       liveBrowsers: [],
+      mode: config.orderFetchMode,
+      invoices: "off",
     });
   }
   const job = jobs.get(userId)!;
@@ -629,6 +651,8 @@ function state(userId: string): FetchJobState {
     job.report.idsDuplicate = 0;
   }
   if (job.report.enrichQueued == null) job.report.enrichQueued = 0;
+  if (job.report.idsDroppedByDate == null) job.report.idsDroppedByDate = 0;
+  if (job.report.idsCarried == null) job.report.idsCarried = 0;
   if (!job.phase) job.phase = "";
   if (!job.liveBrowsers) job.liveBrowsers = [];
   return job;
@@ -653,7 +677,7 @@ export function getOrderFetchJob(userId: string) {
   const job = state(userId);
   tickElapsed(job);
   const { liveBrowsers, ...rest } = job;
-  return { ...rest, logs: [...job.logs], report: { ...job.report } };
+  return { ...rest, mode: job.mode || config.orderFetchMode, logs: [...job.logs], report: { ...job.report } };
 }
 
 export function isOnOrAfterSince(value?: Date | string | null, since?: Date) {
@@ -886,9 +910,13 @@ function parseTracking(raw: string): ITrackingStage[] {
     const [statusRaw, rest = ""] = chunk.split("|||");
     const status = statusRaw.replace(/\s+/g, " ").trim().replace(/^Out For Delivery$/i, "Out for delivery");
     if (!status) continue;
-    const pending = /^(Refund|Delivery Expected)$/i.test(status) || /expected by/i.test(rest);
     const body = rest.replace(/\s+/g, " ").trim();
     const steps = parseStepsFromBody(body, status);
+    // A stage is pending when it is a promise ("Delivery Expected", "Refund",
+    // or only an "expected by" line) — not when it already carries dated steps.
+    // Flipkart writes "expected by …" under a Shipped stage whose steps say
+    // "picked up" / "arrived at facility"; that unit is shipped, not confirmed.
+    const pending = /^(Refund|Delivery Expected)$/i.test(status) || (/expected by/i.test(rest) && !steps.some((s) => s.progress.some((p) => p.date)));
     const stageDate = bestDateTime(body) || (steps[0]?.progress[0]?.date ? new Date(steps[0].progress[0].date) : null);
     if (!steps.length && stageDate) {
       steps.push({
@@ -1002,6 +1030,8 @@ export type OrderUnitCard = {
   productName?: string;
   status?: string;
   text?: string;
+  /** Known exactly when the card came from the API list; parsed from text otherwise. */
+  orderDate?: Date | null;
 };
 type ListCard = OrderUnitCard;
 
@@ -1049,6 +1079,12 @@ async function discoverUnit(
   card: ListCard
 ): Promise<"new" | "duplicate" | "seeded"> {
   const now = new Date();
+  // Counted for every listed unit, known or new: the invariant's
+  // dropped_by_date is "what the list showed older than the since-date".
+  {
+    const d = listDateSafe(card);
+    if (d && d.getTime() < jobSince(userId).getTime()) state(userId).report.idsDroppedByDate += 1;
+  }
   const existing = await OrderIndex.findOne({
     userId,
     platformAccountId: account.id,
@@ -1067,10 +1103,9 @@ async function discoverUnit(
   if (saved?.last_fetch && !/^skipped — older/i.test(String(saved.last_error || ""))) {
     scrape_status = "scraped";
   } else {
-    const listDate = parseListCardDate(card.status || card.text || "");
+    const listDate = listDateSafe(card);
     if (listDate && listDate.getTime() < jobSince(userId).getTime()) scrape_status = "skipped_old";
   }
-
   await OrderIndex.updateOne(
     { userId, platformAccountId: account.id, unit_id: card.unitId },
     {
@@ -1099,7 +1134,396 @@ async function discoverUnit(
 }
 
 function listDateSafe(card: ListCard) {
+  if (card.orderDate instanceof Date && !Number.isNaN(card.orderDate.getTime())) return card.orderDate;
   return parseListCardDate(card.status || card.text || "");
+}
+
+// ---- API mode ---------------------------------------------------------------------
+//
+// ORDER_FETCH_MODE=api reads Flipkart's own order APIs (services/orderApi.ts)
+// instead of the pages. The persistence below is the SAME document and index
+// writes scrapeAndSave() does, so a unit saved either way looks identical in
+// Order Units History. A unit the API cannot serve falls back to the page.
+
+/** Persist one API-mapped unit exactly as scrapeAndSave() persists a scraped one. */
+export async function saveMappedUnit(
+  userId: string,
+  account: OrderAccount,
+  mapped: MappedOrderUnit,
+  opts: { applyCalendar?: boolean } = { applyCalendar: true }
+) {
+  const card = { orderId: mapped.order_id, itemId: mapped.item_id, unitId: mapped.unit_id, orderUrl: mapped.order_url };
+  const failed = mapped.status_key === "Failed";
+  const shippedStage = mapped.tracking.find((row) => /^shipped$/i.test(row.status));
+  const shippedDate = shippedStage?.date ? new Date(shippedStage.date) : null;
+  const orderDate = mapped.order_date;
+
+  if (opts.applyCalendar !== false && !failed && !orderDate) {
+    await patchOrderIndex(userId, account, card, { scrape_status: "failed", last_error: "no placed date in API timeline", order_url: card.orderUrl });
+    log(userId, "warn", `${card.orderId} unit ${card.unitId}: no placed date in the API timeline — skip`);
+    return { lastFetch: new Date(), productName: "", totalAmount: "", statusKey: "unknown", gstNumber: "", trackingCount: mapped.tracking.length, invoiceDownloaded: false, imei: null, orderDate: null, skippedOld: true };
+  }
+  if (opts.applyCalendar !== false && orderDate && !isOnOrAfterSince(orderDate, jobSince(userId))) {
+    log(userId, "info", `${card.orderId} unit ${card.unitId}: placed ${orderDate.toLocaleDateString("en-IN")} is before ${jobSinceLabel(userId)} — index only`);
+    await patchOrderIndex(userId, account, card, {
+      scrape_status: "skipped_old",
+      order_date: orderDate,
+      shipped_date: shippedDate,
+      status_key: mapped.status_key,
+      last_error: `placed before ${jobSinceLabel(userId)}`,
+      order_url: card.orderUrl,
+    });
+    return { lastFetch: new Date(), productName: "", totalAmount: "", statusKey: "older", gstNumber: "", trackingCount: 0, invoiceDownloaded: false, imei: null, orderDate, skippedOld: true };
+  }
+
+  const lastFetch = new Date();
+  const existing = await Order.findOne({ userId, unit_id: mapped.unit_id }).select("id").lean();
+  const seq = existing?.id || (await nextSeq("order_fetch"));
+  const { api_extra, ...fields } = mapped;
+  void api_extra;
+  await Order.updateOne(
+    { userId, unit_id: mapped.unit_id },
+    {
+      $set: {
+        userId,
+        platformAccountId: account.id,
+        id: seq,
+        platform_email: account.email,
+        platform: "FLIPKART",
+        ...fields,
+        is_bae_order: false,
+        is_invoice_downloaded: false,
+        invoice_path: "",
+        imei: null,
+        ...(await cardFieldsFor(userId, account.email, mapped.order_id).catch(() => ({}))),
+        fetch_source: "api",
+        is_logged_in: true,
+        last_fetch: lastFetch,
+        ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
+        last_error: "",
+      },
+      // Set by the cancel worker when the dashboard cancelled this unit; a later Update must not clear it.
+      $setOnInsert: { cancelled_from_bae: false },
+    },
+    { upsert: true }
+  );
+  await patchOrderIndex(userId, account, card, {
+    scrape_status: "scraped",
+    status_key: mapped.status_key,
+    order_date: orderDate,
+    shipped_date: shippedDate,
+    last_error: "",
+    order_url: card.orderUrl,
+  });
+  return {
+    lastFetch,
+    productName: mapped.product_name,
+    totalAmount: mapped.total_amount,
+    statusKey: mapped.status_key,
+    gstNumber: mapped.business_gst_no,
+    trackingCount: mapped.tracking.length,
+    invoiceDownloaded: false,
+    imei: null,
+    orderDate,
+    skippedOld: false,
+  };
+}
+
+/** Read one unit through the API and persist it. Throws on API trouble so the
+ *  caller can fall back to the page for that unit. */
+export async function apiScrapeAndSave(
+  ctx: APIRequestContext,
+  userId: string,
+  account: OrderAccount,
+  card: OrderUnitCard,
+  opts: { applyCalendar?: boolean; listUnit?: ApiListedUnit["unit"] | null } = {}
+) {
+  const started = Date.now();
+  let read: Awaited<ReturnType<typeof readUnitViaApi>>;
+  try {
+    read = await readUnitViaApi(ctx, card.orderId, card.unitId, opts.listUnit ?? null);
+  } catch (err) {
+    traceFor(userId)?.unit({ email: account.email, orderId: card.orderId, unitId: card.unitId, mode: "api", outcome: "failed", error: err instanceof Error ? err.message : String(err), ms: Date.now() - started });
+    throw err;
+  }
+  const result = { ...(await saveMappedUnit(userId, account, read.mapped, { applyCalendar: opts.applyCalendar })), siblingUnitIds: read.unitIds };
+  traceFor(userId)?.unit({
+    email: account.email,
+    orderId: card.orderId,
+    unitId: card.unitId,
+    mode: "api",
+    raw: read.raw,
+    mapped: read.mapped,
+    outcome: result.skippedOld ? (result.statusKey === "unknown" ? "no_date" : "skipped_old") : "saved",
+    ms: Date.now() - started,
+  });
+  return result;
+}
+
+// ---- The fetch invariant -----------------------------------------------------
+//
+//   listed − dropped_by_date − known + carried = queued = enriched
+//   enriched = mapped + old_at_enrich + failed
+//
+// On an account's first fetch known, carried and old_at_enrich are all zero
+// and this collapses to  listed − dropped_by_date = enriched = mapped.
+// `known` is read back from the index (listed units already scraped), so a
+// listed unit newer than the date that is in neither bucket — an index write
+// that did not land — fails the line instead of vanishing silently.
+
+export interface FetchInvariant {
+  email: string;
+  mode: "scrape" | "api";
+  listed: number;
+  droppedByDate: number;
+  known: number;
+  carried: number;
+  queued: number;
+  enriched: number;
+  mapped: number;
+  oldAtEnrich: number;
+  failed: number;
+  unaccounted: number;
+  pass: boolean;
+  line: string;
+}
+
+const runInvariants = new Map<string, FetchInvariant[]>();
+
+async function checkFetchInvariant(
+  userId: string,
+  account: OrderAccount,
+  mode: "scrape" | "api",
+  listedIds: string[],
+  droppedIds: string[],
+  pendingIds: string[],
+  counts: { enriched: number; mapped: number; oldAtEnrich: number; failed: number }
+): Promise<FetchInvariant> {
+  const listed = new Set(listedIds);
+  const dropped = new Set(droppedIds);
+  const pending = new Set(pendingIds);
+  const candidates = [...listed].filter((id) => !dropped.has(id));
+  const idx = candidates.length
+    ? await OrderIndex.find({ userId, platformAccountId: account.id, unit_id: { $in: candidates } }).select("unit_id scrape_status").lean()
+    : [];
+  const status = new Map(idx.map((r) => [String(r.unit_id), String(r.scrape_status)]));
+  // "known" = the index already decided this unit: enriched earlier, or judged
+  // older by its placed date in an earlier run (the page scraper re-lists such
+  // units from the saved documents without a list date).
+  const known = candidates.filter((id) => !pending.has(id) && (status.get(id) === "scraped" || status.get(id) === "skipped_old")).length;
+  const unaccountedIds = candidates.filter((id) => !pending.has(id) && status.get(id) !== "scraped" && status.get(id) !== "skipped_old");
+  const unaccounted = unaccountedIds.length;
+  const carried = [...pending].filter((id) => !listed.has(id)).length;
+  const queued = pending.size;
+  const lhs = listed.size - dropped.size - known + carried;
+  const eq1 = lhs === queued && queued === counts.enriched;
+  const eq2 = counts.enriched === counts.mapped + counts.oldAtEnrich + counts.failed;
+  const pass = eq1 && eq2 && unaccounted === 0;
+  const line =
+    `[fetch-invariant] ${account.email} mode=${mode} ` +
+    `listed=${listed.size} dropped_by_date=${dropped.size} known=${known} carried=${carried} → queued=${queued} | ` +
+    `enriched=${counts.enriched} → mapped=${counts.mapped} old_at_enrich=${counts.oldAtEnrich} failed=${counts.failed}` +
+    (unaccounted ? ` unaccounted=${unaccounted} [${unaccountedIds.slice(0, 5).join(",")}${unaccounted > 5 ? ",…" : ""}]` : "") +
+    ` | listed−dropped−known+carried=enriched: ${listed.size}−${dropped.size}−${known}+${carried}=${lhs} vs ${counts.enriched} ${eq1 ? "✓" : "✗"}` +
+    ` | enriched=mapped+old+failed: ${counts.enriched}=${counts.mapped}+${counts.oldAtEnrich}+${counts.failed} ${eq2 ? "✓" : "✗"}` +
+    ` ${pass ? "PASS" : "FAIL"}`;
+  const inv: FetchInvariant = { email: account.email, mode, listed: listed.size, droppedByDate: dropped.size, known, carried, queued, enriched: counts.enriched, mapped: counts.mapped, oldAtEnrich: counts.oldAtEnrich, failed: counts.failed, unaccounted, pass, line };
+  state(userId).report.idsCarried += carried;
+  log(userId, pass ? "info" : "warn", line);
+  const list = runInvariants.get(userId) || [];
+  list.push(inv);
+  runInvariants.set(userId, list);
+  traceFor(userId)?.invariant({ ...inv });
+  return inv;
+}
+
+/** The run-level line: every account's numbers summed, PASS only if each account passed. */
+function logRunInvariant(userId: string) {
+  const list = runInvariants.get(userId) || [];
+  if (!list.length) return;
+  const sum = (k: keyof FetchInvariant) => list.reduce((n, i) => n + Number(i[k] || 0), 0);
+  const pass = list.every((i) => i.pass);
+  log(
+    userId,
+    pass ? "info" : "warn",
+    `[fetch-invariant] RUN ${list.length} account(s) mode=${state(userId).mode} listed=${sum("listed")} dropped_by_date=${sum("droppedByDate")} known=${sum("known")} carried=${sum("carried")} → enriched=${sum("enriched")} → mapped=${sum("mapped")} old_at_enrich=${sum("oldAtEnrich")} failed=${sum("failed")} ${pass ? "PASS" : `FAIL (${list.filter((i) => !i.pass).length} account(s))`}`
+  );
+}
+
+/**
+ * API-mode discovery + enrichment for one account. Returns false when the
+ * API would not serve this session at all (then the page path runs instead).
+ * A single unit the API cannot serve is retried on the page via getPage().
+ */
+async function processAccountViaApi(
+  getPage: () => Promise<Page>,
+  userId: string,
+  queue: QueueAccount[],
+  row: QueueAccount,
+  index: number
+): Promise<boolean> {
+  const job = state(userId);
+  job.currentEmail = row.email;
+  job.phase = "discover";
+  log(userId, "info", `Discover ${index + 1}/${queue.length}: ${row.email} (API)`);
+  const ctx = await openOrderApiSession(row.cookies);
+  try {
+    let walk: Awaited<ReturnType<typeof walkOrderList>>;
+    try {
+      walk = await walkOrderList(ctx, jobSince(userId), {
+        onPage: (p) => log(userId, "info", `${row.email}: list page ${p.page} · ${p.units} unit(s) · ${p.older} older than ${jobSinceLabel(userId)} · ${p.ms}ms`),
+        onPageRaw: (page, request) => traceFor(userId)?.list({ email: row.email, page: page.page, request, response: { orders: page.orders, moreOrder: page.moreOrder, nextCallParams: page.nextCallParams }, ms: page.ms }),
+      });
+    } catch (err) {
+      // Whatever stopped the list — a refused session, an HTTP error, a socket
+      // that would not settle after retries — the page path still knows how
+      // to do this account. Fall back rather than fail it.
+      const why = err instanceof Error ? err.message.split("\n")[0] : String(err);
+      log(userId, "warn", `${row.email}: API list unavailable (${why.slice(0, 160)}) — using the page`);
+      return false;
+    }
+    const byUnit = new Map<string, ApiListedUnit>();
+    const cards: ListCard[] = walk.units.map((u) => {
+      byUnit.set(u.unitId, u);
+      return { orderId: u.orderId, itemId: u.itemId, unitId: u.unitId, orderUrl: u.orderUrl, amount: u.amount, productName: u.productName, status: u.status, orderDate: u.orderDate };
+    });
+    for (const prev of row.existing) {
+      if (prev.orderDate && !isOnOrAfterSince(prev.orderDate, jobSince(userId))) continue;
+      if (byUnit.has(prev.unitId)) continue;
+      cards.push({ orderId: prev.orderId, itemId: prev.itemId, unitId: prev.unitId, orderUrl: prev.orderUrl || orderDetailsUrl(prev.orderId, prev.itemId, prev.unitId), amount: "" });
+    }
+    log(userId, "info", `Collect done (API): ${cards.length} unit(s) in ${walk.pages} page(s)${walk.stoppedAtSince ? ` — stopped at ${jobSinceLabel(userId)}` : ""}`);
+    job.report.idsFound += cards.length;
+    tickElapsed(job);
+
+    let discoveredNew = 0;
+    let discoveredDup = 0;
+    for (const card of cards) {
+      if (job.cancelled) throw new Error("cancelled");
+      const kind = await discoverUnit(userId, row, card);
+      job.report.idsDiscovered += 1;
+      if (kind === "duplicate" || kind === "seeded") {
+        discoveredDup += 1;
+        job.report.idsDuplicate += 1;
+      } else {
+        discoveredNew += 1;
+        job.report.idsNew += 1;
+      }
+    }
+    log(userId, "info", `${row.email}: indexed ${cards.length} unit(s) · ${discoveredNew} new · ${discoveredDup} already known`);
+
+    job.phase = "enrich";
+    const pending = await OrderIndex.find({ userId, platformAccountId: row.id, scrape_status: { $in: ["pending", "failed"] } }).lean();
+    job.report.enrichQueued += pending.length;
+    log(userId, "info", `Enrich ${row.email} (API): ${pending.length} pending/failed unit(s)`);
+
+    const acc = { enriched: 0, mapped: 0, oldAtEnrich: 0, failed: 0 };
+    const enrichedUnits = new Set<string>();
+    let fallbackPage: Page | null = null;
+    for (let n = 0; n < pending.length; n++) {
+      const rowIdx = pending[n];
+      if (job.cancelled) throw new Error("cancelled");
+      const card: ListCard = {
+        orderId: rowIdx.order_id,
+        itemId: rowIdx.item_id,
+        unitId: rowIdx.unit_id,
+        orderUrl: rowIdx.order_url || orderDetailsUrl(rowIdx.order_id, rowIdx.item_id, rowIdx.unit_id),
+        amount: "",
+      };
+      job.currentEmail = `${row.email} enrich ${n + 1}/${pending.length} ${card.orderId} ${card.unitId}`;
+      job.report.idsOpened += 1;
+      acc.enriched += 1;
+      let result: Awaited<ReturnType<typeof saveMappedUnit>>;
+      try {
+        try {
+          result = await apiScrapeAndSave(ctx, userId, row, card, { applyCalendar: true, listUnit: byUnit.get(card.unitId)?.unit ?? null });
+        } catch (apiErr) {
+          const why = apiErr instanceof Error ? apiErr.message : String(apiErr);
+          log(userId, "warn", `${card.orderId} unit ${card.unitId}: API read failed (${why.slice(0, 140)}) — falling back to the page`);
+          if (!fallbackPage) {
+            fallbackPage = await getPage();
+            await restoreFlipkartSession(fallbackPage, row.cookies);
+          }
+          result = await scrapeAndSave(fallbackPage, userId, row, card, { applyCalendar: true });
+        }
+        if (result.skippedOld) {
+          job.report.idsSkippedOld += 1;
+          acc.oldAtEnrich += 1;
+          tickElapsed(job);
+          continue;
+        }
+        job.report.idsScraped += 1;
+        acc.mapped += 1;
+        job.savedOrders += 1;
+        enrichedUnits.add(String(card.unitId));
+        // Every other unit of this order, from the order view itself: an add-on
+        // (Flipkart Trust Shield) has no card of its own on My Orders, so the
+        // page never discovered it. New ones join the queue of this same pass.
+        for (const sib of (result as { siblingUnitIds?: string[] }).siblingUnitIds || []) {
+          if (sib === card.unitId || pending.some((p) => String(p.unit_id) === sib)) continue;
+          const known = await OrderIndex.findOne({ userId, platformAccountId: row.id, unit_id: sib }).select("scrape_status").lean();
+          if (known) continue;
+          const sibCard: ListCard = { orderId: card.orderId, itemId: sib.replace(/000$/, ""), unitId: sib, orderUrl: orderDetailsUrl(card.orderId, sib.replace(/000$/, ""), sib), amount: "" };
+          await discoverUnit(userId, row, sibCard);
+          job.report.idsFound += 1;
+          job.report.idsDiscovered += 1;
+          job.report.idsNew += 1;
+          pending.push({ order_id: card.orderId, item_id: sibCard.itemId, unit_id: sib, order_url: sibCard.orderUrl } as (typeof pending)[number]);
+          job.report.enrichQueued += 1;
+          log(userId, "info", `${card.orderId}: sibling unit ${sib} found in the order view — queued`);
+        }
+        if (result.productName) job.report.withProduct += 1;
+        if (result.trackingCount) job.report.withTracking += 1;
+        if (result.gstNumber) job.report.withGst += 1;
+        tickElapsed(job);
+        log(userId, "info", `${card.orderId} unit ${card.unitId}: ${result.productName || "product"} · ₹${result.totalAmount || "?"} · ${result.statusKey || "status"} · ${result.trackingCount} tracking stage(s)`);
+      } catch (err) {
+        if (isDestroyedContext(err)) throw err;
+        job.report.idsFailed += 1;
+        acc.failed += 1;
+        tickElapsed(job);
+        const message = err instanceof Error ? err.message : String(err);
+        log(userId, "warn", `${card.orderId} unit ${card.unitId}: enrich failed (${message})`);
+        await patchOrderIndex(userId, row, card, { scrape_status: "failed", last_error: message });
+      }
+    }
+
+    if (job.invoices !== "off" && !job.cancelled) {
+      const inv = await captureInvoicesForAccount({
+        userId, platformAccountId: row.id, email: row.email, mode: job.invoices, justEnriched: enrichedUnits,
+        getPage: async () => {
+          if (!fallbackPage) {
+            fallbackPage = await getPage();
+            await restoreFlipkartSession(fallbackPage, row.cookies);
+          }
+          return fallbackPage;
+        },
+        cancelled: () => job.cancelled,
+        log: (level, message) => log(userId, level, message),
+      });
+      job.report.invoicesDownloaded += inv.stored;
+      if (inv.candidates) log(userId, "info", `${row.email}: invoices stored ${inv.stored} · failed ${inv.failed}${inv.skippedCap ? ` · ${inv.skippedCap} deferred` : ""}`);
+    }
+
+    await checkFetchInvariant(
+      userId,
+      row,
+      "api",
+      walk.units.map((u) => u.unitId),
+      walk.units.filter((u) => u.orderDate && u.orderDate.getTime() < jobSince(userId).getTime()).map((u) => u.unitId),
+      pending.map((p) => String(p.unit_id)),
+      acc
+    );
+    traceFor(userId)?.account({ email: row.email, mode: "api", listPages: walk.pages, listed: walk.units.length, pending: pending.length, ...acc });
+
+    job.done += 1;
+    job.report.accountsDone += 1;
+    tickElapsed(job);
+    log(userId, "info", `${row.email}: discover ${cards.length} · enrich ${pending.length} · API · last fetch ${new Date().toLocaleString("en-IN")}`);
+    return true;
+  } finally {
+    await ctx.dispose().catch(() => undefined);
+  }
 }
 
 async function closeLiveBrowsers(userId: string) {
@@ -1145,7 +1569,7 @@ export async function stopAllOrderFetch() {
   }
 }
 
-export async function startOrderFetch(userId: string, emails: string[], sinceDate: Date) {
+export async function startOrderFetch(userId: string, emails: string[], sinceDate: Date, opts: { invoices?: InvoiceMode } = {}) {
   assertIdleForFetch(userId);
   const job = state(userId);
   if (job.running) throw new Error("Order fetch is already running");
@@ -1189,6 +1613,14 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
         orderUrl: link.startsWith("http") ? link : orderDetailsUrl(orderId, itemId, unitId),
       });
     }
+    // Orders OUR checkout placed are known by id even when Flipkart's list hides
+    // them (payment never confirmed, cancelled before confirmation): seed them
+    // so enrichment opens them directly, the way BoB does from its own records.
+    for (const ref of await checkoutOrderIdsFor(userId, row.email).catch(() => [])) {
+      const unitId = fallbackUnitId(ref.orderId);
+      if (existing.has(unitId)) continue;
+      existing.set(unitId, { orderId: ref.orderId, itemId: "", unitId, orderUrl: orderDetailsUrl(ref.orderId), orderDate: ref.placedAt });
+    }
     queue.push({ id: row._id, email: row.email, cookies, existing: [...existing.values()] });
   }
 
@@ -1219,10 +1651,18 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
     startedAt: new Date().toISOString(),
     accountsQueued: queue.length,
   };
+  runInvariants.delete(userId);
+  // The dashboard's switch wins over .env; resolved now, for this run only.
+  const resolved = await resolveOrderFetchMode(userId);
+  job.mode = resolved.mode;
+  job.invoices = opts.invoices || "off";
+  if (job.invoices !== "off") log(userId, "info", `Invoices: ${job.invoices === "new" ? "units enriched in this run" : "every delivered unit without a PDF"} → S3 (after enrichment, Chrome per unit)`);
+  log(userId, "info", `Fetch mode: ${resolved.mode} (from ${resolved.source === "ui" ? "the dashboard switch" : "ORDER_FETCH_MODE in .env"})`);
+  beginTrace(userId, "fetch", { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows, mode: job.mode, modeSource: resolved.source });
   log(
     userId,
     "info",
-    `Fetch from ${job.sinceLabel}: ${queue.length} email(s) · ${windows} Chrome window(s) · discover all unit IDs, then enrich new ones on/after placed date (no invoice)` +
+    `Fetch from ${job.sinceLabel}: ${queue.length} email(s) · ${windows} Chrome window(s) · discover all unit IDs, then enrich new ones on/after placed date${job.invoices === "off" ? " (no invoice)" : " + invoices"}` +
       (skipped.length ? ` · skipped ${skipped.length} not logged in` : "")
   );
   for (const email of skipped.slice(0, 8)) log(userId, "warn", `Skipped ${email} — not logged in`);
@@ -1440,6 +1880,7 @@ export async function scrapeAndSave(
   }
 
   const tracking = parseTracking(trackingText);
+  traceFor(userId)?.unit({ email: account.email, orderId: card.orderId, unitId, mode: "scrape", url: page.url(), pageData, trackingText, outcome: "read" });
   const cancelledStage = tracking.find((row) => /^cancelled$/i.test(row.status) && row.stage === "DONE");
   const deliveredStageHit = tracking.find((row) => /^delivered$/i.test(row.status) && row.stage === "DONE");
   const pageText = String(pageData.pageText || "");
@@ -1565,7 +2006,10 @@ export async function scrapeAndSave(
           ? "Returned"
           : refunded
             ? "Refunded"
-            : current?.status || "";
+            : // The header says "Out For Delivery" before the timeline gets its stage.
+              /out for delivery/i.test(String(pageData.deliveryMessage || "")) && !/^(delivered|cancelled)$/i.test(String(current?.status || ""))
+              ? "Out for delivery"
+              : current?.status || "";
   const statusLabel = failed
     ? failState?.status_label || "Order not placed"
     : delivered
@@ -1576,6 +2020,33 @@ export async function scrapeAndSave(
     : cancelled
       ? cancelledStage?.detailed_steps[0]?.step_text || "Cancelled on Flipkart"
       : null;
+
+  // The delivery block as the page shows it: name is the billing/company line
+  // when one is present, the first line of the block otherwise.
+  const deliveryText = String(pageData.deliveryAddressText || "");
+  const pageShippingAddress: ShippingAddress | null = deliveryText
+    ? (() => {
+        const firstLine = deliveryText.split(/[,|]/)[0]?.trim() || "";
+        const a: ShippingAddress = {
+          name: String(pageData.billingName || "") || firstLine.slice(0, 80),
+          phone: String(pageData.billingPhone || ""),
+          pincode: String(pageData.pincode || ""),
+          city: "",
+          state: "",
+          line1: deliveryText.slice(0, 240),
+          line2: "",
+          text: deliveryText,
+        };
+        return a;
+      })()
+    : null;
+
+  // A page that rendered nothing — no status, no timeline, no product — is a
+  // failed read, not an order with no data: saving it would blank a good row
+  // (seen 2026-10-20: five units of one order wiped by a 406 page fallback).
+  if (!failed && !statusKey && !tracking.length && !productName) {
+    throw new Error(`order page gave no data for ${card.orderId}/${unitKey} (no status, timeline or product) — row left as it was`);
+  }
 
   await Order.updateOne(
     { userId, unit_id: unitKey },
@@ -1612,6 +2083,8 @@ export async function scrapeAndSave(
         billing_phone_number: String(pageData.billingPhone || "") || null,
         billing_address_name: String(pageData.billingName || "") || null,
         billing_address_pincode: String(pageData.pincode || "") || null,
+        shipping_address: pageShippingAddress,
+        shipping_address_hash: addressHash(pageShippingAddress),
         is_invoice_downloaded: invoiceDownloaded,
         invoice_path: invoicePath,
         supercoin_amount_applied: Number(pageData.supercoin) || 0,
@@ -1625,17 +2098,21 @@ export async function scrapeAndSave(
           ? (String(pageData.pageText || "").match(/Total refund[^.!]{0,80}/i) || [null])[0]
           : null,
         cancelled_date: cancelledAt ? new Date(cancelledAt) : cancelled ? orderDate : null,
-        cancelled_from_bae: false,
         cancelled_by_user: /as per your request|cancelled by you|you cancelled/i.test(
           `${trackingText} ${pageData.pageText || ""}`
         ),
         order_status_pre_cancellation: cancelled ? (confirmed?.status || "Order Confirmed") : null,
         imei,
+        shipment_partner_name: String(courier[1] || "").replace(/\s+/g, " ").trim(),
+        ...(await cardFieldsFor(userId, account.email, card.orderId).catch(() => ({}))),
+        fetch_source: "scrape",
         is_logged_in: true,
         last_fetch: lastFetch,
         ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
         last_error: "",
       },
+      // Set by the cancel worker when the dashboard cancelled this unit; a later Update must not clear it.
+      $setOnInsert: { cancelled_from_bae: false },
     },
     { upsert: true }
   );
@@ -1668,7 +2145,12 @@ export async function scrapeAndSave(
 }
 
 
-async function processAccount(page: Page, userId: string, queue: QueueAccount[], row: QueueAccount, index: number) {
+async function processAccount(getPage: () => Promise<Page>, userId: string, queue: QueueAccount[], row: QueueAccount, index: number) {
+  if (state(userId).mode === "api") {
+    const served = await processAccountViaApi(getPage, userId, queue, row, index);
+    if (served) return;
+  }
+  const page = await getPage();
   const job = state(userId);
   job.currentEmail = row.email;
   job.phase = "discover";
@@ -1686,6 +2168,7 @@ async function processAccount(page: Page, userId: string, queue: QueueAccount[],
   }
 
   const cards = await collectOrderIds(page, userId, row.existing);
+  traceFor(userId)?.list({ email: row.email, page: 0, request: { source: "my-orders-page", existingMerged: row.existing.length }, response: cards, ms: 0 });
   job.report.idsFound += cards.length;
   tickElapsed(job);
 
@@ -1718,6 +2201,8 @@ async function processAccount(page: Page, userId: string, queue: QueueAccount[],
   job.report.enrichQueued += pending.length;
   log(userId, "info", `Enrich ${row.email}: ${pending.length} pending/failed unit(s) to open`);
 
+  const acc = { enriched: 0, mapped: 0, oldAtEnrich: 0, failed: 0 };
+  const enrichedUnits = new Set<string>();
   for (let n = 0; n < pending.length; n++) {
     const rowIdx = pending[n];
     if (job.cancelled) throw new Error("cancelled");
@@ -1730,15 +2215,19 @@ async function processAccount(page: Page, userId: string, queue: QueueAccount[],
     };
     job.currentEmail = `${row.email} enrich ${n + 1}/${pending.length} ${card.orderId} ${card.unitId}`;
     job.report.idsOpened += 1;
+    acc.enriched += 1;
     try {
       const scraped = await scrapeAndSave(page, userId, row, card, { applyCalendar: true });
       if (scraped.skippedOld) {
         job.report.idsSkippedOld += 1;
+        acc.oldAtEnrich += 1;
         tickElapsed(job);
         continue;
       }
       job.report.idsScraped += 1;
+      acc.mapped += 1;
       job.savedOrders += 1;
+      enrichedUnits.add(String(card.unitId));
       if (scraped.productName) job.report.withProduct += 1;
       if (scraped.trackingCount) job.report.withTracking += 1;
       if (scraped.gstNumber) job.report.withGst += 1;
@@ -1751,12 +2240,35 @@ async function processAccount(page: Page, userId: string, queue: QueueAccount[],
     } catch (err) {
       if (isDestroyedContext(err)) throw err;
       job.report.idsFailed += 1;
+      acc.failed += 1;
       tickElapsed(job);
       const message = err instanceof Error ? err.message : String(err);
       log(userId, "warn", `${card.orderId} unit ${card.unitId}: enrich failed (${message})`);
       await patchOrderIndex(userId, row, card, { scrape_status: "failed", last_error: message });
     }
   }
+
+  if (job.invoices !== "off" && !job.cancelled) {
+    const inv = await captureInvoicesForAccount({
+      userId, platformAccountId: row.id, email: row.email, mode: job.invoices, justEnriched: enrichedUnits,
+      getPage: async () => page,
+      cancelled: () => job.cancelled,
+      log: (level, message) => log(userId, level, message),
+    });
+    job.report.invoicesDownloaded += inv.stored;
+    if (inv.candidates) log(userId, "info", `${row.email}: invoices stored ${inv.stored} · failed ${inv.failed}${inv.skippedCap ? ` · ${inv.skippedCap} deferred` : ""}`);
+  }
+
+  await checkFetchInvariant(
+    userId,
+    row,
+    "scrape",
+    cards.map((c) => c.unitId),
+    cards.filter((c) => { const d = listDateSafe(c); return Boolean(d && d.getTime() < jobSince(userId).getTime()); }).map((c) => c.unitId),
+    pending.map((p) => String(p.unit_id)),
+    acc
+  );
+  traceFor(userId)?.account({ email: row.email, mode: "scrape", listed: cards.length, pending: pending.length, ...acc });
 
   job.done += 1;
   job.report.accountsDone += 1;
@@ -1772,21 +2284,35 @@ async function run(userId: string, queue: QueueAccount[]) {
   const job = state(userId);
   const windows = Math.max(1, job.windows || 1);
   let next = 0;
-  log(userId, "info", `Opening ${windows} Chrome window(s) for ${queue.length} email(s)`);
+  log(
+    userId,
+    "info",
+    job.mode === "api"
+      ? `API mode: ${windows} lane(s) for ${queue.length} email(s) — Chrome only if a unit falls back to the page`
+      : `Opening ${windows} Chrome window(s) for ${queue.length} email(s)`
+  );
 
   async function lane(laneId: number) {
     if (job.cancelled) return;
-    const launched = await launchStealthContext();
-    job.liveBrowsers.push(launched);
-    const page = await launched.context.newPage();
-    await blockFlipkartLogout(page);
+    // Chrome on demand: scrape mode needs it for every account, API mode only
+    // when a unit (or a whole session) has to fall back to the page.
+    let launched: { browser: Browser; context: BrowserContext } | null = null;
+    let page: Page | null = null;
+    const getPage = async () => {
+      if (page) return page;
+      launched = await launchStealthContext();
+      job.liveBrowsers.push(launched);
+      page = await launched.context.newPage();
+      await blockFlipkartLogout(page);
+      return page;
+    };
     try {
       while (!job.cancelled) {
         const i = next++;
         if (i >= queue.length) break;
         const row = queue[i];
         try {
-          await processAccount(page, userId, queue, row, i);
+          await processAccount(getPage, userId, queue, row, i);
         } catch (err) {
           if (job.cancelled || (err instanceof Error && err.message === "cancelled")) {
             log(userId, "warn", `Stopped at ${row.email}`);
@@ -1795,16 +2321,21 @@ async function run(userId: string, queue: QueueAccount[]) {
           job.failed += 1;
           log(userId, "error", `${row.email} failed: ${err instanceof Error ? err.message : err}`);
         }
-        try {
-          await wipeFlipkartLocalSession(page);
-        } catch {
-          /* next restore */
+        if (page) {
+          try {
+            await wipeFlipkartLocalSession(page);
+          } catch {
+            /* next restore */
+          }
         }
         await sleep(600);
       }
     } finally {
-      await closeBrowser(launched.browser, launched.context).catch(() => {});
-      job.liveBrowsers = job.liveBrowsers.filter((row) => row.browser !== launched.browser);
+      if (launched) {
+        const l = launched as { browser: Browser; context: BrowserContext };
+        await closeBrowser(l.browser, l.context).catch(() => {});
+        job.liveBrowsers = job.liveBrowsers.filter((row) => row.browser !== l.browser);
+      }
     }
     void laneId;
   }
@@ -1826,6 +2357,8 @@ async function run(userId: string, queue: QueueAccount[]) {
       "info",
       `Report: ${formatElapsed(r.elapsedMs)} · found ${r.idsFound} units · scraped ${r.idsScraped} · tracking ${r.withTracking}`
     );
+    logRunInvariant(userId);
+    endTrace(userId, { report: { ...r }, cancelled: job.cancelled, pass: (runInvariants.get(userId) || []).every((i) => i.pass) });
     await closeLiveBrowsers(userId);
     if (!job.cancelled) log(userId, "info", "Chrome closed. Orders are stored.");
   }

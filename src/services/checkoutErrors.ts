@@ -1,4 +1,5 @@
-export type CheckoutErrorSource = "PLATFORM" | "BANK" | "USER";
+/** INFRA: our own plumbing (a proxy, a tunnel) — never the platform ID's fault. */
+export type CheckoutErrorSource = "PLATFORM" | "BANK" | "USER" | "INFRA";
 
 export type CheckoutErrorCode =
   | "PRODUCT_UNAVAILABLE"
@@ -16,10 +17,15 @@ export type CheckoutErrorCode =
   | "SLA_EXCEEDED"
   | "CART_AMOUNT_LIMIT"
   | "SESSION_EXPIRED"
+  | "PINCODE_NOT_SET"
+  | "COD_UNAVAILABLE"
+  | "PAYMENT_FAILED"
   | "INSUFFICIENT_BALANCE"
   | "CARD_AUTH_FAILED"
   | "OTP_TIMEOUT"
   | "OTP_NOT_FOUND"
+  | "OTP_CARD_MISMATCH"
+  | "PROXY_FAILED"
   | "UNKNOWN";
 
 export interface CheckoutErrorDef {
@@ -28,7 +34,14 @@ export interface CheckoutErrorDef {
   source: CheckoutErrorSource;
   failedStep: string;
   stageDisplay: string;
-  filterBatch?: boolean;
+  /**
+   * A verdict about THIS platform ID on THIS product. Running the same ID again
+   * shows the same page, so the job is not re-queued; the next ID in the batch is
+   * the retry. Nothing here ever stops the batch — a product that is out of stock
+   * or undeliverable for one account may still go through on another, and the
+   * operator wants every selected ID attempted, each reporting its own reason.
+   */
+  noRetry?: boolean;
 }
 
 export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
@@ -38,6 +51,7 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "PLATFORM",
     failedStep: "product",
     stageDisplay: "Adding to cart",
+    noRetry: true,
   },
   PRODUCT_NOT_SERVICEABLE: {
     code: "PRODUCT_NOT_SERVICEABLE",
@@ -45,7 +59,7 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "PLATFORM",
     failedStep: "out_of_stock_pincode",
     stageDisplay: "Adding to cart",
-    filterBatch: true,
+    noRetry: true,
   },
   ITEM_NOT_DELIVERABLE: {
     code: "ITEM_NOT_DELIVERABLE",
@@ -53,7 +67,7 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "PLATFORM",
     failedStep: "product",
     stageDisplay: "Adding to cart",
-    filterBatch: true,
+    noRetry: true,
   },
   MAX_UNITS_REACHED: {
     code: "MAX_UNITS_REACHED",
@@ -61,6 +75,8 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     source: "PLATFORM",
     failedStep: "product",
     stageDisplay: "Adding to cart",
+    // The cap is per account: this ID has had its allowance of this product.
+    noRetry: true,
   },
   ADD_TO_CART_FAILED: {
     code: "ADD_TO_CART_FAILED",
@@ -139,6 +155,51 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     failedStep: "session",
     stageDisplay: "Session",
   },
+  /**
+   * Flipkart is asking for a delivery pincode — it has not judged the product yet.
+   *
+   * Its own code, because it used to be ITEM_NOT_DELIVERABLE. Back when a
+   * deliverability verdict stopped the whole batch, that turned "we have not told
+   * Flipkart the pincode" into "this product cannot be delivered here" and ended
+   * a run with purchased 0 on 2026-09-30. Batches are no longer stopped by any
+   * code, but the distinction still matters: this is a page state a retry fixes,
+   * so the same ID IS re-queued (noRetry absent), unlike a real verdict.
+   */
+  PINCODE_NOT_SET: {
+    code: "PINCODE_NOT_SET",
+    display: "Delivery pincode was not set on the page",
+    source: "PLATFORM",
+    failedStep: "pincode",
+    stageDisplay: "Product",
+  },
+  /**
+   * The payments page lists "Cash on Delivery — Unavailable". Flipkart decides
+   * this per account, product and address, so with payment mode COD it is a
+   * verdict on this platform ID: recorded on this job, not retried on the same
+   * ID, and the batch goes on — another ID may well be offered COD for the same
+   * cart. Was reported as UNABLE_TO_PLACE_ORDER, which hid the actual reason.
+   */
+  COD_UNAVAILABLE: {
+    code: "COD_UNAVAILABLE",
+    display: "Cash on Delivery unavailable for this order",
+    source: "PLATFORM",
+    failedStep: "payment",
+    stageDisplay: "Processing Payment",
+    noRetry: true,
+  },
+  /**
+   * Flipkart's own payment failure, before or instead of the bank: the modal
+   * "Your payment couldn't be processed due to a technical error. Please try
+   * again." over the card form after Pay. Flipkart's side, so the card is kept
+   * and the same ID may be retried — the modal itself says to.
+   */
+  PAYMENT_FAILED: {
+    code: "PAYMENT_FAILED",
+    display: "Flipkart could not process the payment",
+    source: "PLATFORM",
+    failedStep: "payment",
+    stageDisplay: "Processing Payment",
+  },
   INSUFFICIENT_BALANCE: {
     code: "INSUFFICIENT_BALANCE",
     display: "Insufficient bank account balance",
@@ -167,6 +228,39 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     failedStep: "payment",
     stageDisplay: "Processing Payment",
   },
+  /**
+   * An OTP DID arrive on the leased handset, inside the window, but the bank's
+   * SMS named a different parent card than the Cards CSV row claims (job
+   * 6ac286…cba360, 2026-10-04: the row had ****0313 in both columns, ICICI
+   * texted "Card XX7009"). The code is not typed — it is only provably ours
+   * when the card matches — and waiting longer cannot help, so the job fails
+   * at once instead of burning the budget as OTP_TIMEOUT with no explanation.
+   * A data problem on the CSV row: parent_card_number must be the card the
+   * bank names in its SMS. The same row fails identically on every ID, so the
+   * batch moves on rather than re-queuing.
+   */
+  OTP_CARD_MISMATCH: {
+    code: "OTP_CARD_MISMATCH",
+    display: "OTP was sent for a different card than the Cards CSV says",
+    source: "USER",
+    failedStep: "payment",
+    stageDisplay: "Processing Payment",
+    noRetry: true,
+  },
+  /**
+   * The worker's outbound proxy failed (tunnel refused, auth rejected, the
+   * egress probe got nothing). Nothing about the platform ID or the product:
+   * the runner re-queues the job without burning an attempt and the proxy's
+   * fail counter goes up (dead after PROXY_DEAD_AFTER). Recorded on the job
+   * only when the re-queue itself is impossible.
+   */
+  PROXY_FAILED: {
+    code: "PROXY_FAILED",
+    display: "Proxy connection failed",
+    source: "INFRA",
+    failedStep: "session",
+    stageDisplay: "Opening browser",
+  },
   UNKNOWN: {
     code: "UNKNOWN",
     display: "Order failed",
@@ -183,7 +277,7 @@ export class CheckoutFailure extends Error {
   readonly details: string;
   readonly failedStep: string;
   readonly stageDisplay: string;
-  readonly filterBatch: boolean;
+  readonly noRetry: boolean;
 
   constructor(code: CheckoutErrorCode, details: string, overrides?: Partial<CheckoutErrorDef>) {
     const def = { ...CHECKOUT_ERRORS[code], ...overrides };
@@ -195,7 +289,7 @@ export class CheckoutFailure extends Error {
     this.details = details || def.display;
     this.failedStep = def.failedStep;
     this.stageDisplay = def.stageDisplay;
-    this.filterBatch = Boolean(def.filterBatch);
+    this.noRetry = Boolean(def.noRetry);
   }
 }
 
@@ -209,11 +303,30 @@ function lineMatching(text: string, re: RegExp): string {
 }
 
 /** Scan Flipkart page text for a known blocker. */
-export function classifyPageText(raw: string, pincode = ""): CheckoutFailure | null {
+export function classifyPageText(
+  raw: string,
+  pincode = "",
+  opts: { purchasable?: boolean } = {}
+): CheckoutFailure | null {
   const text = raw.replace(/\u00a0/g, " ");
   const compact = text.replace(/\s+/g, " ").trim();
   const pin = pincode.replace(/\D/g, "").slice(-6);
-  const hasNotify = /\bNotify Me\b/i.test(compact);
+
+  /**
+   * Does this page still offer to sell us the thing?
+   *
+   * A Flipkart PDP is full of other people's stock: colour variants, "similar
+   * products", recently-viewed tiles. Any of them can say "Out of stock" while the
+   * product we actually want is perfectly buyable \u2014 and a plain text scan then
+   * reports PRODUCT_UNAVAILABLE for a page with a live Buy Now button on it.
+   *
+   * So when a top-level "Buy now" / "Add to cart" is present, stock wording is
+   * treated as belonging to something else on the page. Auto-detected rather than
+   * passed in, because there are many call sites and one that forgets gets a
+   * confident wrong answer; a caller can still force it either way.
+   */
+  const purchasable = opts.purchasable ?? /^\s*(buy now|add to cart)\b/im.test(text);
+  const hasNotify = !purchasable && /\bNotify Me\b/i.test(compact);
 
   if (/you'?ve reached the maximum units allowed/i.test(compact)) {
     return new CheckoutFailure("MAX_UNITS_REACHED", lineMatching(text, /maximum units/i));
@@ -228,11 +341,14 @@ export function classifyPageText(raw: string, pincode = ""): CheckoutFailure | n
     /enter pincode to see if the product is in stock/i.test(compact) ||
     /enter delivery pincode/i.test(compact)
   ) {
+    // PINCODE_NOT_SET, not ITEM_NOT_DELIVERABLE: Flipkart is ASKING for a pincode,
+    // which means it has not judged deliverability at all. Classifying it as
+    // "not deliverable" filtered the whole batch over a page state a retry fixes.
     return new CheckoutFailure(
-      "ITEM_NOT_DELIVERABLE",
+      "PINCODE_NOT_SET",
       pin
-        ? `Enter pincode to see if the product is in stock (${pin})`
-        : "Enter pincode to see if the product is in stock"
+        ? `Flipkart is still asking for a delivery pincode (${pin} not applied yet)`
+        : "Flipkart is still asking for a delivery pincode"
     );
   }
   if (
@@ -265,17 +381,45 @@ export function classifyPageText(raw: string, pincode = ""): CheckoutFailure | n
       pin ? `This product is not available on this pin (${pin})` : lineMatching(text, /not deliverable/i)
     );
   }
+  // A seller that will not ship here is a DELIVERY problem, not a stock one. The
+  // generic rules above only match "…to your address"; Flipkart also writes the
+  // pincode, or names the seller.
+  if (
+    /seller does ?n[o']t deliver/i.test(compact) ||
+    /no sellers? (deliver|ships?)/i.test(compact) ||
+    (/not deliverable/i.test(compact) && /\d{6}/.test(compact))
+  ) {
+    return new CheckoutFailure(
+      "ITEM_NOT_DELIVERABLE",
+      lineMatching(text, /not deliverable|does ?n[o']t deliver|no sellers? (deliver|ships?)/i)
+    );
+  }
   const oos = compact.match(
-    /(?:currently\s+)?(?:out of stock|not serviceable|not available|not deliverable|currently unavailable)\s+(?:for|to)\s+(\d{6})/i
+    /(?:currently\s+)?(?:out of stock|not serviceable|not available|currently unavailable)\s+(?:for|to)\s+(\d{6})/i
   );
   if (oos) {
-    return new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", lineMatching(text, /out of stock|not serviceable|not available|not deliverable/i));
+    return new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", lineMatching(text, /out of stock|not serviceable|not available/i));
   }
-  if (pin && /out of stock/i.test(compact) && compact.includes(pin)) {
+  if (!purchasable && pin && /out of stock/i.test(compact) && compact.includes(pin)) {
     return new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", `Currently out of stock for ${pin}`);
+  }
+  // A sold-out PDP that names no pincode. Guarded by `purchasable`, so a live
+  // page whose colour variants are out of stock is not caught by it — that is
+  // the whole reason the guard exists. Checked before Notify Me so the failure
+  // carries Flipkart's own words ("Out of stock") rather than ours: a real
+  // sold-out iPhone 16 page says exactly "Out of stock" beside the variant, with
+  // a Notify Me button under it.
+  if (!purchasable && /\bsold out\b|\bout of stock\b|\bcurrently unavailable\b/i.test(compact)) {
+    return new CheckoutFailure(
+      "PRODUCT_UNAVAILABLE",
+      lineMatching(text, /sold out|out of stock|currently unavailable/i)
+    );
   }
   if (hasNotify) {
     return new CheckoutFailure("PRODUCT_UNAVAILABLE", "Notify Me — product is not available to purchase");
+  }
+  if (/payment (?:couldn'?t|could not|cannot) be processed|technical error (?:at the bank|\. please try again)|due to a technical error/i.test(compact)) {
+    return new CheckoutFailure("PAYMENT_FAILED", lineMatching(text, /couldn'?t be processed|could not be processed|technical error/i));
   }
   if (/insufficient (funds|balance)|insufficient bank/i.test(compact)) {
     return new CheckoutFailure("INSUFFICIENT_BALANCE", lineMatching(text, /insufficient/i));
@@ -287,6 +431,34 @@ export function classifyPageText(raw: string, pincode = ""): CheckoutFailure | n
 }
 
 /** Map a thrown message (and optional page text) to a catalog entry. */
+/**
+ * The BANK's page (3-D Secure / ACS), not Flipkart's: what it says when it
+ * refuses. Kept apart from classifyPageText because the two vocabularies do not
+ * overlap and a Flipkart rule must never fire on a bank page or vice versa.
+ *
+ * Order matters. Insufficient funds is named first because it is the one
+ * outcome that must PAUSE a card rather than retire it (cardPool.verdictFor
+ * keys on the code). A wrong credential is retired — same CSV row, same result
+ * every time — and an "attempts remaining" warning is reported verbatim because
+ * it is the only advance notice of a lockout.
+ */
+export function classifyBankText(text: string): CheckoutFailure | null {
+  const compact = String(text || "").replace(/ /g, " ").replace(/\s+/g, " ");
+  if (/insufficient (?:funds|balance)|not enough (?:funds|balance)|exceeds (?:your |the )?(?:available )?(?:balance|limit)|limit exceeded/i.test(compact)) {
+    return new CheckoutFailure("INSUFFICIENT_BALANCE", lineMatching(text, /insufficient|not enough|exceeds|limit exceeded/i));
+  }
+  if (/attempts? (?:remaining|left)|remaining attempts?|will be (?:blocked|locked)/i.test(compact)) {
+    return new CheckoutFailure("CARD_AUTH_FAILED", lineMatching(text, /attempts?|blocked|locked/i));
+  }
+  if (/(?:incorrect|invalid|wrong) (?:password|pin|otp)|(?:password|pin|otp) (?:is )?(?:incorrect|invalid|wrong)|authentication (?:failed|unsuccessful)/i.test(compact)) {
+    return new CheckoutFailure("CARD_AUTH_FAILED", lineMatching(text, /password|pin|otp|authentication/i));
+  }
+  if (/transaction (?:declined|failed|unsuccessful|could not be (?:completed|processed))|payment (?:declined|failed|unsuccessful)|declined by (?:the )?(?:bank|issuer)/i.test(compact)) {
+    return new CheckoutFailure("CARD_AUTH_FAILED", lineMatching(text, /declined|failed|unsuccessful|could not be/i));
+  }
+  return null;
+}
+
 export function classifyThrownMessage(message: string, pageText = ""): CheckoutFailure {
   const fromPage = pageText ? classifyPageText(pageText) : null;
   if (fromPage) return fromPage;
@@ -296,7 +468,7 @@ export function classifyThrownMessage(message: string, pageText = ""): CheckoutF
     return new CheckoutFailure("PRODUCT_UNAVAILABLE", m);
   }
   if (/enter pincode to see if the product is in stock|enter delivery pincode/i.test(m)) {
-    return new CheckoutFailure("ITEM_NOT_DELIVERABLE", m);
+    return new CheckoutFailure("PINCODE_NOT_SET", m);
   }
   if (/out of stock|not serviceable/i.test(m)) return new CheckoutFailure("PRODUCT_NOT_SERVICEABLE", m);
   if (/not deliverable/i.test(m)) return new CheckoutFailure("ITEM_NOT_DELIVERABLE", m);
@@ -321,6 +493,12 @@ export function classifyThrownMessage(message: string, pageText = ""): CheckoutF
   if (/unable to place/i.test(m)) return new CheckoutFailure("UNABLE_TO_PLACE_ORDER", m);
   if (/OTP/i.test(m) && /timeout/i.test(m)) return new CheckoutFailure("OTP_TIMEOUT", m);
   if (/OTP/i.test(m)) return new CheckoutFailure("OTP_NOT_FOUND", m);
+  if (/cash on delivery.*(unavailable|not available)|\bCOD\b.*(unavailable|not available)/i.test(m)) {
+    return new CheckoutFailure("COD_UNAVAILABLE", m);
+  }
+  if (/payment (?:couldn'?t|could not|cannot) be processed|technical error at the bank|due to a technical error/i.test(m)) {
+    return new CheckoutFailure("PAYMENT_FAILED", m);
+  }
   if (/insufficient/i.test(m)) return new CheckoutFailure("INSUFFICIENT_BALANCE", m);
   return new CheckoutFailure("UNKNOWN", m);
 }
@@ -331,6 +509,9 @@ export function failureFields(err: CheckoutFailure) {
     errorCodeDisplay: err.display,
     errorSource: err.source,
     errorDetails: err.details,
+    /** The stage it failed in, in the operator's words ("Adding to cart",
+     *  "Processing Payment") — the Orders tab's "Processing Stage" column. */
+    errorStage: err.stageDisplay,
     failedStep: err.failedStep,
     failureMessage: err.details,
     error: err.details,

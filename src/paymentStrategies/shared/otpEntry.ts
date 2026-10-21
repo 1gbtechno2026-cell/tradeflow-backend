@@ -23,8 +23,10 @@ import { parentCardLast4, type PaymentContext } from "../types.js";
 const LEASE_RENEW_MS = 60_000;
 
 export interface OtpRound {
-  /** Do the bank-page work that causes the OTP to be sent. */
-  requestOtp: () => Promise<void>;
+  /** Do the bank-page work that causes the OTP to be sent. May resolve to
+   *  "authenticated" when the bank let the transaction through without asking
+   *  for a code (frictionless 3-D Secure): then no OTP is awaited or typed. */
+  requestOtp: () => Promise<void | "authenticated">;
   /** Type the code and confirm. Must never log it. */
   submitOtp: (otp: string) => Promise<void>;
 }
@@ -54,6 +56,7 @@ export async function withLeasedPhone<T>(
     cardTypeName,
     runId: ctx.runId,
     corporateId: ctx.corporateId,
+    employeeId: ctx.employeeId || undefined,
   });
   ctx.log(
     "info",
@@ -93,7 +96,11 @@ export async function requestAndAwaitOtp(
   opts: { phoneNumber: string; cardLast4: string }
 ): Promise<string> {
   const submittedAt = new Date();
-  if (!ctx.dryRun) await round.requestOtp();
+  const outcome = ctx.dryRun ? undefined : await round.requestOtp();
+  if (outcome === "authenticated") {
+    ctx.log("info", `[pay] bank authenticated ****${opts.cardLast4} without asking for an OTP — nothing awaited`);
+    return "";
+  }
   ctx.log("info", `[pay] OTP requested for card ****${opts.cardLast4}`);
 
   const otp = await waitForPaymentOtp({

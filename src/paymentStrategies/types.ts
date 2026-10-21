@@ -45,6 +45,9 @@ export interface PaymentContext {
   authType: AuthType;
   /** Required when the card type is corporate; ignored otherwise. */
   corporateId?: string | null;
+  /** Optional: pin the lease to one employee's handset (testing with a phone
+   *  in hand). Unset, the lease picks any claimable phone under the corporate. */
+  employeeId?: string | null;
   /** For verifying the bank is charging what Flipkart quoted. */
   expectedAmount?: string | null;
   otpTimeoutMs?: number;

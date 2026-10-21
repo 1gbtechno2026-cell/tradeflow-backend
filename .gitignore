@@ -5,3 +5,10 @@ dist/
 !.env.example
 *.log
 .DS_Store
+
+# Local reference only: the standalone Flipkart order-flow project this repo's
+# FlipkartCheckout was adapted from. Kept on disk for comparison, never shipped —
+# it carries its own node_modules and would bloat the Docker build.
+flipkart flow/
+debug/
+test-flow.json

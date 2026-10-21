@@ -1685,14 +1685,18 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
     if (!job.report.finishedAt) job.report.finishedAt = new Date().toISOString();
     tickElapsed(job);
     const rep = job.report;
-    const total = rep.enrichQueued || rep.idsOpened || 0;
+    // Items = every unit ID the run checked: the ones already known count as
+    // success (nothing to do), the new ones by how their enrichment went.
+    const known = Math.max(0, (rep.idsDiscovered || 0) - (rep.idsNew || 0));
+    const total = Math.max(rep.idsDiscovered || 0, rep.enrichQueued || rep.idsOpened || 0);
+    const processed = job.cancelled ? known + (rep.idsOpened || 0) : total;
     void finishRun(userId, "fetch", {
       status: job.cancelled ? "stopped" : "completed",
       total,
-      processed: rep.idsOpened || 0,
-      success: rep.idsScraped || 0,
+      processed,
+      success: known + (rep.idsScraped || 0) + (rep.idsSkippedOld || 0),
       failed: rep.idsFailed || 0,
-      cancelled: job.cancelled ? Math.max(0, total - (rep.idsOpened || 0)) : 0,
+      cancelled: job.cancelled ? Math.max(0, total - processed) : 0,
       message: `${rep.accountsDone}/${rep.accountsQueued} email(s) · ${rep.idsDiscovered} unit IDs found, ${rep.idsNew} new, ${rep.idsScraped} saved, ${rep.idsFailed} failed, ${rep.idsSkippedOld} older than ${job.sinceLabel}`,
       meta: { report: rep },
     }).catch(() => undefined);

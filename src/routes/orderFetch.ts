@@ -11,6 +11,7 @@ import {
 } from "../services/orderFetch.js";
 import { getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import { listRuns, syncPanel } from "../services/orderJobRuns.js";
+import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays } from "../services/orderFetchSchedule.js";
 import {
   cancelUpdateRequest,
   createUpdateRequest,
@@ -191,6 +192,36 @@ orderFetchRouter.post("/update/trigger", async (req, res) => {
 });
 
 /** Stops the newest open request (or `requestId`): queued accounts are removed, running ones finish their current unit. */
+/** The scheduled fetch: on/off, cron, look-back, how many IDs it would take, last tick, last scheduled run. */
+orderFetchRouter.get("/fetch/schedule", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim() || workspaceUserId();
+    res.json(await fetchScheduleStatus(userId));
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Could not read the fetch schedule" });
+  }
+});
+
+/** PUT body: { fetchSinceDays, by? } */
+orderFetchRouter.put("/fetch/schedule", async (req, res) => {
+  try {
+    const out = await setFetchSinceDays(userIdFrom(req), req.body?.fetchSinceDays, String(req.body?.by || "").trim());
+    res.json({ ...out, ...(await fetchScheduleStatus(userIdFrom(req))) });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not save the fetch schedule" });
+  }
+});
+
+/** Run the scheduled fetch now (same selection and look-back; the row shows system-cron). Body: { by? } */
+orderFetchRouter.post("/fetch/schedule/run", async (req, res) => {
+  try {
+    const out = await runScheduledFetch(userIdFrom(req), String(req.body?.by || "").trim() || "run now");
+    res.status(out.started ? 202 : 409).json(out);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not run the scheduled fetch" });
+  }
+});
+
 /** "Sync Order Units From Platform": one row per job type (fetch, update, invoices placeholder, coupons, reschedule, cancel). */
 orderFetchRouter.get("/sync/panel", async (req, res) => {
   try {

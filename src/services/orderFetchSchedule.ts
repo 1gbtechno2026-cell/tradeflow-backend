@@ -1,0 +1,126 @@
+import cron, { type ScheduledTask } from "node-cron";
+import { Types } from "mongoose";
+import { config } from "../config.js";
+import { OrderJobRun } from "../models/OrderJobRun.js";
+import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
+import { PlatformId } from "../models/PlatformId.js";
+import { cookiesFor, getOrderFetchJob, startOrderFetch } from "./orderFetch.js";
+import { workspaceUserId } from "./sessionStore.js";
+
+/**
+ * The scheduled Fetch — the reference tool's "system-cron" row.
+ *
+ * At FETCH_SCHEDULE (default 05:00 Asia/Kolkata) the API runs one Fetch over
+ * every logged-in Flipkart Platform ID of the workspace, looking back
+ * `fetchSinceDays` (dashboard setting, else FETCH_SINCE_DAYS, else 60), with
+ * trigger "system-cron" on the panel row and the ledger. It uses the same
+ * startOrderFetch the button uses, so the dashboard's mode switch, windows
+ * and invoice step apply unchanged; a tick is skipped while a fetch is
+ * already running.
+ *
+ *   FETCH_SCHEDULE=0            off (development)
+ *   FETCH_SCHEDULE="0 5 * * *"  cron expression, CRON_TIMEZONE or Asia/Kolkata
+ *   FETCH_SINCE_DAYS=60         default look-back when no dashboard setting
+ */
+
+const RAW = String(process.env.FETCH_SCHEDULE ?? "0").trim();
+export const FETCH_SCHEDULE_ENABLED = RAW !== "" && RAW !== "0" && RAW.toLowerCase() !== "off" && RAW.toLowerCase() !== "false";
+export const FETCH_SCHEDULE_CRON = FETCH_SCHEDULE_ENABLED && RAW !== "1" && RAW.toLowerCase() !== "on" && RAW.toLowerCase() !== "true" ? RAW : "0 5 * * *";
+export const FETCH_TIMEZONE = process.env.CRON_TIMEZONE || "Asia/Kolkata";
+const DEFAULT_SINCE_DAYS = Math.max(1, Number(process.env.FETCH_SINCE_DAYS) || 60);
+
+let task: ScheduledTask | null = null;
+let lastTick: { at: Date; outcome: string } | null = null;
+
+export async function resolveFetchSinceDays(userId: string): Promise<{ days: number; source: "ui" | "env" }> {
+  const row = Types.ObjectId.isValid(userId) ? await OrderSyncSettings.findOne({ userId }).lean().catch(() => null) : null;
+  const ui = Math.floor(Number(row?.fetchSinceDays || 0));
+  return ui >= 1 ? { days: Math.min(365, ui), source: "ui" } : { days: DEFAULT_SINCE_DAYS, source: "env" };
+}
+
+export async function setFetchSinceDays(userId: string, days: unknown, by: string) {
+  const n = Math.floor(Number(days));
+  if (!Number.isFinite(n) || n < 1 || n > 365) throw new Error("fetchSinceDays must be 1–365");
+  await OrderSyncSettings.updateOne({ userId }, { $set: { fetchSinceDays: n, fetchScheduleChangedBy: by || "", fetchScheduleChangedAt: new Date() }, $setOnInsert: { userId } }, { upsert: true });
+  return resolveFetchSinceDays(userId);
+}
+
+/** Every logged-in Flipkart Platform ID with a saved session — what the scheduled run fetches. */
+export async function scheduledFetchEmails(userId: string): Promise<string[]> {
+  const rows = await PlatformId.find({ userId, platform: "flipkart", status: "logged_in", sessionSavedAt: { $ne: null } }).select("email sessionCookies sessionState").sort({ createdAt: 1 }).lean();
+  return rows.filter((r) => cookiesFor(r).length > 0).map((r) => r.email);
+}
+
+/**
+ * One scheduled run (also what "Run the scheduled fetch now" does). Returns
+ * what it started, or why it did not.
+ */
+export async function runScheduledFetch(userId: string, by = "schedule"): Promise<{ started: boolean; message: string; emails?: number; sinceDays?: number }> {
+  if (getOrderFetchJob(userId).running) {
+    const message = "skipped — a fetch is already running";
+    lastTick = { at: new Date(), outcome: message };
+    console.log(`[fetch-schedule] ${message}`);
+    return { started: false, message };
+  }
+  const emails = await scheduledFetchEmails(userId);
+  if (!emails.length) {
+    const message = "skipped — no logged-in Platform ID";
+    lastTick = { at: new Date(), outcome: message };
+    console.log(`[fetch-schedule] ${message}`);
+    return { started: false, message };
+  }
+  const { days } = await resolveFetchSinceDays(userId);
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  since.setHours(0, 0, 0, 0);
+  try {
+    await startOrderFetch(userId, emails, since, { trigger: "system-cron", by });
+    const message = `started — ${emails.length} logged-in Platform ID(s), orders since ${since.toISOString().slice(0, 10)} (${days} d)`;
+    lastTick = { at: new Date(), outcome: message };
+    console.log(`[fetch-schedule] ${message}`);
+    return { started: true, message, emails: emails.length, sinceDays: days };
+  } catch (err) {
+    const message = `could not start: ${err instanceof Error ? err.message : String(err)}`;
+    lastTick = { at: new Date(), outcome: message };
+    console.warn(`[fetch-schedule] ${message}`);
+    return { started: false, message };
+  }
+}
+
+export function startFetchSchedule(): void {
+  if (task) return;
+  if (!FETCH_SCHEDULE_ENABLED) {
+    console.log("[fetch-schedule] off (FETCH_SCHEDULE=0) — the Fetch button only");
+    return;
+  }
+  if (!cron.validate(FETCH_SCHEDULE_CRON)) {
+    console.warn(`[fetch-schedule] FETCH_SCHEDULE "${FETCH_SCHEDULE_CRON}" is not a valid cron expression — not started`);
+    return;
+  }
+  task = cron.schedule(FETCH_SCHEDULE_CRON, () => void runScheduledFetch(workspaceUserId(), "schedule"), { timezone: FETCH_TIMEZONE });
+  console.log(`[fetch-schedule] "${FETCH_SCHEDULE_CRON}" ${FETCH_TIMEZONE} — every logged-in Platform ID, look-back ${DEFAULT_SINCE_DAYS} d unless the dashboard sets fetchSinceDays`);
+}
+
+export function stopFetchSchedule(): void {
+  task?.stop();
+  task = null;
+}
+
+export async function fetchScheduleStatus(userId: string) {
+  const since = await resolveFetchSinceDays(userId);
+  const [lastRun, emails] = await Promise.all([
+    OrderJobRun.findOne({ userId, type: "fetch", trigger: "system-cron" }).sort({ createdAt: -1 }).select("status startedAt finishedAt total success failed message").lean(),
+    scheduledFetchEmails(userId),
+  ]);
+  return {
+    enabled: FETCH_SCHEDULE_ENABLED,
+    cron: FETCH_SCHEDULE_CRON,
+    timezone: FETCH_TIMEZONE,
+    sinceDays: since.days,
+    sinceSource: since.source,
+    loggedInIds: emails.length,
+    windows: config.fetchWindowConcurrency || null,
+    lastTick,
+    lastScheduledRun: lastRun,
+    fetchRunning: getOrderFetchJob(userId).running,
+  };
+}

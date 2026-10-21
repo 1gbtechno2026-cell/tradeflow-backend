@@ -5,6 +5,7 @@ import { connectDb } from "./db.js";
 import { jobsRouter } from "./routes/jobs.js";
 import { testRouter } from "./routes/test.js";
 import { orderFetchRouter } from "./routes/orderFetch.js";
+import { startFetchSchedule } from "./services/orderFetchSchedule.js";
 import { smsRouter } from "./routes/sms.js";
 
 function stamp() {
@@ -58,6 +59,8 @@ async function main() {
     console.log(`[trade-flow] ${stamp()} API listening on http://0.0.0.0:${config.port}`);
     console.log(`[trade-flow] Submit Order should show: --> POST /api/jobs`);
   });
+  // Scheduled Fetch (FETCH_SCHEDULE); off unless set.
+  startFetchSchedule();
 }
 
 main().catch((err) => {

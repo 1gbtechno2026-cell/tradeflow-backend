@@ -19,6 +19,10 @@ export interface IOrderSyncSettings {
   updateWindows: number;
   updateChangedBy: string;
   updateChangedAt: Date | null;
+  /** Scheduled fetch (services/orderFetchSchedule.ts): how far back the 05:00 run looks. 0 = FETCH_SINCE_DAYS / default 60. */
+  fetchSinceDays: number;
+  fetchScheduleChangedBy: string;
+  fetchScheduleChangedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -36,6 +40,9 @@ const OrderSyncSettingsSchema = new Schema<IOrderSyncSettings>(
     updateWindows: { type: Number, default: 0 },
     updateChangedBy: { type: String, default: "" },
     updateChangedAt: { type: Date, default: null },
+    fetchSinceDays: { type: Number, default: 0 },
+    fetchScheduleChangedBy: { type: String, default: "" },
+    fetchScheduleChangedAt: { type: Date, default: null },
   },
   { timestamps: true, collection: "order_sync_settings" }
 );

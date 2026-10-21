@@ -87,6 +87,8 @@ interface FetchJobState {
 }
 
 const jobs = new Map<string, FetchJobState>();
+/** Accounts that failed in the current run, for the panel's "View failed items" (services/orderJobRuns.ts). */
+const failedAccounts = new Map<string, Array<{ key: string; reason: string }>>();
 const ORDERS_URL = "https://www.flipkart.com/account/orders?link=home_orders";
 
 function fetchWindowCount(emailCount: number) {
@@ -1653,6 +1655,7 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
     accountsQueued: queue.length,
   };
   runInvariants.delete(userId);
+  failedAccounts.delete(userId);
   // The dashboard's switch wins over .env; resolved now, for this run only.
   const resolved = await resolveOrderFetchMode(userId);
   job.mode = resolved.mode;
@@ -1697,6 +1700,7 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
       success: known + (rep.idsScraped || 0) + (rep.idsSkippedOld || 0),
       failed: rep.idsFailed || 0,
       cancelled: job.cancelled ? Math.max(0, total - processed) : 0,
+      failedItems: failedAccounts.get(userId) || [],
       message: `${rep.accountsDone}/${rep.accountsQueued} email(s) · ${rep.idsDiscovered} unit IDs found, ${rep.idsNew} new, ${rep.idsScraped} saved, ${rep.idsFailed} failed, ${rep.idsSkippedOld} older than ${job.sinceLabel}`,
       meta: { report: rep },
     }).catch(() => undefined);
@@ -2346,6 +2350,9 @@ async function run(userId: string, queue: QueueAccount[]) {
           }
           job.failed += 1;
           log(userId, "error", `${row.email} failed: ${err instanceof Error ? err.message : err}`);
+          const list = failedAccounts.get(userId) || [];
+          if (list.length < 500) list.push({ key: row.email, reason: (err instanceof Error ? err.message : String(err)).split("\n")[0].slice(0, 200) });
+          failedAccounts.set(userId, list);
         }
         if (page) {
           try {

@@ -11,7 +11,7 @@ import {
 } from "../services/orderFetch.js";
 import { getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import { listRuns, syncPanel } from "../services/orderJobRuns.js";
-import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays } from "../services/orderFetchSchedule.js";
+import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays, setScheduledInvoices } from "../services/orderFetchSchedule.js";
 import {
   cancelUpdateRequest,
   createUpdateRequest,
@@ -202,11 +202,14 @@ orderFetchRouter.get("/fetch/schedule", async (req, res) => {
   }
 });
 
-/** PUT body: { fetchSinceDays, by? } */
+/** PUT body: { fetchSinceDays?, scheduledInvoices?, by? } — either or both. */
 orderFetchRouter.put("/fetch/schedule", async (req, res) => {
   try {
-    const out = await setFetchSinceDays(userIdFrom(req), req.body?.fetchSinceDays, String(req.body?.by || "").trim());
-    res.json({ ...out, ...(await fetchScheduleStatus(userIdFrom(req))) });
+    const by = String(req.body?.by || "").trim();
+    if (req.body?.fetchSinceDays === undefined && req.body?.scheduledInvoices === undefined) throw new Error("Nothing to save: send fetchSinceDays and/or scheduledInvoices");
+    if (req.body?.fetchSinceDays !== undefined) await setFetchSinceDays(userIdFrom(req), req.body.fetchSinceDays, by);
+    if (req.body?.scheduledInvoices !== undefined) await setScheduledInvoices(userIdFrom(req), req.body.scheduledInvoices, by);
+    res.json(await fetchScheduleStatus(userIdFrom(req)));
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : "Could not save the fetch schedule" });
   }

@@ -6,6 +6,7 @@ import { jobsRouter } from "./routes/jobs.js";
 import { testRouter } from "./routes/test.js";
 import { orderFetchRouter } from "./routes/orderFetch.js";
 import { startFetchSchedule } from "./services/orderFetchSchedule.js";
+import { startQueueMetrics } from "./services/queueMetrics.js";
 import { smsRouter } from "./routes/sms.js";
 
 function stamp() {
@@ -61,6 +62,7 @@ async function main() {
   });
   // Scheduled Fetch (FETCH_SCHEDULE); off unless set.
   startFetchSchedule();
+  startQueueMetrics();
 }
 
 main().catch((err) => {

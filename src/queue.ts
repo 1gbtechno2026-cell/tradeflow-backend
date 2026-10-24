@@ -29,6 +29,17 @@ function redisConnection() {
   };
 }
 
+/** Read-only handle on any queue by name, for depth metrics (services/queueMetrics.ts). */
+const metricQueues = new Map<string, Queue>();
+export function metricsQueue(name: string): Queue {
+  let q = metricQueues.get(name);
+  if (!q) {
+    q = new Queue(name, { connection: redisConnection() });
+    metricQueues.set(name, q);
+  }
+  return q;
+}
+
 const queues = new Map<string, Queue<CheckoutJobData>>();
 
 function queueByName(name: string): Queue<CheckoutJobData> {

@@ -1,10 +1,11 @@
 import { connectDb } from "./db.js";
 import { config } from "./config.js";
-import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createSyncWorker, createUpdateWorker, getSyncQueue, LEGACY_QUEUE, queueNameFor, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
+import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createRescheduleWorker, createSyncWorker, createUpdateWorker, getSyncQueue, LEGACY_QUEUE, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
 import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
 import { resolveCancelSpeed, runCancelJob } from "./services/orderCancel.js";
+import { rescheduleConcurrency, runRescheduleJob } from "./services/orderReschedule.js";
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
 import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob } from "./services/orderUpdateQueue.js";
 
@@ -13,7 +14,7 @@ import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob } from "
  * deployment (AWS: the checkout workers run checkout,cancel; one small
  * tradeflow-sync service runs sync — no Chrome, HTTP only):
  *
- *   WORKER_ROLES=checkout,cancel,sync,update   default: all four (local dev)
+ *   WORKER_ROLES=checkout,cancel,sync,update,reschedule   default: all five (local dev)
  *   SYNC_CONCURRENCY=4                          order syncs at once (default 4)
  *   SYNC_SWEEP_MS=600000                        outbox sweep period (default 10 min)
  *   UPDATE_CONCURRENCY=3                        Update Order Units: accounts at once
@@ -44,11 +45,11 @@ function classesFromEnv(): JobClass[] {
   return picked.length ? picked : [...JOB_CLASSES];
 }
 
-type Role = "checkout" | "cancel" | "sync" | "update";
+type Role = "checkout" | "cancel" | "sync" | "update" | "reschedule";
 
 function rolesFromEnv(): Set<Role> {
   const raw = String(process.env.WORKER_ROLES || "").trim();
-  const all: Role[] = ["checkout", "cancel", "sync", "update"];
+  const all: Role[] = ["checkout", "cancel", "sync", "update", "reschedule"];
   if (!raw) return new Set(all);
   const picked = raw.split(",").map((s) => s.trim()).filter((r): r is Role => (all as string[]).includes(r));
   return new Set(picked.length ? picked : all);
@@ -129,6 +130,20 @@ async function main() {
     void follow();
     setInterval(() => void follow(), 10_000).unref();
     names.push([CANCEL_QUEUE, cancelConcurrency]);
+  }
+  // Order reschedules: one job per account; RESCHEDULE_CONCURRENCY accounts at once (default 1).
+  const rescheduleWindows = rescheduleConcurrency();
+  if (roles.has("reschedule") && rescheduleWindows > 0) {
+    const rescheduleWorker = createRescheduleWorker(rescheduleWindows, async (job, token) => {
+      console.log(`[worker] PICKED ${RESCHEDULE_QUEUE} request=${job.data.requestId} email=${job.data.email}`);
+      await runRescheduleJob(job, token);
+    });
+    rescheduleWorker.on("failed", (job, err) => {
+      if (err.name === "DelayedError") return;
+      console.error(`[worker] FAILED ${RESCHEDULE_QUEUE} job=${job?.id}:`, err.message);
+    });
+    rescheduleWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${RESCHEDULE_QUEUE}):`, err.message));
+    names.push([RESCHEDULE_QUEUE, rescheduleWindows]);
   }
   // Order sync: finished checkouts' orders into Order Units, plus the sweep.
   if (roles.has("sync")) {

@@ -88,6 +88,11 @@ export interface IOrder {
   /** Cancellation requested from the dashboard (services/orderCancel.ts):
    *  "" | queued | running | cancelled | not_cancellable | failed. */
   cancel_status: string;
+  /** Reschedule Order Units (services/orderReschedule.ts): queued | running | not_available | needs_review | rescheduled | failed. */
+  reschedule_status: string;
+  reschedule_request_id: string;
+  reschedule_date: string;
+  reschedule_message: string;
   cancel_request_id: string;
   cancel_requested_at: Date | null;
   /** Dashboard user who asked for the cancellation. */
@@ -209,6 +214,10 @@ const OrderSchema = new Schema<IOrder>(
     payment_fee: { type: String, default: "" },
     payment_fee_details: { type: String, default: "" },
     cancel_status: { type: String, default: "" },
+    reschedule_status: { type: String, default: "" },
+    reschedule_request_id: { type: String, default: "" },
+    reschedule_date: { type: String, default: "" },
+    reschedule_message: { type: String, default: "" },
     cancel_request_id: { type: String, default: "" },
     cancel_requested_at: { type: Date, default: null },
     cancel_requested_by: { type: String, default: "" },

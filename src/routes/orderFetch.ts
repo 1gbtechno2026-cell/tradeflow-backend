@@ -10,6 +10,7 @@ import {
   stopOrderFetch,
 } from "../services/orderFetch.js";
 import { getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
+import { getRescheduleRequest, listRescheduleRequests, previewReschedule, requestReschedule, retryRescheduleRequest } from "../services/orderReschedule.js";
 import { listRuns, syncPanel } from "../services/orderJobRuns.js";
 import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays, setScheduledInvoices } from "../services/orderFetchSchedule.js";
 import {
@@ -367,6 +368,65 @@ orderFetchRouter.post("/cancel/:id/retry", async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : "Could not retry the cancellation" });
   }
+});
+
+/**
+ * Reschedule Order Units — Flipkart's "Change Date" per unit, in the Platform
+ * ID's Chrome (order-reschedule queue). Body: { type: "unit"|"order", ids,
+ * date: "YYYY-MM-DD", by? }. Answers at once with what was queued / refused.
+ */
+orderFetchRouter.post("/reschedule", async (req, res) => {
+  try {
+    const type = String(req.body?.type || "").toLowerCase();
+    if (type !== "unit" && type !== "order") {
+      res.status(400).json({ error: 'type must be "unit" or "order"' });
+      return;
+    }
+    res.status(202).json(await requestReschedule(userIdFrom(req), { type, ids: parseIds(req.body?.ids), date: String(req.body?.date || ""), by: String(req.body?.by || "").trim() }));
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not queue the reschedule" });
+  }
+});
+
+orderFetchRouter.post("/reschedule/preview", async (req, res) => {
+  try {
+    const type = String(req.body?.type || "").toLowerCase();
+    if (type !== "unit" && type !== "order") {
+      res.status(400).json({ error: 'type must be "unit" or "order"' });
+      return;
+    }
+    res.json(await previewReschedule(userIdFrom(req), { type, ids: parseIds(req.body?.ids), date: String(req.body?.date || "") }));
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not preview the reschedule" });
+  }
+});
+
+orderFetchRouter.post("/reschedule/:id/retry", async (req, res) => {
+  try {
+    const result = await retryRescheduleRequest(userIdFrom(req), req.params.id, String(req.body?.by || "").trim());
+    if (!result) {
+      res.status(404).json({ error: "Reschedule request not found" });
+      return;
+    }
+    res.status(202).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not retry the reschedule" });
+  }
+});
+
+orderFetchRouter.get("/reschedule", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  res.json({ requests: await listRescheduleRequests(userId, Number(req.query.limit) || 20) });
+});
+
+orderFetchRouter.get("/reschedule/:id", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  const row = await getRescheduleRequest(userId, req.params.id);
+  if (!row) {
+    res.status(404).json({ error: "Reschedule request not found" });
+    return;
+  }
+  res.json(row);
 });
 
 orderFetchRouter.get("/cancel", async (req, res) => {

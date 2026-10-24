@@ -1,5 +1,6 @@
 import { Types } from "mongoose";
 import { CancelRequest } from "../models/CancelRequest.js";
+import { RescheduleRequest } from "../models/RescheduleRequest.js";
 import { OrderJobRun, type IOrderJobRun, type JobRunStatus, type JobRunTrigger, type JobRunType } from "../models/OrderJobRun.js";
 import { OrderUpdateRequest } from "../models/OrderUpdateRequest.js";
 import { getOrderFetchJob } from "./orderFetch.js";
@@ -226,6 +227,55 @@ async function updateRow(userId: string): Promise<PanelRow> {
   };
 }
 
+/** The latest Reschedule Order Units request as a panel row (services/orderReschedule.ts). */
+async function rescheduleRow(userId: string): Promise<PanelRow> {
+  const r = await RescheduleRequest.findOne({ userId }).sort({ createdAt: -1 }).lean();
+  if (!r) return idleRow("reschedule");
+  const units = r.units || [];
+  const count = (s: string) => units.filter((u) => u.status === s).length;
+  const total = units.length;
+  const success = count("rescheduled");
+  const failed = count("failed");
+  const notAvailable = count("not_available");
+  const needsReview = count("needs_review");
+  const processed = success + failed + notAvailable + needsReview;
+  const running = r.status !== "done";
+  const finished = units.filter((u) => u.finishedAt).map((u) => new Date(u.finishedAt as Date).getTime());
+  const start = r.createdAt;
+  const end = r.finishedAt ? new Date(r.finishedAt).getTime() : finished.length ? Math.max(...finished) : Date.now();
+  const elapsed = start ? end - new Date(start).getTime() : 0;
+  const avgMs = processed ? elapsed / processed : 0;
+  const pending = running ? Math.max(0, total - processed) : 0;
+  const runningUnit = units.find((u) => u.status === "running");
+  return {
+    ...idleRow("reschedule"),
+    status: running ? "running" : "completed",
+    trigger: "user",
+    by: r.createdBy || "",
+    total,
+    processed,
+    success,
+    failed,
+    cancelled: 0,
+    pending,
+    startedAt: start,
+    finishedAt: r.finishedAt,
+    avgMs,
+    etaSeconds: pending && avgMs ? Math.round((pending * avgMs) / 1000) : null,
+    currentLabel: runningUnit ? `${runningUnit.email} ${runningUnit.orderId}/${runningUnit.unitId}` : r.date ? `→ ${r.date}` : "",
+    extras: [
+      { label: "Not available", value: notAvailable },
+      { label: "Needs review", value: needsReview },
+      { label: "Refused", value: (r.rejected || []).length },
+    ],
+    failedItems: [
+      ...units.filter((u) => u.status === "failed").map((u) => ({ key: `${u.email} ${u.orderId}/${u.unitId}`, reason: u.message || "failed" })),
+      ...units.filter((u) => u.status === "not_available").map((u) => ({ key: `${u.email} ${u.orderId}/${u.unitId}`, reason: u.message || "not available" })),
+    ].slice(0, FAILED_KEEP),
+    refId: String(r._id),
+  };
+}
+
 async function cancelRow(userId: string): Promise<PanelRow> {
   const r = await CancelRequest.findOne({ userId }).sort({ createdAt: -1 }).lean();
   if (!r) return idleRow("cancel");
@@ -281,7 +331,7 @@ async function ledgerRow(userId: string, type: JobRunType): Promise<PanelRow> {
 }
 
 export async function syncPanel(userId: string): Promise<{ rows: PanelRow[]; at: Date }> {
-  const [fetch, update, cancel, coupons, reschedule] = await Promise.all([fetchRow(userId), updateRow(userId), cancelRow(userId), ledgerRow(userId, "coupons"), ledgerRow(userId, "reschedule")]);
+  const [fetch, update, cancel, coupons, reschedule] = await Promise.all([fetchRow(userId), updateRow(userId), cancelRow(userId), ledgerRow(userId, "coupons"), rescheduleRow(userId)]);
   // The invoices row is the dashboard's (its Invoice documents); a placeholder keeps the order stable.
   return { rows: [fetch, update, idleRow("invoices"), coupons, reschedule, cancel], at: new Date() };
 }

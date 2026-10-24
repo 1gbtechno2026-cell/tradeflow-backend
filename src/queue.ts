@@ -121,6 +121,39 @@ export function createCancelWorker(
   });
 }
 
+// ── Order reschedule ───────────────────────────────────────────────────────
+// One job per (reschedule request, account): every unit the request holds for
+// that account has its "Change Date" driven in one browser (services/orderReschedule.ts).
+
+export const RESCHEDULE_QUEUE = "order-reschedule";
+
+export interface RescheduleJobData {
+  requestId: string;
+  email: string;
+}
+
+let rescheduleQueue: Queue<RescheduleJobData> | null = null;
+
+export function getRescheduleQueue(): Queue<RescheduleJobData> {
+  if (!rescheduleQueue) {
+    rescheduleQueue = new Queue<RescheduleJobData>(RESCHEDULE_QUEUE, {
+      connection: redisConnection(),
+      defaultJobOptions: { attempts: 1, removeOnComplete: true, removeOnFail: true } satisfies JobsOptions,
+    });
+  }
+  return rescheduleQueue;
+}
+
+export function createRescheduleWorker(concurrency: number, processor: (job: Job<RescheduleJobData>, token: string | undefined) => Promise<void>) {
+  return new Worker<RescheduleJobData>(RESCHEDULE_QUEUE, processor, {
+    connection: redisConnection(),
+    concurrency: Math.max(1, concurrency),
+    lockDuration: 10 * 60 * 1000,
+    stalledInterval: 60 * 1000,
+    maxStalledCount: 1,
+  });
+}
+
 // ── Order sync ─────────────────────────────────────────────────────────────
 // After a checkout ends, its order goes into Order Units without anyone running
 // a fetch (services/orderSync.ts). One job per checkout job, keyed by its id, so

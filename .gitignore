@@ -12,3 +12,7 @@ dist/
 flipkart flow/
 debug/
 test-flow.json
+
+# environment profile templates (no secrets)
+!.env.local.example
+!.env.production.example

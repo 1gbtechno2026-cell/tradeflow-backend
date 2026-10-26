@@ -53,6 +53,12 @@ export const config = {
    * `${workerId}-api` so it never shares a worker's proxy.
    */
   workerId: (process.env.WORKER_ID || os.hostname().split(".")[0] || "worker").trim(),
+  /** Which environment this process is: the dashboard keeps one proxy mode per environment (services/proxyMode.ts). */
+  envName: (String(process.env.TRADEFLOW_ENV || "local").trim().toLowerCase() === "production" ? "production" : "local") as "local" | "production",
+  /** session = one proxy per Chrome session (job), leased from the pool and rested after; worker = the old sticky one-per-process binding. */
+  proxyLease: (String(process.env.PROXY_LEASE || "session").trim().toLowerCase() === "worker" ? "worker" : "session") as "session" | "worker",
+  /** How long a released proxy rests before another session may take it (ms). */
+  proxyRestMs: Math.max(0, Number(process.env.PROXY_REST_MS) || 60_000),
   /**
    * Which deployment this process belongs to — the owner of the batches it
    * creates and the only one that consumes or sweeps them. All processes that

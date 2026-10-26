@@ -42,7 +42,7 @@ async function main() {
   });
 
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true });
+    res.json({ ok: true, env: config.envName, workerId: config.workerId, proxyLease: config.proxyLease });
   });
   app.use("/api/sms", smsRouter);
   app.use(requireApiKey);

@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { ProxyPool, type IProxyPool } from "../models/ProxyPool.js";
 import { decryptProxySecret } from "./proxySecrets.js";
 import { workspaceUserId } from "./sessionStore.js";
+import { currentProxyMode } from "./proxyMode.js";
 
 /**
  * Egress for the checkout workers: one proxy per worker PROCESS, bound by
@@ -88,7 +89,7 @@ function toClaimed(row: IProxyPool & { _id: Types.ObjectId }): ClaimedProxy {
  * lets that row go and binds a fresh one, so one worker never holds two.
  */
 export async function claimProxyForWorker(workerId: string): Promise<ClaimedProxy | null> {
-  if (config.proxyMode === "off") return null;
+  if ((await currentProxyMode()) === "off") return null;
   // One claim at a time per process: two jobs starting in the same instant
   // both saw "no row bound to me yet" and each bound a fresh proxy (Mac held
   // .173 and .183 at once on 2026-10-06). The second waits for the first.
@@ -119,6 +120,47 @@ async function claimProxyForWorkerNow(workerId: string): Promise<ClaimedProxy | 
     { new: true, sort: { lastUsedAt: 1, createdAt: 1 } }
   ).lean();
   return fresh ? toClaimed(fresh as IProxyPool & { _id: Types.ObjectId }) : null;
+}
+
+/**
+ * One proxy per SESSION (PROXY_LEASE=session, the default): a free active row
+ * — not bound to anyone and past its rest — is bound to `holder`
+ * (`<workerId>#<jobId>`) for the life of one job and released after, with a
+ * rest of PROXY_REST_MS before the next session may take it. 200 proxies and
+ * 30 concurrent sessions then means 30 different exit addresses, each idle
+ * most of the time, instead of 8 sessions sharing one worker's address.
+ */
+export async function claimProxyForSession(holder: string): Promise<ClaimedProxy | null> {
+  if ((await currentProxyMode()) === "off") return null;
+  const userId = new Types.ObjectId(workspaceUserId());
+  const now = new Date();
+  const own = await ProxyPool.findOne({ userId, assignedTo: holder, status: "active" }).lean();
+  if (own) return toClaimed(own as IProxyPool & { _id: Types.ObjectId });
+  const fresh = await ProxyPool.findOneAndUpdate(
+    { userId, status: "active", assignedTo: null, $or: [{ restUntil: null }, { restUntil: { $exists: false } }, { restUntil: { $lte: now } }] },
+    { $set: { assignedTo: holder, assignedAt: now } },
+    { new: true, sort: { lastUsedAt: 1, createdAt: 1 } }
+  ).lean();
+  return fresh ? toClaimed(fresh as IProxyPool & { _id: Types.ObjectId }) : null;
+}
+
+/** Give a session's proxy back to the pool; it rests before anyone else gets it. */
+export async function releaseProxy(id: string, holder: string): Promise<void> {
+  await ProxyPool.updateOne({ _id: id, assignedTo: holder }, { $set: { assignedTo: null, assignedAt: null, restUntil: new Date(Date.now() + config.proxyRestMs) } }).catch(() => undefined);
+}
+
+/**
+ * The egress for one job under the configured lease model. `release` is a
+ * no-op in worker mode (the binding is sticky) and gives the row back in
+ * session mode.
+ */
+export async function claimEgress(holder: string): Promise<{ egress: ClaimedProxy | null; release: () => Promise<void> }> {
+  if (config.proxyLease === "worker") {
+    const egress = await claimProxyForWorker(config.workerId);
+    return { egress, release: async () => undefined };
+  }
+  const egress = await claimProxyForSession(holder);
+  return { egress, release: async () => (egress ? releaseProxy(egress.id, holder) : undefined) };
 }
 
 /** Active rows nobody is bound to — how many more workers the pool can serve. */

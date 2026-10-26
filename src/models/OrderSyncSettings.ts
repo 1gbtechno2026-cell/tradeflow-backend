@@ -24,6 +24,11 @@ export interface IOrderSyncSettings {
   fetchScheduleChangedBy: string;
   fetchScheduleChangedAt: Date | null;
   /** Scheduled fetch downloads invoices ("All missing": every delivered unit without a PDF, capped per run). Dashboard Settings toggle; null = FETCH_SCHEDULE_INVOICES / off. */
+  /** Proxy mode per environment (services/proxyMode.ts): off | preferred | required; null = that process's PROXY_MODE env. */
+  proxyModeLocal: string | null;
+  proxyModeProduction: string | null;
+  proxyChangedBy: string;
+  proxyChangedAt: Date | null;
   scheduledInvoices: boolean | null;
   scheduledInvoicesChangedBy: string;
   scheduledInvoicesChangedAt: Date | null;
@@ -47,6 +52,10 @@ const OrderSyncSettingsSchema = new Schema<IOrderSyncSettings>(
     fetchSinceDays: { type: Number, default: 0 },
     fetchScheduleChangedBy: { type: String, default: "" },
     fetchScheduleChangedAt: { type: Date, default: null },
+    proxyModeLocal: { type: String, default: null },
+    proxyModeProduction: { type: String, default: null },
+    proxyChangedBy: { type: String, default: "" },
+    proxyChangedAt: { type: Date, default: null },
     scheduledInvoices: { type: Boolean, default: null },
     scheduledInvoicesChangedBy: { type: String, default: "" },
     scheduledInvoicesChangedAt: { type: Date, default: null },

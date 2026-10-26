@@ -11,6 +11,7 @@ import {
 } from "../services/orderFetch.js";
 import { getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import { getRescheduleRequest, listRescheduleRequests, previewReschedule, requestReschedule, retryRescheduleRequest } from "../services/orderReschedule.js";
+import { proxyModeStatus, setProxyMode } from "../services/proxyMode.js";
 import { listRuns, syncPanel } from "../services/orderJobRuns.js";
 import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays, setScheduledInvoices } from "../services/orderFetchSchedule.js";
 import {
@@ -427,6 +428,20 @@ orderFetchRouter.get("/reschedule/:id", async (req, res) => {
     return;
   }
   res.json(row);
+});
+
+/** Proxy mode per environment — Settings → Environments. GET → status; PUT { env: local|production, mode: off|preferred|required, by? }. */
+orderFetchRouter.get("/proxy-mode", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  res.json(await proxyModeStatus(userId));
+});
+
+orderFetchRouter.put("/proxy-mode", async (req, res) => {
+  try {
+    res.json(await setProxyMode(userIdFrom(req), req.body?.env, req.body?.mode, String(req.body?.by || "").trim()));
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not set the proxy mode" });
+  }
 });
 
 orderFetchRouter.get("/cancel", async (req, res) => {

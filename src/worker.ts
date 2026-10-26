@@ -4,6 +4,7 @@ import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createReschedul
 import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
+import { currentProxyMode } from "./services/proxyMode.js";
 import { resolveCancelSpeed, runCancelJob } from "./services/orderCancel.js";
 import { rescheduleConcurrency, runRescheduleJob } from "./services/orderReschedule.js";
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
@@ -64,23 +65,17 @@ function concurrencyFor(cls: JobClass): number {
 async function main() {
   await connectDb();
 
-  // Egress first. In `required` mode a worker with nothing to leave from must
-  // not take a single job — it would place orders from this machine's own
-  // address. The binding is re-read at every job start (claimProxyForWorker),
-  // so this is the gate, not the only read.
-  if (config.proxyMode !== "off") {
+  // Egress. In worker-lease mode a process binds one proxy for its life and,
+  // in `required` mode, must not take a job without one. In session-lease
+  // mode (default) every job leases its own proxy, so nothing is bound here;
+  // a job that finds the pool empty under `required` waits in the queue.
+  const mode = await currentProxyMode();
+  console.log(`[proxy] env ${config.envName} · mode ${mode} · lease per ${config.proxyLease}${config.proxyLease === "session" ? ` (rest ${Math.round(config.proxyRestMs / 1000)} s)` : ""}`);
+  if (mode !== "off" && config.proxyLease === "worker") {
     const egress = await claimProxyForWorker(config.workerId);
-    if (egress) {
-      console.log(`[proxy] worker ${config.workerId} bound to ${egress.label} (mode ${config.proxyMode})`);
-    } else if (config.proxyMode === "required") {
-      console.error(
-        `[proxy] worker ${config.workerId}: no free proxy in the pool and PROXY_MODE=required — ` +
-          `add proxies in the dashboard's Proxy Pool tab (or assign one to "${config.workerId}") and start again`
-      );
-      process.exit(3);
-    } else {
-      console.warn(`[proxy] worker ${config.workerId}: no free proxy — running on the local connection (PROXY_MODE=preferred)`);
-    }
+    if (egress) console.log(`[proxy] worker ${config.workerId} bound to ${egress.label}`);
+    else if (mode === "required") console.error(`[proxy] worker ${config.workerId}: no free proxy and the mode is required — jobs will wait until the Proxy Pool has a free active proxy`);
+    else console.warn(`[proxy] worker ${config.workerId}: no free proxy — running on the local connection (preferred)`);
   }
 
   const roles = rolesFromEnv();

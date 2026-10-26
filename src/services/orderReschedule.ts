@@ -11,7 +11,7 @@ import { RescheduleRequest, type IRescheduleRequest, type IRescheduleUnit, type 
 import { getRescheduleQueue, type RescheduleJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
 import { blockFlipkartLogout, desktopContext, flipkartLoginUrl, launchStealthBrowser, restoreFlipkartSession, sleep } from "./browser.js";
-import { claimProxyForWorker } from "./proxyPool.js";
+import { claimEgress } from "./proxyPool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
 
 /**
@@ -324,7 +324,8 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
       for (const u of units) await finish(u, "failed", `Session: ${session.reason} — re-login this ID`);
       return;
     }
-    const egress = await claimProxyForWorker(config.workerId).catch(() => null);
+    const lease = await claimEgress(`reschedule:${requestId}:${email}`).catch(() => ({ egress: null, release: async () => undefined }));
+    const egress = lease.egress;
     const browser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
     const artifactDir = path.resolve("debug/reschedule-runs", requestId);
     fs.mkdirSync(artifactDir, { recursive: true });
@@ -429,6 +430,7 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
       }
     } finally {
       await browser.close().catch(() => undefined);
+      await lease.release().catch(() => undefined);
     }
   } finally {
     await unlock();

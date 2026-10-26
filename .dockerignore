@@ -9,3 +9,5 @@ npm-debug.log*
 .DS_Store
 deploy/*.local.json
 agent-transcripts
+!.env.local.example
+!.env.production.example

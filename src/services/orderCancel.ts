@@ -14,7 +14,7 @@ import { blockFlipkartLogout, desktopContext, flipkartLoginUrl, launchStealthBro
 import { lockAccount } from "./accountLock.js";
 import { fetchOrderDetails, mapApiUnitToOrder, openOrderApiSession, orderViewFromPageFetch, type ApiOrderView } from "./orderApi.js";
 import { fallbackUnitId, saveMappedUnit, type OrderAccount } from "./orderFetch.js";
-import { claimProxyForWorker } from "./proxyPool.js";
+import { claimEgress } from "./proxyPool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
 
 /**
@@ -623,7 +623,8 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
     const account: OrderAccount = { id: new Types.ObjectId(session.platformId), email: session.email, cookies: session.cookies };
     const userId = String(request.userId);
 
-    const egress = await claimProxyForWorker(config.workerId).catch(() => null);
+    const lease = await claimEgress(`cancel:${requestId}:${email}`).catch(() => ({ egress: null, release: async () => undefined }));
+    const egress = lease.egress;
     const browser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
     const artifactDir = path.resolve("debug/cancel-runs", requestId);
     const speed = await resolveCancelSpeed(userId).catch(() => null);
@@ -789,6 +790,7 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
       await Promise.all(pages.map((p) => runTab(p)));
     } finally {
       await browser.close().catch(() => undefined);
+      await lease.release().catch(() => undefined);
     }
   } finally {
     await unlock();

@@ -12,7 +12,8 @@ import {
   reserveBatchSlot,
   settleBatchIfCancelling,
 } from "./batchCounters.js";
-import { claimProxyForWorker, isProxyError, probeExitIp, recordProxyUse, reportProxyFailure } from "./proxyPool.js";
+import { claimEgress, isProxyError, probeExitIp, recordProxyUse, reportProxyFailure } from "./proxyPool.js";
+import { currentProxyMode } from "./proxyMode.js";
 import { setNavigationTimeoutScale } from "../automation/helpers.js";
 import {
   blockFlipkartLogout,
@@ -479,16 +480,21 @@ async function runClaimedCheckoutJob(
   // the dashboard applies to the next order. In `required` mode a job with no
   // proxy waits rather than leaving from this machine's own address — and the
   // attempt it reserved is given back, because Flipkart never saw it.
-  let egress: Awaited<ReturnType<typeof claimProxyForWorker>> = null;
+  const proxyMode = await currentProxyMode();
+  const proxyHolder = `${config.workerId}#${data.jobId}`;
+  let egress: Awaited<ReturnType<typeof claimEgress>>["egress"] = null;
+  let releaseEgress: () => Promise<void> = async () => undefined;
   try {
-    egress = await claimProxyForWorker(config.workerId);
+    const lease = await claimEgress(proxyHolder);
+    egress = lease.egress;
+    releaseEgress = lease.release;
   } catch (err) {
     console.warn(`[${data.jobId}] [warn] [proxy] pool unavailable: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (!egress && config.proxyMode === "required") {
+  if (!egress && proxyMode === "required") {
     await releaseReservation();
     await refundBatchAttempt(data.batchId);
-    await requeueCheckoutJob(data, config.proxyWaitMs, `no free proxy for worker ${config.workerId} (PROXY_MODE=required)`);
+    await requeueCheckoutJob(data, config.proxyWaitMs, `no free proxy for ${proxyHolder} (proxy mode required, ${config.envName})`);
     await unlockAccount();
     return;
   }
@@ -539,7 +545,7 @@ async function runClaimedCheckoutJob(
       await recordProxyUse(egress.id, data.jobId, exitIp);
       await patchResult(data.jobId, { egressProxy: egress.label, exitIp });
     } else {
-      log("warn", `[proxy] no proxy — leaving from this machine's own address (PROXY_MODE=${config.proxyMode})`, "session");
+      log("warn", `[proxy] no proxy — leaving from this machine's own address (proxy mode ${proxyMode}, ${config.envName})`, "session");
       await patchResult(data.jobId, { egressProxy: "direct" });
     }
 
@@ -887,6 +893,7 @@ async function runClaimedCheckoutJob(
     netObserver.dispose();
     await deskBrowser.close().catch(() => undefined);
     await mobBrowser?.close().catch(() => undefined);
+    await releaseEgress().catch(() => undefined);
     const latest = await CheckoutJob.findById(data.jobId).select("status");
     if (latest?.status === "cancelled") await releaseReservation();
     await unlockAccount();

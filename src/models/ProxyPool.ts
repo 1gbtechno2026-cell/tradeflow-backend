@@ -26,6 +26,8 @@ export interface IProxyPool {
   consecutiveFails: number;
   lastUsedAt: Date | null;
   lastUsedJobId: string;
+  /** After a session lease is released the row rests until here before another session may take it. */
+  restUntil: Date | null;
 }
 
 const ProxyPoolSchema = new Schema<IProxyPool>(
@@ -46,6 +48,7 @@ const ProxyPoolSchema = new Schema<IProxyPool>(
     consecutiveFails: Number,
     lastUsedAt: Date,
     lastUsedJobId: String,
+    restUntil: Date,
   },
   { timestamps: true, autoIndex: false, autoCreate: false, collection: "proxy_pool" }
 );

@@ -1,0 +1,49 @@
+# Build the Trade Flow image, push it to the fleet's ECR, roll the ECS services, restart the ops box's API.
+# Runs on push to the deploy branch and from the dashboard's Deploy button (workflow_dispatch).
+# Needs the repo secret AWS_ROLE_ARN = GitHubDeployRoleArn output of TradeFlowFleet-<env>.
+name: deploy-fleet
+on:
+  push:
+    branches: [payment-phase0, main]
+    paths-ignore: ["docs/**", "*.md"]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "dev | prod"
+        default: "dev"
+permissions:
+  id-token: write
+  contents: read
+concurrency: deploy-fleet
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ap-south-1
+      ENV_NAME: ${{ github.event.inputs.env || (github.ref_name == 'main' && 'prod' || 'dev') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: Build and push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          REPO="tradeflow-${ENV_NAME}"; TAG="${GITHUB_SHA::7}"
+          docker build --platform linux/amd64 -t "$REGISTRY/$REPO:$TAG" -t "$REGISTRY/$REPO:latest" .
+          docker push "$REGISTRY/$REPO:$TAG"; docker push "$REGISTRY/$REPO:latest"
+      - name: Roll the ECS services
+        run: |
+          CLUSTER="tradeflow-${ENV_NAME}"
+          for svc in $(aws ecs list-services --cluster "$CLUSTER" --query 'serviceArns[]' --output text 2>/dev/null); do
+            aws ecs update-service --cluster "$CLUSTER" --service "${svc##*/}" --force-new-deployment --query 'service.serviceName' --output text
+          done
+      - name: Restart Trade Flow on the ops box (SSM, if running)
+        run: |
+          ID=$(aws ec2 describe-instances --filters "Name=tag:Project,Values=TradeFlow" "Name=tag:Env,Values=${ENV_NAME}" "Name=tag:Role,Values=ops-box" "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[].InstanceId' --output text)
+          [ -n "$ID" ] || { echo "ops box not running — it pulls on its next boot"; exit 0; }
+          aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --comment "tradeflow ${GITHUB_SHA::7}" --parameters 'commands=["sudo /opt/tradeflow/deploy.sh"],executionTimeout=["1200"]' --query 'Command.CommandId' --output text

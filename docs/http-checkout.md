@@ -113,10 +113,10 @@ higher per-proxy limit if the provider allows it. No Chrome fleet is needed
 for COD at that scale; one process with `HTTP_CHECKOUT_CONCURRENCY=200` on
 the ops box is enough, Chrome only for the fallbacks.
 
-## Not yet verified
+## Verified end to end
 
-The real COD pay call (steps 6–8) was recorded from a successful Chrome order
-and is implemented from that recording; it has not yet been exercised by the
-engine itself (a permission rule stopped the one-order test). Run
-`npm run bench:http -- --n 1 --skip 9 --real 1` once and check the printed
-order id in Order Units.
+2026-10-27, one real order from the bench (`--real 1`, account awebeg@fabtrades.in,
+DC 1, proxy 103.163.54.175): **OD338996664603294100**, ₹256 (₹249 + ₹7 COD fee),
+4.4 s end to end — cart view 1.2 s, add 0.56 s, init 0.63 s, summary 0.38 s,
+token 0.40 s, pay page 0.40 s, COD pay 0.46 s, confirmation 0.32 s. The pay call
+on the `1.payments.flipkart.com` prefix answered SUCCESS with the order id.

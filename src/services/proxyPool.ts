@@ -141,7 +141,17 @@ export async function claimProxyForSession(holder: string): Promise<ClaimedProxy
     { $set: { assignedTo: holder, assignedAt: now } },
     { new: true, sort: { lastUsedAt: 1, createdAt: 1 } }
   ).lean();
-  return fresh ? toClaimed(fresh as IProxyPool & { _id: Types.ObjectId }) : null;
+  if (fresh) return toClaimed(fresh as IProxyPool & { _id: Types.ObjectId });
+  // Every free proxy is still resting (small pool, quick jobs): the rest is a
+  // preference, not a reason to leave from the machine's own address. Take the
+  // one that has rested longest. (2026-10-27: 4 proxies, 20-second jobs — two
+  // orders went out direct from the ops box and died on a blank page.)
+  const rested = await ProxyPool.findOneAndUpdate(
+    { userId, status: "active", assignedTo: null },
+    { $set: { assignedTo: holder, assignedAt: now } },
+    { new: true, sort: { restUntil: 1, lastUsedAt: 1 } }
+  ).lean();
+  return rested ? toClaimed(rested as IProxyPool & { _id: Types.ObjectId }) : null;
 }
 
 /** Give a session's proxy back to the pool; it rests before anyone else gets it. */

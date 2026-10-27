@@ -1,9 +1,8 @@
 import { config } from "../config.js";
 import { CheckoutJob } from "../models/CheckoutJob.js";
-import { getCheckoutQueue } from "../queue.js";
-import { jobClassFor } from "./jobClass.js";
+import { checkoutQueueFor } from "../queue.js";
 import type { AuthType, CardDetails } from "../paymentStrategies/types.js";
-import type { AddressDetails, CheckoutJobData, JobRequestSnapshot } from "../types.js";
+import type { AddressDetails, CheckoutJobData, ExecutionVersion, JobRequestSnapshot } from "../types.js";
 
 /**
  * Put a claimed-but-not-startable job back on its queue after `delayMs`,
@@ -25,7 +24,7 @@ export async function requeueCheckoutJob(data: CheckoutJobData, delayMs: number,
   // not be ":" — BullMQ 5 throws "Custom Id cannot contain :", and the job was
   // then lost: Mongo said queued/waiting while nothing sat in the queue (every
   // job that reached this path between 2026-10-15 and 2026-10-18 stranded).
-  await getCheckoutQueue(jobClassFor(data)).add("checkout", data, {
+  await checkoutQueueFor(data).add("checkout", data, {
     jobId: `${data.jobId}-w${now.getTime().toString(36)}`,
     delay: Math.max(1000, delayMs),
   });
@@ -43,6 +42,8 @@ export async function enqueueCheckoutJob(input: {
   cartAmountLimit?: number;
   deliverySlaDays?: number;
   gstMandatory?: boolean;
+  /** Defaults to request.executionVersion. */
+  executionVersion?: ExecutionVersion;
   address: AddressDetails;
   request?: JobRequestSnapshot;
   dryRun?: boolean;
@@ -105,6 +106,7 @@ export async function enqueueCheckoutJob(input: {
     cartAmountLimit: input.cartAmountLimit,
     deliverySlaDays: input.deliverySlaDays,
     gstMandatory: input.gstMandatory,
+    executionVersion: input.executionVersion ?? input.request?.executionVersion,
     address: input.address,
     isRetry: input.isRetry,
     paymentMode: input.paymentMode,
@@ -116,7 +118,7 @@ export async function enqueueCheckoutJob(input: {
   };
   // Routed by concurrency class: otp-phone / card / cod each have their own
   // queue, cap and workers (see jobClass.ts, queue.ts).
-  const queued = await getCheckoutQueue(jobClassFor(payload)).add("checkout", payload, { jobId: String(created._id) });
+  const queued = await checkoutQueueFor(payload).add("checkout", payload, { jobId: String(created._id) });
   created.bullmqJobId = queued.id || String(created._id);
   await created.save();
   return { job: created, queued: true };

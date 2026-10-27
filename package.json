@@ -18,7 +18,8 @@
     "batches:backfill": "tsx src/scripts/backfillBatchCounters.ts",
     "test:classify": "tsx src/scripts/classifyTest.ts",
     "test:proxy-pool": "tsx src/scripts/proxyPoolTest.ts",
-    "orders:replay": "tsx src/scripts/replayOrderTrace.ts"
+    "orders:replay": "tsx src/scripts/replayOrderTrace.ts",
+    "bench:http": "tsx src/scripts/httpCheckoutBench.ts"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.1156.0",

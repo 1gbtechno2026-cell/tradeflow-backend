@@ -1,6 +1,6 @@
 import { Queue, Worker, type Job, type JobsOptions } from "bullmq";
 import { config } from "./config.js";
-import { JOB_CLASSES, type JobClass } from "./services/jobClass.js";
+import { JOB_CLASSES, jobClassFor, type JobClass } from "./services/jobClass.js";
 import type { CheckoutJobData } from "./types.js";
 
 /**
@@ -64,6 +64,24 @@ export function getCheckoutQueue(cls: JobClass): Queue<CheckoutJobData> {
   return queueByName(queueNameFor(cls));
 }
 
+/**
+ * The HTTP checkout engine's queue. COD jobs submitted as "High Speed" go here
+ * instead of checkout-cod: no Chrome per job, so its concurrency is tens per
+ * process (HTTP_CHECKOUT_CONCURRENCY), not the RAM-bound 1–8 of the Chrome
+ * queues. A job that the engine hands back ("fallback") still runs Chrome in
+ * the same process, capped by HTTP_FALLBACK_CHROME_MAX (checkoutRunner.ts).
+ */
+export const HTTP_QUEUE = "checkout-http";
+
+export function getHttpCheckoutQueue(): Queue<CheckoutJobData> {
+  return queueByName(HTTP_QUEUE);
+}
+
+/** Which queue a checkout payload belongs on — class queue, or the HTTP one. */
+export function checkoutQueueFor(data: CheckoutJobData): Queue<CheckoutJobData> {
+  return data.executionVersion === "high_speed" && jobClassFor(data) === "cod" ? getHttpCheckoutQueue() : getCheckoutQueue(jobClassFor(data));
+}
+
 /** Waiting + delayed + active counts per class — the gauges the Orders tab shows. */
 export async function queueDepths(): Promise<Record<string, { waiting: number; delayed: number; active: number }>> {
   const out: Record<string, { waiting: number; delayed: number; active: number }> = {};
@@ -71,6 +89,11 @@ export async function queueDepths(): Promise<Record<string, { waiting: number; d
     const q = getCheckoutQueue(cls);
     const [waiting, delayed, active] = await Promise.all([q.getWaitingCount(), q.getDelayedCount(), q.getActiveCount()]);
     out[cls] = { waiting, delayed, active };
+  }
+  {
+    const q = getHttpCheckoutQueue();
+    const [waiting, delayed, active] = await Promise.all([q.getWaitingCount(), q.getDelayedCount(), q.getActiveCount()]);
+    out.http = { waiting, delayed, active };
   }
   return out;
 }

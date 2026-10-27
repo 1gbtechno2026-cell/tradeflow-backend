@@ -161,6 +161,7 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       finalAmountLimit: { type: Number },
       dryRun: { type: Boolean, default: false },
       gstMandatory: { type: Boolean, default: true },
+      executionVersion: { type: String, default: "" },
       cards: {
         type: [
           new Schema<MaskedCard>(

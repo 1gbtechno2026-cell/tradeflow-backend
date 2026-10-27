@@ -1,6 +1,6 @@
 import { CloudWatchClient, PutMetricDataCommand, type MetricDatum } from "@aws-sdk/client-cloudwatch";
 import { config } from "../config.js";
-import { CANCEL_QUEUE, LEGACY_QUEUE, metricsQueue, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "../queue.js";
+import { CANCEL_QUEUE, HTTP_QUEUE, LEGACY_QUEUE, metricsQueue, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "../queue.js";
 import { JOB_CLASSES } from "./jobClass.js";
 
 /**
@@ -38,7 +38,7 @@ async function counts(name: string): Promise<Counts> {
 }
 
 export async function collectQueueMetrics(): Promise<Record<string, Counts>> {
-  const names = [LEGACY_QUEUE, ...JOB_CLASSES.map((cls) => queueNameFor(cls)), CANCEL_QUEUE, RESCHEDULE_QUEUE, UPDATE_QUEUE, SYNC_QUEUE];
+  const names = [LEGACY_QUEUE, ...JOB_CLASSES.map((cls) => queueNameFor(cls)), HTTP_QUEUE, CANCEL_QUEUE, RESCHEDULE_QUEUE, UPDATE_QUEUE, SYNC_QUEUE];
   const out: Record<string, Counts> = {};
   await Promise.all(
     names.map(async (n) => {
@@ -46,7 +46,7 @@ export async function collectQueueMetrics(): Promise<Record<string, Counts>> {
     })
   );
   const sum = (keys: string[]): Counts => keys.reduce((a, k) => ({ waiting: a.waiting + out[k].waiting, active: a.active + out[k].active, backlog: a.backlog + out[k].backlog }), { waiting: 0, active: 0, backlog: 0 });
-  out.checkout = sum([LEGACY_QUEUE, ...JOB_CLASSES.map((cls) => queueNameFor(cls))]);
+  out.checkout = sum([LEGACY_QUEUE, ...JOB_CLASSES.map((cls) => queueNameFor(cls)), HTTP_QUEUE]);
   out.cancel = sum([CANCEL_QUEUE, RESCHEDULE_QUEUE]);
   return out;
 }

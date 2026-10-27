@@ -65,9 +65,17 @@ const normalizedSchema = z.object({
   /** Orders one card may place in this batch; absent = no cap. */
   cardMaxUsage: z.number().int().positive().optional(),
   dryRun: z.boolean().default(false),
+  /** Dashboard `order_execution_version`: high_speed / sonic_boom → the HTTP
+   *  checkout engine; standard / safe / absent → Chrome. */
+  executionVersion: z.enum(["chrome", "high_speed"]).default("chrome"),
 });
 
 export type NormalizedCreateJob = z.infer<typeof normalizedSchema>;
+
+export function normalizeExecutionVersion(raw: string | undefined): "chrome" | "high_speed" {
+  const v = String(raw || "").trim().toLowerCase();
+  return v === "high_speed" || v === "sonic_boom" || v === "http" ? "high_speed" : "chrome";
+}
 
 /** Accepts both the Trade Flow camelCase body and the Smart Bulk Order snake_case payload. */
 export function parseCreateJobBody(raw: unknown): NormalizedCreateJob {
@@ -107,6 +115,7 @@ export function parseCreateJobBody(raw: unknown): NormalizedCreateJob {
       asNumber(b.cardMaxUsage) ??
       asNumber(b.card_max_usage) ??
       (asBool(b.smart_cards_max_usage_enabled) ? asNumber(b.smart_cards_max_usage) : undefined),
+    executionVersion: normalizeExecutionVersion(asString(b.order_execution_version) ?? asString(b.executionVersion) ?? asString(b.execution_version)),
     dryRun:
       asBool(b.dry_run) ??
       asBool(b.dryRun) ??

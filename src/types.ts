@@ -62,6 +62,8 @@ export interface MaskedCard {
   parentCardNumberMasked: string;
 }
 
+export type ExecutionVersion = "chrome" | "high_speed";
+
 export interface JobRequestSnapshot {
   platform: string;
   paymentMode: string;
@@ -78,6 +80,9 @@ export interface JobRequestSnapshot {
   finalAmountLimit?: number;
   dryRun: boolean;
   gstMandatory?: boolean;
+  /** "high_speed" = the HTTP checkout engine (services/httpCheckout.ts), Chrome
+   *  only as its fallback; anything else = the Chrome page flow. */
+  executionVersion?: ExecutionVersion;
   cards: MaskedCard[];
   totalQuantity?: number;
   quantityPerOrder?: number;
@@ -158,6 +163,8 @@ export interface CheckoutJobData {
   cartAmountLimit?: number;
   deliverySlaDays?: number;
   gstMandatory?: boolean;
+  /** See JobRequestSnapshot.executionVersion. Decides the queue (checkout-http). */
+  executionVersion?: ExecutionVersion;
   address: AddressDetails;
   isRetry?: boolean;
   /** COD | card | ... — decides whether a card is needed at all. */

@@ -1,6 +1,6 @@
 import { connectDb } from "./db.js";
 import { config } from "./config.js";
-import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createRescheduleWorker, createSyncWorker, createUpdateWorker, getSyncQueue, LEGACY_QUEUE, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
+import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createRescheduleWorker, createSyncWorker, createUpdateWorker, getSyncQueue, HTTP_QUEUE, LEGACY_QUEUE, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
 import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
@@ -80,8 +80,16 @@ async function main() {
 
   const roles = rolesFromEnv();
   const classes = classesFromEnv();
+  // The HTTP engine's queue (High Speed COD): no Chrome per job, so tens at
+  // once per process. HTTP_CHECKOUT_CONCURRENCY=0 means this process takes none.
+  const httpEnv = Number(process.env.HTTP_CHECKOUT_CONCURRENCY);
+  const httpConcurrency = Number.isFinite(httpEnv) && httpEnv >= 0 ? Math.floor(httpEnv) : 25;
   const names: Array<readonly [string, number]> = roles.has("checkout")
-    ? [...classes.map((c) => [queueNameFor(c), concurrencyFor(c)] as const), [LEGACY_QUEUE, 1] as const]
+    ? [
+        ...classes.map((c) => [queueNameFor(c), concurrencyFor(c)] as const),
+        [LEGACY_QUEUE, 1] as const,
+        ...(httpConcurrency > 0 && classes.includes("cod") ? [[HTTP_QUEUE, httpConcurrency] as const] : []),
+      ]
     : [];
   for (const [name, concurrency] of [...names]) {
     const worker = createCheckoutWorker(name, concurrency, async (data) => {

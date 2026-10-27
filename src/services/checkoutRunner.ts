@@ -35,6 +35,8 @@ import { resolveLoggedInSession } from "./sessionStore.js";
 import { lockAccount } from "./accountLock.js";
 import { enqueueOrderSync } from "./orderSync.js";
 import { runPaymentPhase } from "./paymentPhase.js";
+import { runHttpCheckout } from "./httpCheckout.js";
+import { acquireChromeFallbackSlot } from "./chromeFallbackGate.js";
 import { FlipkartNetworkObserver } from "../automation/FlipkartNetworkObserver.js";
 import {
   CheckoutFailure,
@@ -508,6 +510,128 @@ async function runClaimedCheckoutJob(
   // is right — every job in this process uses the same proxy.
   if (egress) setNavigationTimeoutScale(Math.max(2, Number(process.env.NAV_TIMEOUT_SCALE || 1)));
 
+  // ── HTTP engine ("High Speed", COD) ──────────────────────────────────────
+  // The order is placed with Flipkart's own API calls (services/httpCheckout.ts)
+  // and no Chrome. Three of its four outcomes end the job right here; the
+  // fourth, "fallback", carries on into the page flow below exactly as a Chrome
+  // job would — behind a gate, so a burst of fallbacks cannot open more Chromes
+  // than this process can hold (HTTP_FALLBACK_CHROME_MAX).
+  let releaseChromeSlot: () => void = () => undefined;
+  if (data.executionVersion === "high_speed" && cls === "cod") {
+    const httpLog = (level: LogLevel, message: string, step?: string) => void appendLog(data.jobId, level, message, step);
+    const endHere = async () => {
+      await releaseEgress().catch(() => undefined);
+      const latest = await CheckoutJob.findById(data.jobId).select("status");
+      if (latest?.status === "cancelled") await releaseReservation();
+      await unlockAccount();
+      await settleBatchIfCancelling(data.batchId).catch(() => undefined);
+    };
+    let httpPayPressed = false;
+    const outcome = await runHttpCheckout({
+      cookies: session.cookies,
+      proxy: egress?.proxy ?? null,
+      productUrl: data.productUrl,
+      quantity: quantityPerOrder,
+      pincode: (data.address.checkoutPincode || data.address.pincode || ""),
+      address: data.address,
+      cartAmountLimit: data.cartAmountLimit,
+      deliverySlaDays: data.deliverySlaDays,
+      gstMandatory: data.gstMandatory ?? job.request?.gstMandatory ?? true,
+      dryRun: PAYMENT_DRY_RUN,
+      log: httpLog,
+      onBeforePay: async () => {
+        httpPayPressed = true;
+        await CheckoutJob.updateOne({ _id: data.jobId }, { $set: { paymentStartedAt: new Date() } });
+      },
+    });
+    const timing = Object.entries(outcome.timings).map(([k, v]) => `${k} ${v}ms`).join(" · ");
+    if (timing) httpLog("info", `[http] ${outcome.kind} · ${timing}`, "session");
+    if (egress && "exitIp" in outcome && outcome.exitIp) {
+      await recordProxyUse(egress.id, data.jobId, outcome.exitIp);
+      await patchResult(data.jobId, { egressProxy: egress.label, exitIp: outcome.exitIp });
+    } else if (outcome.kind !== "fallback") {
+      await patchResult(data.jobId, { egressProxy: egress ? egress.label : "direct" });
+    }
+
+    if (outcome.kind === "placed") {
+      await reporterFor(data.jobId)?.beforeTerminal();
+      job.status = "paid";
+      job.step = "paid";
+      job.completedAt = new Date();
+      await job.save();
+      await patchResult(data.jobId, {
+        flipkartOrderId: outcome.orderId,
+        flipkartReferenceId: outcome.referenceId,
+        ...(outcome.amount ? { transactionAmount: outcome.amount } : {}),
+        ...(outcome.paymentFee ? { paymentFee: outcome.paymentFee, paymentFeeDetails: outcome.paymentFee } : {}),
+        ...(outcome.details.orderStatus ? { orderStatus: outcome.details.orderStatus } : {}),
+        ...(outcome.details.sellerName ? { sellerName: outcome.details.sellerName } : {}),
+        ...(outcome.details.mrp ? { mrp: `₹${outcome.details.mrp}` } : {}),
+        ...(outcome.details.price ? { unitPrice: `₹${outcome.details.price}` } : {}),
+        ...(outcome.details.slaDays != null ? { promiseDays: outcome.details.slaDays, promiseDate: new Date(Date.now() + outcome.details.slaDays * 86_400_000) } : {}),
+        ...(outcome.checkoutTotal ? { cartAmount: `₹${outcome.checkoutTotal}` } : {}),
+        ...(outcome.deliveryText ? { deliveryText: outcome.deliveryText } : {}),
+        ...(outcome.deliveryDays != null ? { deliveryDays: outcome.deliveryDays } : {}),
+      });
+      reservationHeld = false;
+      const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
+      httpLog("info", `COD order placed (HTTP engine) — batch purchased ${progress.purchasedQuantity}/${totalQuantity}, attempts ${progress.attemptsUsed}/${totalAttempts}`, "paid");
+      await endHere();
+      return;
+    }
+    if (outcome.kind === "dry_run") {
+      await releaseReservation();
+      await refundBatchAttempt(data.batchId);
+      await reporterFor(data.jobId)?.beforeTerminal();
+      job.status = "dry_run";
+      job.step = "dry_run";
+      job.completedAt = new Date();
+      await job.save();
+      httpLog("warn", "DRY RUN — HTTP engine reached the payment token and stopped. No order was placed (PAYMENT_DRY_RUN=true on this worker).", "dry_run");
+      await endHere();
+      return;
+    }
+    if (outcome.kind === "fallback" && egress && !httpPayPressed && isProxyError(outcome.reason)) {
+      const retired = await reportProxyFailure(egress.id, outcome.reason.split("\n")[0]);
+      httpLog("warn", `[proxy] ${egress.label} failed in the HTTP engine: ${outcome.reason.slice(0, 200)}${retired ? " — marked DEAD" : ""}; attempt refunded, job re-queued`, "session");
+      await releaseReservation();
+      await refundBatchAttempt(data.batchId);
+      await requeueCheckoutJob(data, config.proxyWaitMs, `proxy ${egress.label} failed — PROXY_FAILED`);
+      await endHere();
+      return;
+    }
+    if (outcome.kind === "failed" && outcome.payUnknown) {
+      // Same parking as a worker that dies after Pay: the reservation stays,
+      // nothing is re-queued, the order sync looks the account up.
+      await reporterFor(data.jobId)?.beforeTerminal();
+      await CheckoutJob.updateOne(
+        { _id: data.jobId, status: { $ne: "cancelled" } },
+        { $set: { status: "needs_reconciliation", step: "needs_reconciliation", completedAt: new Date(), ...failureFields(outcome.failure) } }
+      );
+      httpLog("error", "Parked as needs_reconciliation — check My Orders for this account before doing anything with this job.", "needs_reconciliation");
+      reservationHeld = false;
+      await endHere();
+      return;
+    }
+    if (outcome.kind === "failed") {
+      const failure = outcome.failure;
+      httpLog("error", `${failure.display}: ${failure.details}`, failure.failedStep);
+      await reporterFor(data.jobId)?.beforeTerminal();
+      await CheckoutJob.updateOne(
+        { _id: data.jobId, status: { $ne: "cancelled" } },
+        { $set: { status: "failed", completedAt: new Date(), step: failure.failedStep, ...failureFields(failure) } }
+      );
+      await releaseReservation();
+      if (failure.noRetry) httpLog("info", `${failure.code} is a verdict on this platform ID — not re-queued; the batch continues with the next ID`, "batch");
+      else await maybeEnqueueRetry(data, job.userId, failure.failedStep, job.request);
+      await endHere();
+      return;
+    }
+    // fallback → the page flow, one Chrome slot at a time
+    httpLog("info", `[http] handing this order to the Chrome flow (${outcome.reason})`, "session");
+    releaseChromeSlot = await acquireChromeFallbackSlot();
+  }
+
   // One watcher across both legs — see testFlow for why.
   const apiWatcher = new FlipkartApiWatcher();
   const deskBrowser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
@@ -906,6 +1030,7 @@ async function runClaimedCheckoutJob(
     }
     await sleep(Math.min(config.keepBrowserOpenMs, 15000));
   } finally {
+    releaseChromeSlot();
     netObserver.dispose();
     await deskBrowser.close().catch(() => undefined);
     await mobBrowser?.close().catch(() => undefined);

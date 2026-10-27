@@ -47,6 +47,7 @@ export function requestSnapshot(data: NormalizedCreateJob): JobRequestSnapshot {
     finalAmountLimit: data.finalAmountLimit,
     dryRun: data.dryRun,
     gstMandatory: data.gstMandatory,
+    executionVersion: data.executionVersion,
     cards: maskCards(data.cards),
     totalQuantity: data.totalQuantity,
     quantityPerOrder: data.quantityPerOrder,

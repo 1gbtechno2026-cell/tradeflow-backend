@@ -212,7 +212,11 @@ async function maybeEnqueueRetry(
  * makes explicitly, not something that happens because a default flipped. Set
  * PAYMENT_DRY_RUN=false once the selectors land and you mean it.
  */
-const PAYMENT_DRY_RUN = process.env.PAYMENT_DRY_RUN !== "false";
+// Dry run ONLY when asked for explicitly. It used to be the default unless
+// PAYMENT_DRY_RUN=false was set — and a machine that forgot the variable (the
+// ops box, 2026-10-27) ran every order as a dry run while reporting "paid".
+const PAYMENT_DRY_RUN = String(process.env.PAYMENT_DRY_RUN || "").trim().toLowerCase() === "true";
+if (PAYMENT_DRY_RUN) console.warn("[checkout] PAYMENT_DRY_RUN=true — orders stop at the payment page and are recorded as dry_run, nothing is placed");
 
 /** Flipkart's E002 page. "Deliver to" present means a real checkout, not the error. */
 async function checkoutShowsE002(page: Page): Promise<boolean> {
@@ -776,7 +780,19 @@ async function runClaimedCheckoutJob(
         await CheckoutJob.updateOne({ _id: data.jobId }, { $set: { paymentStartedAt: new Date() } });
       },
     });
-    if (payment.attempted) {
+    if (payment.attempted && payment.ok && PAYMENT_DRY_RUN) {
+      // A dry run proves the plumbing up to the payment page. Nothing was
+      // clicked, so nothing was bought: the job ends as dry_run (never paid),
+      // the batch slot and the attempt go back, and the Orders tab says so.
+      await releaseReservation();
+      await refundBatchAttempt(data.batchId);
+      await reporterFor(data.jobId)?.beforeTerminal();
+      job.status = "dry_run";
+      job.step = "dry_run";
+      job.completedAt = new Date();
+      await job.save();
+      log("warn", "DRY RUN — reached the payment page and stopped. No order was placed (PAYMENT_DRY_RUN=true on this worker).", "dry_run");
+    } else if (payment.attempted) {
       if (!payment.ok) {
         // Which card the failed attempt went on, before the failure is recorded.
         if (payment.cardUsed) await patchResult(data.jobId, payment.cardUsed);

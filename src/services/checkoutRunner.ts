@@ -553,6 +553,22 @@ async function runClaimedCheckoutJob(
       await patchResult(data.jobId, { egressProxy: egress ? egress.label : "direct" });
     }
 
+    if (outcome.kind === "placed" && !outcome.confirmed) {
+      // Flipkart said SUCCESS and gave an id, but the account's My Orders does not
+      // list the order: it was dropped. Not a purchase — the batch slot goes back
+      // (the attempt stays used), the job is parked for a person / the order sync,
+      // which flips it to paid if the order shows up later after all.
+      await reporterFor(data.jobId)?.beforeTerminal();
+      await patchResult(data.jobId, { flipkartOrderId: outcome.orderId, flipkartReferenceId: outcome.referenceId, ...(outcome.amount ? { transactionAmount: outcome.amount } : {}) });
+      await CheckoutJob.updateOne(
+        { _id: data.jobId, status: { $ne: "cancelled" } },
+        { $set: { status: "needs_reconciliation", step: "needs_reconciliation", completedAt: new Date(), error: `Flipkart answered SUCCESS with ${outcome.orderId} but My Orders does not list it after ${Math.round(outcome.verifyMs / 1000)} s — order dropped by Flipkart; not counted as purchased`, errorCode: "ORDER_NOT_LISTED", errorCodeDisplay: "Order not listed by Flipkart" } }
+      );
+      await releaseReservation();
+      httpLog("error", `${outcome.orderId}: Flipkart dropped the order (not in My Orders after ${Math.round(outcome.verifyMs / 1000)} s) — slot returned to the batch, parked as needs_reconciliation`, "needs_reconciliation");
+      await endHere();
+      return;
+    }
     if (outcome.kind === "placed") {
       await reporterFor(data.jobId)?.beforeTerminal();
       job.status = "paid";

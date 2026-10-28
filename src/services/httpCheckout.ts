@@ -89,6 +89,12 @@ export interface HttpPlaced {
   kind: "placed";
   orderId: string;
   referenceId: string;
+  /** Flipkart's My Orders lists the order (checked after the pay call). false = the pay call said
+   *  SUCCESS and gave an id, but the account's My Orders does not show it: Flipkart dropped it. */
+  confirmed: boolean;
+  /** The status My Orders shows ("Approved", …) when confirmed; how long the check waited. */
+  listedStatus: string;
+  verifyMs: number;
   amount: string;
   paymentFee: string;
   checkoutTotal: number | null;
@@ -358,6 +364,41 @@ async function removeCartLines(rome: Rome, lines: Array<{ itemId: string; produc
   }, "cart remove");
 }
 
+/**
+ * After the pay call: is the order really there? Flipkart's payment answer
+ * says SUCCESS and hands out an order id even for orders its risk filter
+ * then drops (2026-10-28: 72 of 204 "paid" orders never appeared in My
+ * Orders). The account's My Orders list is the truth: poll it for up to
+ * VERIFY_WAIT_MS; an order that is listed is confirmed, with its status.
+ */
+const VERIFY_WAIT_MS = Math.max(10_000, Number(process.env.HTTP_VERIFY_WAIT_MS) || 90_000);
+const VERIFY_STEP_MS = 6_000;
+
+async function verifyPlaced(rome: Rome, orderId: string, log: HttpCheckoutInput["log"]): Promise<{ confirmed: boolean; listedStatus: string; verifyMs: number }> {
+  const short = shortOrderId(orderId);
+  const full = orderId;
+  const t0 = Date.now();
+  let tries = 0;
+  while (Date.now() - t0 < VERIFY_WAIT_MS) {
+    tries += 1;
+    try {
+      const page = await rome.get("/api/5/self-serve/orders/?page=1", "my orders");
+      const orders = findAll(page, (o) => typeof o.orderId === "string" && (String(o.orderId) === short || String(o.orderId) === full || `OD${String(o.orderId)}` === short));
+      if (orders.length) {
+        const o = orders[0];
+        const unitStatus = findAll(o, (x) => typeof x.status === "string" && String(x.status).length < 40)[0];
+        const status = String(unitStatus?.status || o.status || o.orderStatus || "listed");
+        return { confirmed: true, listedStatus: status, verifyMs: Date.now() - t0 };
+      }
+    } catch (err) {
+      log("warn", `[http] my orders check: ${err instanceof Error ? err.message.split("\n")[0].slice(0, 120) : String(err)}`, "verify");
+    }
+    await new Promise((r) => setTimeout(r, VERIFY_STEP_MS));
+  }
+  log("warn", `[http] ${orderId} is NOT in My Orders after ${Math.round((Date.now() - t0) / 1000)} s (${tries} checks) — Flipkart dropped the order`, "verify");
+  return { confirmed: false, listedStatus: "", verifyMs: Date.now() - t0 };
+}
+
 const VIEWCART_BODY = (pincode: string) => ({ pageUri: "/viewcart?exploreMode=TRUE&preference=FLIPKART", pageContext: { trackingContext: { context: { eVar61: "" } }, networkSpeed: 10000 }, locationContext: { pincode: Number(pincode), changed: false } });
 
 /** The cart's own lines (not the recommendations under them): pageContext.fdpTrackingData.marketplaceData[].items[]. */
@@ -621,8 +662,10 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
         /* the order exists regardless */
       }
       lap("confirmation");
-      log("info", `[http] COD order placed — ${orderId} · ₹${(paise / 100).toFixed(0)}${fee ? ` · ${fee}` : ""} · ${Date.now() - t0} ms end to end`, "paid");
-      return { kind: "placed", orderId, referenceId: shortOrderId(orderId), amount: paise ? `₹${(paise / 100).toFixed(2)}` : "", paymentFee: fee, checkoutTotal: totalCost, deliveryDays, deliveryText, exitIp, details, timings };
+      const verify = await verifyPlaced(rome, orderId, log);
+      lap("verify");
+      if (verify.confirmed) log("info", `[http] COD order placed — ${orderId} · ₹${(paise / 100).toFixed(0)}${fee ? ` · ${fee}` : ""} · My Orders: ${verify.listedStatus} after ${verify.verifyMs} ms · ${Date.now() - t0} ms end to end`, "paid");
+      return { kind: "placed", orderId, referenceId: shortOrderId(orderId), confirmed: verify.confirmed, listedStatus: verify.listedStatus, verifyMs: verify.verifyMs, amount: paise ? `₹${(paise / 100).toFixed(2)}` : "", paymentFee: fee, checkoutTotal: totalCost, deliveryDays, deliveryText, exitIp, details: { ...details, orderStatus: details.orderStatus || verify.listedStatus || undefined }, timings };
     }
     const message = String(findKey(payJson, "default_text") || findKey(payJson, "message") || payText.slice(0, 200));
     if (payStatus === 401 || payStatus === 403 || payStatus === 429) throw new Fallback(`pay answered ${payStatus} — challenge`);

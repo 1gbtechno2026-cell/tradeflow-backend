@@ -36,7 +36,36 @@ function toIstIso(value?: Date | string | null): string | null {
  * fetch/update services once approved) decides what to do with it.
  */
 
-const API_HOST = "https://2.rome.api.flipkart.com";
+/**
+ * Flipkart pins every account to a data centre and names it in the host
+ * prefix (1.rome… / 2.rome…). A call on the wrong prefix answers
+ * 406 {"ERROR_MESSAGE":"DC Change","RESPONSE":{"id":"1"}}. The prefix is kept
+ * per session and switched on that answer — until 2026-10-28 it was fixed to
+ * "2", and every DC-1 account's order sync failed with "answered HTTP 406".
+ */
+const DEFAULT_DC = "2";
+const sessionDc = new WeakMap<APIRequestContext, string>();
+const romeHost = (ctx: APIRequestContext) => `https://${sessionDc.get(ctx) || DEFAULT_DC}.rome.api.flipkart.com`;
+
+/** Run a rome call; on "DC Change" switch this session's prefix and run it once more. */
+async function romeCall<T extends { status(): number; text(): Promise<string> }>(ctx: APIRequestContext, call: (host: string) => Promise<T>): Promise<{ res: T; text: string }> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await call(romeHost(ctx));
+    const text = await res.text();
+    if (res.status() === 406 && /DC Change/i.test(text)) {
+      const id = text.match(/"id"\s*:\s*"(\d+)"/)?.[1];
+      if (id && id !== sessionDc.get(ctx)) {
+        sessionDc.set(ctx, id);
+        continue;
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      continue;
+    }
+    return { res, text };
+  }
+  const res = await call(romeHost(ctx));
+  return { res, text: await res.text() };
+}
 const DESKTOP_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -176,6 +205,15 @@ async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 3): 
   throw lastErr;
 }
 
+function parseJsonOrThrow(res: { ok(): boolean; status(): number; url(): string }, text: string): unknown {
+  if (!res.ok()) throw new OrderApiError(`${res.url().split("?")[0]} answered HTTP ${res.status()}`, res.status(), text.slice(0, 300));
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new OrderApiSessionError(`${res.url().split("?")[0]} did not answer JSON — the session is probably not logged in`);
+  }
+}
+
 async function readJson(res: { ok(): boolean; status(): number; text(): Promise<string>; url(): string }): Promise<unknown> {
   const text = await res.text();
   if (!res.ok()) {
@@ -198,10 +236,7 @@ export async function fetchOrderList(
   const qs = new URLSearchParams({ page: String(page) });
   for (const p of nextCallParams) qs.set(p.key, p.value);
   const started = Date.now();
-  const { res, text } = await withRetry(`list page ${page}`, async () => {
-    const r = await ctx.get(`${API_HOST}/api/5/self-serve/orders/?${qs.toString()}`);
-    return { res: r, text: await r.text() };
-  });
+  const { res, text } = await withRetry(`list page ${page}`, () => romeCall(ctx, (host) => ctx.get(`${host}/api/5/self-serve/orders/?${qs.toString()}`)));
   if (!res.ok()) throw new OrderApiError(`order list answered HTTP ${res.status()}`, res.status(), text.slice(0, 300));
   let json: { RESPONSE?: { multipleOrderDetailsView?: { orders?: ApiOrder[]; moreOrder?: boolean; nextCallParams?: Array<{ key: string; value: string }> } } };
   try {
@@ -236,7 +271,7 @@ export interface OrderDetailsResult {
  */
 export async function fetchOrderDetails(ctx: APIRequestContext, orderId: string, unitId: string): Promise<OrderDetailsResult> {
   const started = Date.now();
-  const res = await withRetry(`details ${orderId}/${unitId}`, () => ctx.post(`${API_HOST}/api/4/page/fetch`, {
+  const { res, text: detailText } = await withRetry(`details ${orderId}/${unitId}`, () => romeCall(ctx, (host) => ctx.post(`${host}/api/4/page/fetch`, {
     data: {
       requestContext: { type: "CX_ORDER_DETAIL_PAGE", orderId, unitId, pageView: "", businessCategory: "" },
       pageType: "CX_ORDER_DETAIL_PAGE",
@@ -254,8 +289,8 @@ export async function fetchOrderDetails(ctx: APIRequestContext, orderId: string,
         fetchSeoData: false,
       },
     },
-  }));
-  const raw = await readJson(res);
+  })));
+  const raw = parseJsonOrThrow(res, detailText);
   const orderView = orderViewFromPageFetch(raw);
   if (!orderView) {
     throw new OrderApiError(`order details for ${orderId}/${unitId} carried neither DUMMY_CARD_WIDGET nor ORDER_SUMMARY_WIDGET_CX`, 200);

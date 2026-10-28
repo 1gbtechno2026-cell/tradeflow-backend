@@ -19,6 +19,7 @@
     "test:classify": "tsx src/scripts/classifyTest.ts",
     "test:proxy-pool": "tsx src/scripts/proxyPoolTest.ts",
     "orders:replay": "tsx src/scripts/replayOrderTrace.ts",
+    "orders:resync-recent": "tsx src/scripts/resyncRecent.ts",
     "bench:http": "tsx src/scripts/httpCheckoutBench.ts"
   },
   "dependencies": {

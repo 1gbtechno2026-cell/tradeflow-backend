@@ -630,6 +630,15 @@ async function runClaimedCheckoutJob(
     // fallback → the page flow, one Chrome slot at a time
     httpLog("info", `[http] handing this order to the Chrome flow (${outcome.reason})`, "session");
     releaseChromeSlot = await acquireChromeFallbackSlot();
+    // The wait at the gate can be long; a batch cancelled meanwhile must not open Chrome.
+    const latestAfterWait = await CheckoutJob.findById(data.jobId).select("status");
+    if (latestAfterWait?.status === "cancelled") {
+      releaseChromeSlot();
+      httpLog("info", "Cancelled while waiting for a Chrome slot — not opened", "cancelled");
+      await releaseReservation();
+      await endHere();
+      return;
+    }
   }
 
   // One watcher across both legs — see testFlow for why.

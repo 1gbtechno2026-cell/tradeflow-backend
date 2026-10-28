@@ -138,6 +138,21 @@ export function parseProductIds(productUrl: string): { pid: string; lid: string 
   }
 }
 
+/** pid + lid from the product page's `window.__INITIAL_STATE__` (plain GET, no cookies). */
+export async function resolveProductIds(productUrl: string, proxy?: HttpProxy | null): Promise<{ pid: string; lid: string } | null> {
+  const ctx = await playwrightRequest.newContext({ ...(proxy ? { proxy } : {}), extraHTTPHeaders: { "user-agent": UA, accept: "text/html,*/*" }, timeout: 20_000 });
+  try {
+    const res = await ctx.get(productUrl);
+    if (res.status() !== 200) return null;
+    const html = await res.text();
+    const pid = html.match(/"productId":"([A-Z0-9]{16})"/)?.[1] || html.match(/[?&]pid=([A-Z0-9]{16})/)?.[1] || "";
+    const lid = html.match(/"listingId":"(LST[A-Z0-9]{16,})"/)?.[1] || html.match(/[?&]lid=(LST[A-Z0-9]{16,})/)?.[1] || "";
+    return pid && lid ? { pid: pid.toUpperCase(), lid: lid.toUpperCase() } : null;
+  } finally {
+    await ctx.dispose().catch(() => undefined);
+  }
+}
+
 async function newSession(cookies: unknown[], proxy?: HttpProxy | null): Promise<APIRequestContext> {
   const mapped = mapPlaywrightCookies(cookies);
   if (!mapped.length) throw new CheckoutFailure("SESSION_EXPIRED", "Saved Flipkart session has no usable cookies");
@@ -368,8 +383,14 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
     mark = now;
   };
   const log = input.log;
-  const ids = parseProductIds(input.productUrl);
-  if (!ids) return { kind: "fallback", reason: "product URL has no pid/lid — the page flow resolves the listing", timings };
+  let ids = parseProductIds(input.productUrl);
+  if (!ids) {
+    // A short Flipkart URL (no ?pid=&lid=): the product page HTML carries both in its
+    // embedded state (pageContext.productId / listingId) — one GET, same proxy.
+    ids = await resolveProductIds(input.productUrl, input.proxy).catch(() => null);
+    if (ids) log("info", `[http] resolved listing from the product page: pid ${ids.pid} lid ${ids.lid}`, "product");
+  }
+  if (!ids) return { kind: "fallback", reason: "product URL has no pid/lid and the product page did not reveal them — the page flow resolves the listing", timings };
   const pincode = String(input.pincode || "").replace(/\D/g, "").slice(-6);
   if (pincode.length !== 6) return { kind: "fallback", reason: "no 6-digit pincode on the job", timings };
 

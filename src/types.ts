@@ -148,6 +148,16 @@ export interface JobResultSnapshot {
    *  "direct") and the public address Flipkart saw. */
   egressProxy?: string;
   exitIp?: string;
+  /** HTTP engine: whether My Orders listed the order when checked. false = Flipkart
+   *  said SUCCESS and gave an id but had not listed it yet (it can take hours —
+   *  2026-10-28: 171 of 173 such orders appeared later); the order sync keeps
+   *  checking and flips this to true, or parks the job if it never appears. */
+  listed?: boolean;
+  /** The status My Orders showed ("Approved", …), "pending" while unlisted, "not_listed" when given up on. */
+  listedStatus?: string;
+  listingCheckedAt?: Date | null;
+  /** Set when a person or the reconcile script flipped the job to paid after the fact. */
+  reconciledAt?: Date | null;
 }
 
 export interface CheckoutJobData {

@@ -5,6 +5,7 @@ import { CheckoutJob } from "../models/CheckoutJob.js";
 import { getSyncQueue, SYNC_QUEUE, type SyncJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
 import { openOrderApiSession } from "./orderApi.js";
+import { releaseBatchReservation } from "./batchCounters.js";
 import { walkOrderList } from "./orderApiSync.js";
 import { apiScrapeAndSave, fallbackUnitId, orderDetailsUrl, type OrderAccount, type OrderUnitCard } from "./orderFetch.js";
 import { claimProxyForWorker } from "./proxyPool.js";
@@ -34,6 +35,9 @@ import { resolveLoggedInSession } from "./sessionStore.js";
  */
 
 const TERMINAL = ["paid", "failed", "needs_reconciliation"];
+/** Listing-pending orders (result.listed === false): how often and how many times the sync asks My Orders before giving up (default every 20 min, 25 times ≈ 8 h). */
+const LISTING_RETRY_MS = Number(process.env.SYNC_LISTING_RETRY_MS || 20 * 60 * 1000);
+const LISTING_ATTEMPTS = Number(process.env.SYNC_LISTING_ATTEMPTS || 25);
 /** The account is busy with a checkout, cancel or another sync. */
 const LOCK_RETRY_MS = 30_000;
 const SWEEP_GRACE_MS = Number(process.env.SYNC_SWEEP_GRACE_MS || 5 * 60 * 1000);
@@ -50,7 +54,9 @@ type SyncableJob = {
   productUrl: string;
   paymentStartedAt?: Date | null;
   startedAt?: Date | null;
-  result?: { flipkartOrderId?: string };
+  batchId?: string;
+  quantity?: number;
+  result?: { flipkartOrderId?: string; listed?: boolean };
 };
 
 function syncKind(job: SyncableJob): "order" | "discover" | "skip" {
@@ -63,9 +69,13 @@ function syncKind(job: SyncableJob): "order" | "discover" | "skip" {
 export async function enqueueOrderSync(checkoutJobId: string): Promise<void> {
   try {
     const job = await CheckoutJob.findById(checkoutJobId)
-      .select("status paymentStartedAt result.flipkartOrderId orderSync.status")
+      .select("status paymentStartedAt result.flipkartOrderId result.listed orderSync.status")
       .lean<SyncableJob & { orderSync?: { status?: string } }>();
     if (!job || !TERMINAL.includes(job.status) || job.orderSync?.status === "done") return;
+    // An order Flipkart confirmed but had not listed when the engine checked can
+    // take hours to show up in My Orders (2026-10-28: 171 of 173 did). Keep
+    // asking every LISTING_RETRY_MS; only the final failure parks the job.
+    const opts = job.result?.listed === false ? { attempts: LISTING_ATTEMPTS, backoff: { type: "fixed" as const, delay: LISTING_RETRY_MS } } : {};
     if (syncKind(job) === "skip") {
       await CheckoutJob.updateOne(
         { _id: checkoutJobId },
@@ -79,7 +89,7 @@ export async function enqueueOrderSync(checkoutJobId: string): Promise<void> {
     );
     // jobId = the checkout job: while one sync for it is queued, delayed or
     // running, adding it again does nothing.
-    await getSyncQueue().add("sync", { checkoutJobId }, { jobId: `sync-${checkoutJobId}` });
+    await getSyncQueue().add("sync", { checkoutJobId }, { jobId: `sync-${checkoutJobId}`, ...opts });
   } catch (err) {
     // The sweep picks it up.
     console.warn(`[order-sync] could not queue ${checkoutJobId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -97,11 +107,12 @@ function pidOf(productUrl: string): string {
 export async function runOrderSyncJob(job: Job<SyncJobData>, token: string | undefined): Promise<void> {
   const { checkoutJobId } = job.data;
   const cj = await CheckoutJob.findById(checkoutJobId)
-    .select("userId email status productUrl paymentStartedAt startedAt result.flipkartOrderId orderSync")
+    .select("userId email status productUrl paymentStartedAt startedAt batchId quantity result.flipkartOrderId result.listed orderSync")
     .lean<SyncableJob>();
   if (!cj) return;
   const kind = syncKind(cj);
   if (kind === "skip") return;
+  const listingPending = kind === "order" && cj.result?.listed === false && cj.status === "paid";
 
   const unlock = await lockAccount(cj.email, `sync:${checkoutJobId}:${config.workerId}`, 5 * 60 * 1000);
   if (!unlock) {
@@ -125,10 +136,12 @@ export async function runOrderSyncJob(job: Job<SyncJobData>, token: string | und
     try {
       const saved = new Set<string>();
       const orderIds = new Set<string>();
+      let listedStatus = "";
       const syncOrder = async (card: OrderUnitCard) => {
         const first = await apiScrapeAndSave(ctx, cj.userId, account, card, { applyCalendar: false });
         saved.add(card.unitId);
         orderIds.add(card.orderId);
+        if (!listedStatus && first.statusKey && first.statusKey !== "unknown") listedStatus = first.statusKey;
         // The order view lists every unit of the order: a multi-unit order is
         // saved whole from one known unit.
         for (const unitId of first.siblingUnitIds || []) {
@@ -193,10 +206,14 @@ export async function runOrderSyncJob(job: Job<SyncJobData>, token: string | und
             "orderSync.orderIds": [...orderIds],
             "orderSync.units": saved.size,
             "orderSync.syncedAt": new Date(),
+            ...(listingPending ? { "result.listed": true, "result.listedStatus": listedStatus || "listed", "result.listingCheckedAt": new Date() } : {}),
           },
+          ...(listingPending
+            ? { $push: { logs: { at: new Date(), level: "info", step: "order-sync", message: `My Orders now lists ${cj.result?.flipkartOrderId} (${listedStatus || "listed"}) — ${Math.round((Date.now() - new Date(cj.paymentStartedAt || cj.startedAt || Date.now()).getTime()) / 60000)} min after Pay` } } }
+            : {}),
         }
       );
-      console.log(`${tag} synced ${saved.size} unit(s)${orderIds.size ? ` of ${[...orderIds].join(", ")}` : " — no order on Flipkart for this attempt"}`);
+      console.log(`${tag} synced ${saved.size} unit(s)${orderIds.size ? ` of ${[...orderIds].join(", ")}` : " — no order on Flipkart for this attempt"}${listingPending ? " · listing confirmed" : ""}`);
     } finally {
       await ctx.dispose().catch(() => undefined);
     }
@@ -207,6 +224,28 @@ export async function runOrderSyncJob(job: Job<SyncJobData>, token: string | und
       { _id: checkoutJobId },
       { $set: { "orderSync.status": final ? "failed" : "pending", "orderSync.lastError": message } }
     );
+    if (final && listingPending) {
+      // Hours of asking and My Orders still has nothing: now it counts as dropped.
+      // The units come off the batch here, not at placement time.
+      const hours = Math.round((Date.now() - new Date(cj.paymentStartedAt || cj.startedAt || Date.now()).getTime()) / 36e5);
+      await CheckoutJob.updateOne(
+        { _id: checkoutJobId, status: "paid" },
+        {
+          $set: {
+            status: "needs_reconciliation",
+            step: "needs_reconciliation",
+            error: `Flipkart answered SUCCESS with ${cj.result?.flipkartOrderId} but My Orders still does not list it after ${hours} h (${attempt} checks) — order dropped by Flipkart; not counted as purchased`,
+            errorCode: "ORDER_NOT_LISTED",
+            errorCodeDisplay: "Order not listed by Flipkart",
+            "result.listedStatus": "not_listed",
+            "result.listingCheckedAt": new Date(),
+          },
+          $push: { logs: { at: new Date(), level: "error", step: "order-sync", message: `Not in My Orders after ${hours} h and ${attempt} checks — parked as needs_reconciliation, ${cj.quantity || 1} unit(s) returned to the batch` } },
+        }
+      );
+      if (cj.batchId) await releaseBatchReservation(cj.batchId, cj.quantity || 1).catch(() => undefined);
+      console.warn(`${tag} listing never appeared after ${attempt} checks — parked as needs_reconciliation`);
+    }
     console.warn(`${tag} attempt ${attempt} failed${final ? " (giving up)" : ", will retry"}: ${message}`);
     throw err;
   } finally {

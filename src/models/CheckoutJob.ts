@@ -225,6 +225,11 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       // public address Flipkart saw. "direct" when no proxy was used.
       egressProxy: { type: String, default: "" },
       exitIp: { type: String, default: "" },
+      // HTTP engine: My Orders listing state (see JobResultSnapshot.listed).
+      listed: { type: Boolean },
+      listedStatus: { type: String, default: "" },
+      listingCheckedAt: { type: Date, default: null },
+      reconciledAt: { type: Date, default: null },
     },
     logs: { type: [JobLogSchema], default: [] },
     bullmqJobId: { type: String },

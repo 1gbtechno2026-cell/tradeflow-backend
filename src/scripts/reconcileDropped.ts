@@ -108,8 +108,9 @@ async function main() {
             errorCodeDisplay: "",
             errorSource: "",
             errorStage: "",
-            "result.confirmed": true,
+            "result.listed": true,
             "result.listedStatus": hit.status,
+            "result.listingCheckedAt": new Date(),
             "result.reconciledAt": new Date(),
           },
           $push: {

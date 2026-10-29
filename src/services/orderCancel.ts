@@ -456,9 +456,52 @@ export async function getCancelRequest(userId: string, requestId: string) {
   return row ? publicRequest(row) : null;
 }
 
+/**
+ * The Cancellations list. Counts are computed in the database: the newest 50
+ * requests carry 11,000 unit entries (10 MB) between them, and loading those
+ * just to count statuses took 40 s. The arrays themselves come from
+ * getCancelRequest (one request) when a row is opened.
+ */
 export async function listCancelRequests(userId: string, limit = 20) {
-  const rows = await CancelRequest.find({ userId }).sort({ createdAt: -1 }).limit(Math.min(100, Math.max(1, limit))).lean();
-  return rows.map(publicRequest);
+  const n = (status: string, field = "units") => ({ $size: { $filter: { input: { $ifNull: [`$${field}`, []] }, as: "x", cond: { $eq: ["$$x.status", status] } } } });
+  const rows = await CancelRequest.aggregate<{
+    _id: unknown; type: string; dryRun?: boolean; urgent?: boolean; createdBy?: string; retryOf?: string; status: string; createdAt?: Date; finishedAt?: Date | null;
+    total: number; queued: number; running: number; cancelled: number; notCancellable: number; failed: number; dryRunUnits: number; rejected: number;
+    ordersTotal: number; ordersQueued: number; ordersRunning: number; ordersRead: number; ordersFailed: number;
+  }>([
+    { $match: { userId } },
+    { $sort: { createdAt: -1 } },
+    { $limit: Math.min(100, Math.max(1, limit)) },
+    {
+      $project: {
+        type: 1, dryRun: 1, urgent: 1, createdBy: 1, retryOf: 1, status: 1, createdAt: 1, finishedAt: 1,
+        total: { $size: { $ifNull: ["$units", []] } },
+        queued: n("queued"), running: n("running"), cancelled: n("cancelled"), notCancellable: n("not_cancellable"), failed: n("failed"), dryRunUnits: n("dry_run"),
+        rejected: { $size: { $ifNull: ["$rejected", []] } },
+        ordersTotal: { $size: { $ifNull: ["$orders", []] } },
+        ordersQueued: n("queued", "orders"), ordersRunning: n("running", "orders"), ordersRead: n("read", "orders"), ordersFailed: n("failed", "orders"),
+      },
+    },
+  ]);
+  return rows.map((r) => ({
+    id: String(r._id),
+    type: r.type,
+    dryRun: Boolean(r.dryRun),
+    urgent: Boolean(r.urgent),
+    createdBy: r.createdBy || "",
+    retryOf: r.retryOf || "",
+    status: r.status,
+    createdAt: r.createdAt ?? null,
+    finishedAt: r.finishedAt ?? null,
+    counts: {
+      total: r.total, queued: r.queued, running: r.running, cancelled: r.cancelled, notCancellable: r.notCancellable, failed: r.failed, dryRun: r.dryRunUnits, rejected: r.rejected,
+      ordersTotal: r.ordersTotal, ordersQueued: r.ordersQueued + r.ordersRunning, ordersRead: r.ordersRead, ordersFailed: r.ordersFailed,
+    },
+    // The arrays are on GET /api/orders/cancel/:id — the list only shows counts.
+    units: [] as ICancelUnit[],
+    orders: [] as ICancelOrder[],
+    rejected: [] as Array<{ id: string; reason: string }>,
+  }));
 }
 
 export function publicRequest(r: {

@@ -20,6 +20,7 @@
     "test:proxy-pool": "tsx src/scripts/proxyPoolTest.ts",
     "orders:replay": "tsx src/scripts/replayOrderTrace.ts",
     "orders:resync-recent": "tsx src/scripts/resyncRecent.ts",
+    "orders:reconcile-dropped": "tsx src/scripts/reconcileDropped.ts",
     "bench:http": "tsx src/scripts/httpCheckoutBench.ts"
   },
   "dependencies": {

@@ -13,6 +13,8 @@ import { requestSnapshot } from "../services/orderSnapshot.js";
 import { resolveAddress, resolveLoggedInSession, workspaceUserId } from "../services/sessionStore.js";
 import { toCardDetails } from "../services/paymentCards.js";
 import { resyncCheckoutJob } from "../services/orderSync.js";
+import { batchSummary, listBatches } from "../services/batchList.js";
+import { containsRegex, listParam, paginationMeta, parseDateRange, parsePagination, rangeFilter } from "../services/listFilters.js";
 import type { AuthType } from "../paymentStrategies/types.js";
 import type { AddressDetails, JobRequestSnapshot, JobResultSnapshot } from "../types.js";
 
@@ -330,29 +332,98 @@ jobsRouter.post("/", async (req, res) => {
   }
 });
 
+/**
+ * The orders listing ("All Orders"). Paged and filtered on the server:
+ *   page, page_size (≤ 500)            default 100 per page; `limit` alone still works as page 1
+ *   range_mode / range_key / start / end   see services/listFilters.ts
+ *   status=a,b   platform=FLIPKART   batchId=x,y   email=<contains>   product=<contains>
+ *   orderId=OD…,OD…   (Flipkart order id or the Trade Flow id)
+ *   system=mine|all|<id>   ordering=-created_at|-updated_at|created_at
+ */
 jobsRouter.get("/", async (req, res) => {
   const userId = workspaceUserId();
-  const status = String(req.query.status || "").trim();
-  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 80));
+  const q = req.query as Record<string, unknown>;
   const filter: Record<string, unknown> = { userId };
-  if (status) filter.status = status;
+  const statuses = listParam(q, "status");
+  if (statuses.length) filter.status = statuses.length === 1 ? statuses[0] : { $in: statuses };
   // ?system=mine → only this deployment's jobs (pre-systemId rows count as ours); ?system=<id> → that one; default all.
-  const system = String(req.query.system || "").trim();
+  const system = String(q.system || "").trim();
   if (system === "mine") filter.systemId = { $in: [config.systemId, "", null] };
   else if (system && system !== "all") filter.systemId = system;
+  const range = parseDateRange(q);
+  const created = rangeFilter(range);
+  if (created) filter.createdAt = created;
+  const batchIds = listParam(q, "batchId");
+  if (batchIds.length) filter.batchId = batchIds.length === 1 ? batchIds[0] : { $in: batchIds };
+  const email = String(q.email || "").trim();
+  if (email) filter.email = containsRegex(email);
+  const platforms = listParam(q, "platform").map((p) => p.toUpperCase());
+  const and: Record<string, unknown>[] = [];
+  if (platforms.length) {
+    and.push(
+      platforms.includes("FLIPKART")
+        ? { $or: [{ "request.platform": { $in: platforms } }, { "request.platform": { $exists: false } }, { "request.platform": "" }] }
+        : { "request.platform": { $in: platforms } }
+    );
+  }
+  const orderIds = listParam(q, "orderId").map((s) => s.toUpperCase());
+  if (orderIds.length) {
+    const objectIds = orderIds.map((s) => s.toLowerCase()).filter((s) => /^[0-9a-f]{24}$/.test(s));
+    and.push({
+      $or: [
+        { "result.flipkartOrderId": { $in: orderIds } },
+        { "result.flipkartReferenceId": { $in: orderIds } },
+        ...(objectIds.length ? [{ _id: { $in: objectIds } }] : []),
+      ],
+    });
+  }
+  const product = String(q.product || "").trim();
+  if (product) {
+    const rx = containsRegex(product);
+    and.push({ $or: [{ "result.productName": rx }, { "product.model": rx }, { productUrl: rx }] });
+  }
+  if (and.length) filter.$and = and;
+
+  const page = parsePagination(q, { pageSize: q.page === undefined && q.page_size === undefined ? 80 : 100, maxPageSize: 500 });
+  const ordering = String(q.ordering || "-created_at");
+  const sort: Record<string, 1 | -1> =
+    ordering === "created_at" ? { createdAt: 1 } : ordering === "-updated_at" ? { updatedAt: -1 } : ordering === "-started_at" ? { startedAt: -1 } : { createdAt: -1 };
+
   // Omit logs on list — unbounded log arrays OOM the API under jobs-proxy polling.
-  const rows = await CheckoutJob.find(filter)
-    .select("-logs")
-    .sort({ createdAt: -1 })
-    .limit(limit)
-    .lean();
-  const grouped = await CheckoutJob.aggregate([
-    { $match: { userId } },
-    { $group: { _id: "$status", n: { $sum: 1 } } },
+  const [rows, count, grouped] = await Promise.all([
+    CheckoutJob.find(filter).select("-logs").sort(sort).skip(page.skip).limit(page.pageSize).lean(),
+    CheckoutJob.countDocuments(filter),
+    CheckoutJob.aggregate([{ $match: { userId } }, { $group: { _id: "$status", n: { $sum: 1 } } }]),
   ]);
   const counts: Record<string, number> = {};
   for (const row of grouped) counts[String(row._id)] = row.n;
-  res.json({ jobs: await attachBatches(rows.map(publicJob)), counts, total: rows.length, systemId: config.systemId });
+  res.json({
+    jobs: await attachBatches(rows.map(publicJob)),
+    counts,
+    total: count,
+    pagination: paginationMeta(count, page),
+    range: { mode: range.mode, key: range.key, from: range.from, to: range.to },
+    systemId: config.systemId,
+  });
+});
+
+/** The "Bulk Orders" listing: one row per batch, paged and filtered on the server (services/batchList.ts). */
+jobsRouter.get("/batches", async (req, res) => {
+  try {
+    res.json(await listBatches(workspaceUserId(), req.query as Record<string, unknown>, config.systemId));
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Could not list batches" });
+  }
+});
+
+/** One batch's configuration (the request it was placed with) and its failure breakdown. */
+jobsRouter.get("/batch/:batchId/summary", async (req, res) => {
+  const summary = await batchSummary(req.params.batchId);
+  if (!summary) {
+    res.status(404).json({ error: "Batch not found" });
+    return;
+  }
+  res.json(summary);
 });
 
 // ── Batch-level cancel ──────────────────────────────────────────────────────

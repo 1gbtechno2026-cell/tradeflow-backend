@@ -73,5 +73,7 @@ const CheckoutBatchSchema = new Schema<ICheckoutBatch>(
   },
   { timestamps: true, collection: "tradeflowbatches" }
 );
+// Backs the Orders tab's Bulk Orders listing: a workspace's batches newest first within a date range.
+CheckoutBatchSchema.index({ userId: 1, createdAt: -1 });
 
 export const CheckoutBatch = mongoose.model<ICheckoutBatch>("CheckoutBatch", CheckoutBatchSchema);

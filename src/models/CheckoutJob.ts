@@ -268,5 +268,8 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
 CheckoutJobSchema.index({ status: 1, heartbeatAt: 1 });
 // Backs the order-sync sweep: finished jobs whose order has not reached Order Units.
 CheckoutJobSchema.index({ "orderSync.status": 1, completedAt: 1 });
+// Backs the Orders tab: a workspace's jobs newest first within a date range, and one batch's jobs in order.
+CheckoutJobSchema.index({ userId: 1, createdAt: -1 });
+CheckoutJobSchema.index({ batchId: 1, createdAt: 1 });
 
 export const CheckoutJob = mongoose.model<ICheckoutJob>("CheckoutJob", CheckoutJobSchema);

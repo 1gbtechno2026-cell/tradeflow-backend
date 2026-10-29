@@ -353,8 +353,10 @@ jobsRouter.get("/", async (req, res) => {
   const range = parseDateRange(q);
   const created = rangeFilter(range);
   if (created) filter.createdAt = created;
-  const batchIds = listParam(q, "batchId");
-  if (batchIds.length) filter.batchId = batchIds.length === 1 ? batchIds[0] : { $in: batchIds };
+  const batchIds = listParam(q, "batchId").map((s) => s.replace(/^#/, ""));
+  // A single short value is a prefix typed by hand ("#1fcd5ced"); full ids match exactly.
+  if (batchIds.length === 1 && batchIds[0].length < 36) filter.batchId = new RegExp(`^${batchIds[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i");
+  else if (batchIds.length) filter.batchId = batchIds.length === 1 ? batchIds[0] : { $in: batchIds };
   const email = String(q.email || "").trim();
   if (email) filter.email = containsRegex(email);
   const platforms = listParam(q, "platform").map((p) => p.toUpperCase());
@@ -382,7 +384,55 @@ jobsRouter.get("/", async (req, res) => {
     const rx = containsRegex(product);
     and.push({ $or: [{ "result.productName": rx }, { "product.model": rx }, { productUrl: rx }] });
   }
+  // Advanced filters (the reference UI's second filter row).
+  const stage = String(q.stage || "").trim();
+  if (stage) and.push({ $or: [{ errorStage: stage }, { failedStep: stage }] });
+  const errorCodes = listParam(q, "errorCode");
+  if (errorCodes.length) filter.errorCode = { $in: errorCodes };
+  const cardName = String(q.cardName || "").trim();
+  if (cardName) {
+    const rx = containsRegex(cardName);
+    and.push({ $or: [{ "result.cardName": rx }, { "request.cards.name": rx }] });
+  }
+  const cardLast4 = String(q.cardNumber || "").replace(/\D/g, "").slice(-4);
+  if (cardLast4) {
+    const rx = new RegExp(`${cardLast4}$`);
+    and.push({ $or: [{ "result.childCardLast4": rx }, { "result.cardLast4": rx }, { "result.parentCardLast4": rx }, { "request.cards.cardNumberMasked": rx }, { "request.cards.parentCardNumberMasked": rx }] });
+  }
+  const employeeIds = listParam(q, "employeeId");
+  if (employeeIds.length) filter["result.employeeId"] = { $in: employeeIds };
+  const cartAmount = String(q.cartAmount || "").replace(/[₹,\s]/g, "");
+  if (cartAmount && /^\d+(\.\d+)?$/.test(cartAmount)) {
+    const n = Math.round(Number(cartAmount));
+    const rx = new RegExp(`^₹?\\s?(${n.toLocaleString("en-IN")}|${n})(\\.\\d{1,2})?$`);
+    and.push({ $or: [{ "result.cartAmount": rx }, { "result.transactionAmount": rx }, { "result.cartAfterCardOffer": rx }] });
+  }
   if (and.length) filter.$and = and;
+
+  // ?with_meta=1 → the choices the advanced filters offer (error codes and stages seen on this workspace's jobs).
+  const metadata =
+    String(q.with_meta || "") === "1"
+      ? await (async () => {
+          const [codes, stages] = await Promise.all([
+            CheckoutJob.aggregate<{ _id: { code: string; display: string }; n: number }>([
+              { $match: { userId, errorCode: { $nin: ["", null] } } },
+              { $group: { _id: { code: "$errorCode", display: { $ifNull: ["$errorCodeDisplay", ""] } }, n: { $sum: 1 } } },
+              { $sort: { n: -1 } },
+              { $limit: 60 },
+            ]),
+            CheckoutJob.aggregate<{ _id: string; n: number }>([
+              { $match: { userId, $or: [{ errorStage: { $nin: ["", null] } }, { failedStep: { $nin: ["", null] } }] } },
+              { $group: { _id: { $ifNull: ["$errorStage", "$failedStep"] }, n: { $sum: 1 } } },
+              { $sort: { n: -1 } },
+              { $limit: 40 },
+            ]),
+          ]);
+          return {
+            error_codes: codes.map((c) => ({ value: c._id.code, label: c._id.display || c._id.code, n: c.n })),
+            stages: stages.filter((s) => s._id).map((s) => ({ value: s._id, n: s.n })),
+          };
+        })()
+      : undefined;
 
   const page = parsePagination(q, { pageSize: q.page === undefined && q.page_size === undefined ? 80 : 100, maxPageSize: 500 });
   const ordering = String(q.ordering || "-created_at");
@@ -403,6 +453,7 @@ jobsRouter.get("/", async (req, res) => {
     total: count,
     pagination: paginationMeta(count, page),
     range: { mode: range.mode, key: range.key, from: range.from, to: range.to },
+    metadata,
     systemId: config.systemId,
   });
 });

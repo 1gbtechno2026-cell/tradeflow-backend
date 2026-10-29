@@ -9,6 +9,7 @@ import { resolveCancelSpeed, runCancelJob } from "./services/orderCancel.js";
 import { rescheduleConcurrency, runRescheduleJob } from "./services/orderReschedule.js";
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
 import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob } from "./services/orderUpdateQueue.js";
+import { describeError, isTransientError, throttledWarn } from "./lib/resilience.js";
 
 /**
  * What this process does. One image, three roles, so each can be its own
@@ -61,6 +62,25 @@ function concurrencyFor(cls: JobClass): number {
   const n = Number(process.env[key]);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : config.workerConcurrency;
 }
+
+// A network / Atlas / Redis outage is not a bug: log it once a minute and keep
+// running — the driver reconnects, queues resume. Real bugs still end the process.
+process.on("unhandledRejection", (reason) => {
+  if (isTransientError(reason)) {
+    throttledWarn("guard:transient", `[guard] outage, process stays up: ${describeError(reason)}`);
+    return;
+  }
+  console.error("[guard] UNHANDLED REJECTION — exiting:", reason);
+  process.exit(1);
+});
+process.on("uncaughtException", (err) => {
+  if (isTransientError(err)) {
+    throttledWarn("guard:transient", `[guard] outage (sync), process stays up: ${describeError(err)}`);
+    return;
+  }
+  console.error("[guard] UNCAUGHT EXCEPTION — exiting:", err);
+  process.exit(1);
+});
 
 async function main() {
   await connectDb();

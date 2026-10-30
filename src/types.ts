@@ -37,6 +37,8 @@ export interface AddressDetails {
   checkoutPincode?: string;
   label?: string;
   gstLabel?: string;
+  /** Text that identifies this address in an account's address book (dashboard Addresses → Match Phrase). */
+  matchPhrase?: string;
 }
 
 export interface JobLog {

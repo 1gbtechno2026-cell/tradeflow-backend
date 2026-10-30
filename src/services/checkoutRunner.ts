@@ -34,6 +34,7 @@ import { getRedis } from "../lib/redis.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
 import { lockAccount } from "./accountLock.js";
 import { enqueueOrderSync } from "./orderSync.js";
+import { resolveCheckoutSettings } from "./checkoutSettings.js";
 import { runPaymentPhase } from "./paymentPhase.js";
 import { runHttpCheckout } from "./httpCheckout.js";
 import { acquireChromeFallbackSlot } from "./chromeFallbackGate.js";
@@ -527,9 +528,12 @@ async function runClaimedCheckoutJob(
       await settleBatchIfCancelling(data.batchId).catch(() => undefined);
     };
     let httpPayPressed = false;
+    const checkoutSettings = await resolveCheckoutSettings(String(job.userId || "")).catch(() => null);
     const outcome = await runHttpCheckout({
       cookies: session.cookies,
       proxy: egress?.proxy ?? null,
+      addressMatch: checkoutSettings?.addressMatchPhrase ? "phrase" : "name",
+      verifyWaitMs: checkoutSettings ? checkoutSettings.httpVerifyWaitSec * 1000 : undefined,
       productUrl: data.productUrl,
       quantity: quantityPerOrder,
       pincode: (data.address.checkoutPincode || data.address.pincode || ""),

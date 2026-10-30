@@ -76,6 +76,10 @@ export interface HttpCheckoutInput {
   gstMandatory?: boolean;
   /** Stop after the payment token; nothing is bought; the cart is cleaned. */
   dryRun: boolean;
+  /** "phrase": a saved address also counts when its text contains address.matchPhrase (default "name": identical contact name). */
+  addressMatch?: "name" | "phrase";
+  /** How long to wait after Pay for My Orders to list the order (default VERIFY_WAIT_MS). */
+  verifyWaitMs?: number;
   log: (level: LogLevel, message: string, step?: string) => void;
   /** Called right before the order call — the line between "safe to re-run" and "an order may exist". */
   onBeforePay?: () => Promise<void>;
@@ -263,9 +267,13 @@ function contactsFrom(json: Json): Contact[] {
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
-function contactMatches(c: Contact, address: AddressDetails, pincode: string): boolean {
+export function contactMatches(c: Contact, address: AddressDetails, pincode: string, mode: "name" | "phrase" = "name"): boolean {
+  if (c.pincode !== pincode) return false;
   const wanted = norm(address.companyName || address.name || "");
-  return c.pincode === pincode && (!wanted || norm(c.name) === wanted);
+  if (!wanted || norm(c.name) === wanted) return true;
+  // Match Phrase: the saved entry is ours when its name or address text carries the phrase.
+  const phrase = mode === "phrase" ? norm(address.matchPhrase || "") : "";
+  return phrase.length >= 3 && norm(`${c.name} ${c.addressLine1} ${c.city}`).includes(phrase);
 }
 
 function contactBody(address: AddressDetails, pincode: string, phone: string): Json {
@@ -371,15 +379,17 @@ async function removeCartLines(rome: Rome, lines: Array<{ itemId: string; produc
  * Orders). The account's My Orders list is the truth: poll it for up to
  * VERIFY_WAIT_MS; an order that is listed is confirmed, with its status.
  */
-const VERIFY_WAIT_MS = Math.max(10_000, Number(process.env.HTTP_VERIFY_WAIT_MS) || 90_000);
+// 2026-10-30: of 733 paid orders none was listed within 90 s, so the default is
+// a short confirmation only; the order sync keeps checking for hours after.
+const VERIFY_WAIT_MS = Math.max(5_000, Number(process.env.HTTP_VERIFY_WAIT_MS) || 15_000);
 const VERIFY_STEP_MS = 6_000;
 
-async function verifyPlaced(rome: Rome, orderId: string, log: HttpCheckoutInput["log"]): Promise<{ confirmed: boolean; listedStatus: string; verifyMs: number }> {
+async function verifyPlaced(rome: Rome, orderId: string, log: HttpCheckoutInput["log"], waitMs = VERIFY_WAIT_MS): Promise<{ confirmed: boolean; listedStatus: string; verifyMs: number }> {
   const short = shortOrderId(orderId);
   const full = orderId;
   const t0 = Date.now();
   let tries = 0;
-  while (Date.now() - t0 < VERIFY_WAIT_MS) {
+  while (Date.now() - t0 < waitMs) {
     tries += 1;
     try {
       const page = await rome.get("/api/5/self-serve/orders/?page=1", "my orders");
@@ -523,7 +533,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
     // address (its phone stays), else add it; then select it on the checkout.
     if (input.address && (!sum.addressId || (sum.summaryPin && sum.summaryPin !== pincode))) {
       const contacts = contactsFrom(await rome.get("/api/1/contacts", "address book"));
-      let target = contacts.find((c) => contactMatches(c, input.address!, pincode)) || null;
+      let target = contacts.find((c) => contactMatches(c, input.address!, pincode, input.addressMatch || "name")) || null;
       if (!target) {
         const base = contacts.find((c) => c.isDefault) || contacts[0] || null;
         const phone = (base?.phone || input.address.mobile || "").replace(/\D/g, "").slice(-10);
@@ -537,7 +547,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
         target = { id, name: body.name as string, pincode, phone, addressLine1: body.addressLine1 as string, city: body.city as string, isDefault: true };
         log("info", `[http] address book: ${base ? `edited ${base.city || "?"} ${base.pincode} into` : "added"} ${body.city} ${pincode} (contact ${id})`, "address");
       } else {
-        log("info", `[http] address book: saved address ${target.city} ${target.pincode} matches (contact ${target.id})`, "address");
+        log("info", `[http] address book: saved address ${target.city} ${target.pincode} matches${input.addressMatch === "phrase" && input.address.matchPhrase ? ` (phrase "${input.address.matchPhrase}")` : ""} (contact ${target.id})`, "address");
       }
       const refs = cartItemRefIds(R(sum.summary));
       if (!refs.length) throw new Fallback("checkout page shows no cart item ref — cannot select the address; the page flow does it");
@@ -558,8 +568,28 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
     const cards = findAll(R(summary), (o) => o.type === "CART_PAGE_PRODUCT_CARD" && typeof o.data === "object")
       .map((o) => (((o.data as Json).productInfo as Json | undefined)?.baseInfo as Json | undefined)?.value as Json | undefined)
       .filter((v): v is Json => !!v && typeof v.listingId === "string");
-    const others = cards.filter((v) => String(v.listingId).toUpperCase() !== ids.lid);
-    if (others.length) throw new Fallback(`checkout holds ${others.length} other item(s) (${others.map((v) => v.listingId).join(", ")}) — the page flow empties the cart`);
+    let others = cards.filter((v) => String(v.listingId).toUpperCase() !== ids.lid);
+    if (others.length) {
+      // Another listing rides on this checkout (left in the cart by an earlier
+      // run, or added after our cart check). Take it out here instead of
+      // handing the whole order to Chrome: 6 of 30 accounts hit this on 2026-10-30.
+      const cartNow = await rome.post("/api/4/page/fetch?cacheFirst=false", VIEWCART_BODY(pincode), "viewcart for checkout cleanup");
+      const removable = cartRemoveActions(R(cartNow)).filter((a) => a.listingId !== ids.lid);
+      if (!removable.length) {
+        const lines = cartLines(R(cartNow));
+        log("warn", `[http] checkout holds ${others.map((v) => v.listingId).join(", ")} but the cart page lists ${lines.length ? lines.map((l) => l.listingId).join(", ") : "nothing"} and offers ${cartRemoveActions(R(cartNow)).length} remove action(s)`, "cart");
+      }
+      if (removable.length) {
+        await removeCartLines(rome, removable);
+        log("info", `[http] removed ${removable.length} other item(s) from the cart (${removable.map((a) => a.listingId).join(", ")}) and re-read the checkout`, "cart");
+        sum = await readSummary();
+        const again = findAll(R(sum.summary), (o) => o.type === "CART_PAGE_PRODUCT_CARD" && typeof o.data === "object")
+          .map((o) => (((o.data as Json).productInfo as Json | undefined)?.baseInfo as Json | undefined)?.value as Json | undefined)
+          .filter((v): v is Json => !!v && typeof v.listingId === "string");
+        others = again.filter((v) => String(v.listingId).toUpperCase() !== ids.lid);
+      }
+      if (others.length) throw new Fallback(`checkout holds ${others.length} other item(s) (${others.map((v) => v.listingId).join(", ")}) — the page flow empties the cart`);
+    }
     const qtyOnCheckout = cards.filter((v) => String(v.listingId).toUpperCase() === ids.lid).reduce((a, v) => a + (Number(v.quantity) || 0), 0);
     if (cards.length && qtyOnCheckout !== input.quantity) throw new Fallback(`checkout shows quantity ${qtyOnCheckout}, the job wants ${input.quantity} — the page flow sets it`);
     if (input.cartAmountLimit && totalCost && totalCost > input.cartAmountLimit) {
@@ -662,7 +692,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
         /* the order exists regardless */
       }
       lap("confirmation");
-      const verify = await verifyPlaced(rome, orderId, log);
+      const verify = await verifyPlaced(rome, orderId, log, input.verifyWaitMs && input.verifyWaitMs >= 5_000 ? input.verifyWaitMs : VERIFY_WAIT_MS);
       lap("verify");
       if (verify.confirmed) log("info", `[http] COD order placed — ${orderId} · ₹${(paise / 100).toFixed(0)}${fee ? ` · ${fee}` : ""} · My Orders: ${verify.listedStatus} after ${verify.verifyMs} ms · ${Date.now() - t0} ms end to end`, "paid");
       return { kind: "placed", orderId, referenceId: shortOrderId(orderId), confirmed: verify.confirmed, listedStatus: verify.listedStatus, verifyMs: verify.verifyMs, amount: paise ? `₹${(paise / 100).toFixed(2)}` : "", paymentFee: fee, checkoutTotal: totalCost, deliveryDays, deliveryText, exitIp, details: { ...details, orderStatus: details.orderStatus || verify.listedStatus || undefined }, timings };

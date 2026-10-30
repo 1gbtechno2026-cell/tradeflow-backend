@@ -9,6 +9,7 @@ import {
   startOrderFetch,
   stopOrderFetch,
 } from "../services/orderFetch.js";
+import { resolveCheckoutSettings, setCheckoutSettings } from "../services/checkoutSettings.js";
 import { getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import { getRescheduleRequest, listRescheduleRequests, previewReschedule, requestReschedule, retryRescheduleRequest } from "../services/orderReschedule.js";
 import { proxyModeStatus, setProxyMode } from "../services/proxyMode.js";
@@ -450,6 +451,19 @@ orderFetchRouter.get("/cancel", async (req, res) => {
 });
 
 /** Cancel speed: { windows, tabs, source, changedBy, changedAt, limits }. PUT body: { windows?, tabs?, by? }. Applies to the next job, no restart. */
+/** HTTP checkout engine switches (services/checkoutSettings.ts). PUT body: { addressMatchPhrase?, httpVerifyWaitSec?, by? }. */
+orderFetchRouter.get("/checkout-settings", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  res.json(await resolveCheckoutSettings(userId));
+});
+orderFetchRouter.put("/checkout-settings", async (req, res) => {
+  try {
+    res.json(await setCheckoutSettings(userIdFrom(req), { addressMatchPhrase: req.body?.addressMatchPhrase, httpVerifyWaitSec: req.body?.httpVerifyWaitSec }, String(req.body?.by || "").trim()));
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not save the checkout settings" });
+  }
+});
+
 orderFetchRouter.get("/cancel/settings", async (req, res) => {
   const userId = String(req.query.userId || "").trim() || workspaceUserId();
   res.json(await resolveCancelSpeed(userId));

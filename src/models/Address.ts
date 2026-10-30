@@ -9,6 +9,8 @@ export interface IAddress {
   addressLine1: string;
   addressLine2: string;
   floorNumber: string;
+  /** Dashboard Addresses → Match Phrase: text that identifies this address in an account's saved book. */
+  matchPhrase?: string;
   city: string;
   state: string;
   linkedGstIds: Types.ObjectId[];
@@ -24,6 +26,7 @@ const AddressSchema = new Schema<IAddress>(
     addressLine1: { type: String, required: true },
     addressLine2: { type: String, default: "" },
     floorNumber: { type: String, default: "" },
+    matchPhrase: { type: String, default: "" },
     city: { type: String, required: true },
     state: { type: String, required: true },
     linkedGstIds: [{ type: Schema.Types.ObjectId, ref: "Gst" }],

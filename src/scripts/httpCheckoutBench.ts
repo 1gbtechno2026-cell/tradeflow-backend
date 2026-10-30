@@ -16,6 +16,10 @@ import { runHttpCheckout, type HttpCheckoutOutcome } from "../services/httpCheck
  *   --skip 200     start further down the account list (fresh accounts per round)
  *   --direct       no proxy; default: the Proxy Pool's active proxies, round robin
  *   --product URL  --pincode 122016  --verbose
+ *   --phrase "UDYOG VIHAR"   address match by Match Phrase (Settings → Checkout engine ON)
+ *   --wait 15                seconds to wait for My Orders after a REAL Pay
+ *   --name "X"               contact name on the job address (default DASHMOBILES PRIVATE LIMITED)
+ *   --email a@b.in,c@d.in    only these accounts
  *
  * Accounts busy in the worker (account:lock) are skipped. Nothing is written
  * to CheckoutJob; this is the engine alone.
@@ -33,7 +37,9 @@ const REAL = Number(arg("real", "0")) || 0;
 const PRODUCT = arg("product", "https://www.flipkart.com/techblaze-80-w-supervooc-7-3-wall-charger-mobile-detachable-cable/p/itm030b5480ff521?pid=ACCHBQAYAKFJ59W6&lid=LSTACCHBQAYAKFJ59W6A5ELR1&marketplace=FLIPKART");
 const PINCODE = arg("pincode", "122016");
 const VERBOSE = has("verbose");
-const ADDRESS = { name: "DASHMOBILES PRIVATE LIMITED", mobile: "", pincode: PINCODE, locality: "UDYOG VIHAR", addressLine1: "Cabin 2, 581 , PHASE -5", city: "Gurugram", state: "Haryana", addressType: "Home" as const, gstNumber: "06AALCD3578N1Z0", companyName: "DASHMOBILES PRIVATE LIMITED", checkoutPincode: "" };
+const PHRASE = arg("phrase", "");
+const NAME = arg("name", "DASHMOBILES PRIVATE LIMITED");
+const ADDRESS = { name: NAME, mobile: "", pincode: PINCODE, locality: "UDYOG VIHAR", addressLine1: "Cabin 2, 581 , PHASE -5", city: "Gurugram", state: "Haryana", addressType: "Home" as const, gstNumber: "06AALCD3578N1Z0", companyName: "DASHMOBILES PRIVATE LIMITED", checkoutPincode: "", matchPhrase: PHRASE };
 const DIRECT = has("direct");
 
 function pct(xs: number[], p: number) {
@@ -45,9 +51,10 @@ function pct(xs: number[], p: number) {
 async function main() {
   await connectDb();
   const userId = workspaceUserId();
-  const rows = await PlatformId.find({ userId, status: "logged_in" }).sort({ _id: 1 }).skip(SKIP).limit(N * 2).select("email").lean();
+  const emails = arg("email").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+  const rows = await PlatformId.find(emails.length ? { userId, email: { $in: emails } } : { userId, status: "logged_in" }).sort({ _id: 1 }).skip(SKIP).limit(N * 2).select("email").lean();
   const proxies = DIRECT ? [] : (await listProxies()).map(toPlaywrightProxy);
-  console.log(`bench · ${N} account(s) from offset ${SKIP} · concurrency ${CONC} · ${REAL ? `REAL orders: ${REAL}` : "dry run"} · ${proxies.length ? `${proxies.length} proxies round robin` : "direct"} · pin ${PINCODE}`);
+  console.log(`bench · ${N} account(s) from offset ${SKIP} · concurrency ${CONC} · address match ${PHRASE ? `phrase "${PHRASE}"` : "name"} · ${REAL ? `REAL orders: ${REAL}` : "dry run"} · ${proxies.length ? `${proxies.length} proxies round robin` : "direct"} · pin ${PINCODE}`);
   if (REAL > N) throw new Error("--real cannot exceed --n");
 
   const picked: Array<{ email: string; cookies: unknown[]; unlock: () => Promise<void> }> = [];
@@ -83,6 +90,8 @@ async function main() {
         deliverySlaDays: Number(arg("sla", "9")) || 9,
         gstMandatory: false,
         dryRun,
+        addressMatch: PHRASE ? "phrase" : "name",
+        verifyWaitMs: arg("wait") ? Number(arg("wait")) * 1000 : undefined,
         log: (level, message) => {
           if (VERBOSE || level !== "info" || !dryRun) console.log(`  [${acct.email}] ${message}`);
         },

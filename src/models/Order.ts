@@ -104,6 +104,9 @@ export interface IOrder {
   cancelled_date: Date | null;
   cancelled_from_bae: boolean;
   cancelled_by_user: boolean;
+  /** Flipkart's fkCancelled flag: who cancelled — "flipkart" | "customer" | "". */
+  cancelled_by: string;
+  cancel_reason_text: string | null;
   order_status_pre_cancellation: string | null;
   imei: string | null;
   is_logged_in: boolean;
@@ -228,6 +231,8 @@ const OrderSchema = new Schema<IOrder>(
     cancelled_date: { type: Date, default: null },
     cancelled_from_bae: { type: Boolean, default: false },
     cancelled_by_user: { type: Boolean, default: false },
+    cancelled_by: { type: String, enum: ["", "flipkart", "customer"], default: "" },
+    cancel_reason_text: { type: String, default: null },
     order_status_pre_cancellation: { type: String, default: null },
     imei: { type: String, default: null },
     is_logged_in: { type: Boolean, default: false },

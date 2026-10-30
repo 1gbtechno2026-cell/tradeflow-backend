@@ -483,6 +483,10 @@ export interface MappedOrderUnit {
   refund_msg: string | null;
   cancelled_date: Date | null;
   cancelled_by_user: boolean;
+  /** Who cancelled, from Flipkart's own flag (status.fkCancelled): "flipkart" (seller policy, risk check…), "customer" (the account, us included), "" when not cancelled or unknown. */
+  cancelled_by: "" | "flipkart" | "customer";
+  /** Flipkart's one-line reason when cancelled ("Sorry, your order was cancelled as per seller policy restrictions applicable to this brand."). */
+  cancel_reason_text: string | null;
   order_status_pre_cancellation: string | null;
   shipment_partner_name: string;
   /** Extra, API-only: price lines the DOM never itemises. */
@@ -618,6 +622,8 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
     refund_msg: null,
     cancelled_date: cancelledAt ? new Date(cancelledAt) : cancelled ? orderDate : null,
     cancelled_by_user: /as per your request|cancelled by you|you cancelled/i.test(cancelledText),
+    cancelled_by: cancelled ? (meta.status?.fkCancelled === true ? "flipkart" : /as per your request|cancelled by you|you cancelled/i.test(cancelledText) ? "customer" : "") : "",
+    cancel_reason_text: cancelled ? statusText || null : null,
     order_status_pre_cancellation: cancelled ? furthestBeforeCancel?.status || confirmed?.status || "Order Confirmed" : null,
     shipment_partner_name: shipmentPartnerFrom(unit),
     api_extra: {

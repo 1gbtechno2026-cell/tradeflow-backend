@@ -22,7 +22,8 @@
     "orders:resync-recent": "tsx src/scripts/resyncRecent.ts",
     "orders:reconcile-dropped": "tsx src/scripts/reconcileDropped.ts",
     "bench:http": "tsx src/scripts/httpCheckoutBench.ts",
-    "orders:api-bench": "tsx src/scripts/orderApiBench.ts"
+    "orders:api-bench": "tsx src/scripts/orderApiBench.ts",
+    "orders:backfill-cancelled-by": "tsx src/scripts/backfillCancelledBy.ts"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.1156.0",

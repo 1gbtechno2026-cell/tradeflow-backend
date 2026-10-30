@@ -18,6 +18,7 @@ import { runHttpCheckout, type HttpCheckoutOutcome } from "../services/httpCheck
  *   --product URL  --pincode 122016  --verbose
  *   --wait 15                seconds to wait for My Orders after a REAL Pay
  *   --name "X"               contact name on the job address (default DASHMOBILES PRIVATE LIMITED)
+ *   --qty 8 --qmode upto     units per order and the quantity mode (minimum | upto)
  *   --email a@b.in,c@d.in    only these accounts
  *
  * Accounts busy in the worker (account:lock) are skipped. Nothing is written
@@ -37,6 +38,8 @@ const PRODUCT = arg("product", "https://www.flipkart.com/techblaze-80-w-supervoo
 const PINCODE = arg("pincode", "122016");
 const VERBOSE = has("verbose");
 const NAME = arg("name", "DASHMOBILES PRIVATE LIMITED");
+const QTY = Math.max(1, Number(arg("qty", "1")) || 1);
+const QMODE = arg("qmode", "minimum") === "upto" ? "upto" : "minimum";
 const ADDRESS = { name: NAME, mobile: "", pincode: PINCODE, locality: "UDYOG VIHAR", addressLine1: "Cabin 2, 581 , PHASE -5", city: "Gurugram", state: "Haryana", addressType: "Home" as const, gstNumber: "06AALCD3578N1Z0", companyName: "DASHMOBILES PRIVATE LIMITED", checkoutPincode: "" };
 const DIRECT = has("direct");
 
@@ -52,7 +55,7 @@ async function main() {
   const emails = arg("email").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
   const rows = await PlatformId.find(emails.length ? { userId, email: { $in: emails } } : { userId, status: "logged_in" }).sort({ _id: 1 }).skip(SKIP).limit(N * 2).select("email").lean();
   const proxies = DIRECT ? [] : (await listProxies()).map(toPlaywrightProxy);
-  console.log(`bench · ${N} account(s) from offset ${SKIP} · concurrency ${CONC} · ${REAL ? `REAL orders: ${REAL}` : "dry run"} · ${proxies.length ? `${proxies.length} proxies round robin` : "direct"} · pin ${PINCODE}`);
+  console.log(`bench · ${N} account(s) from offset ${SKIP} · concurrency ${CONC} · qty ${QTY} ${QMODE} · ${REAL ? `REAL orders: ${REAL}` : "dry run"} · ${proxies.length ? `${proxies.length} proxies round robin` : "direct"} · pin ${PINCODE}`);
   if (REAL > N) throw new Error("--real cannot exceed --n");
 
   const picked: Array<{ email: string; cookies: unknown[]; unlock: () => Promise<void> }> = [];
@@ -82,7 +85,8 @@ async function main() {
         cookies: acct.cookies,
         proxy,
         productUrl: PRODUCT,
-        quantity: 1,
+        quantity: QTY,
+        quantityMode: QMODE,
         pincode: PINCODE,
         address: has("no-address-fix") ? undefined : ADDRESS,
         deliverySlaDays: Number(arg("sla", "9")) || 9,
@@ -95,7 +99,7 @@ async function main() {
       });
       const ms = Date.now() - t;
       results.push({ email: acct.email, outcome, ms, proxy: proxy ? proxy.server.replace(/^https?:\/\//, "") : "direct" });
-      const tag = outcome.kind === "failed" ? `failed ${outcome.failure.code}` : outcome.kind === "fallback" ? `fallback: ${outcome.reason.slice(0, 90)}` : outcome.kind === "placed" ? `PLACED ${outcome.orderId}` : `dry_run ₹${outcome.checkoutTotal ?? "?"}${outcome.cartCleaned ? "" : " (cart not cleaned)"}`;
+      const tag = outcome.kind === "failed" ? `failed ${outcome.failure.code}` : outcome.kind === "fallback" ? `fallback: ${outcome.reason.slice(0, 90)}` : outcome.kind === "placed" ? `PLACED ${outcome.orderId}${outcome.quantityPlaced != null ? ` qty ${outcome.quantityPlaced}` : ""}` : `dry_run ₹${outcome.checkoutTotal ?? "?"}${outcome.cartCleaned ? "" : " (cart not cleaned)"}`;
       console.log(`${String(results.length).padStart(4)}/${picked.length} ${String(ms).padStart(6)} ms  ${acct.email.padEnd(34)} ${tag}`);
       await acct.unlock().catch(() => undefined);
     }

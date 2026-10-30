@@ -141,6 +141,7 @@ export function batchRow(b: ICheckoutBatch, r: JobRollup | undefined) {
     productUrl: b.productUrl || r?.productUrl || "",
     totalQuantity: b.totalQuantity,
     quantityPerOrder: b.quantityPerOrder,
+    quantityPerOrderMode: b.quantityPerOrderMode || "minimum",
     totalAttempts: b.totalAttempts,
     purchasedQuantity: b.purchasedQuantity,
     attemptsUsed: b.attemptsUsed,

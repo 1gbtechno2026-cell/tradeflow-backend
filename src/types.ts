@@ -64,6 +64,10 @@ export interface MaskedCard {
 
 export type ExecutionVersion = "chrome" | "high_speed";
 
+/** How Quantity Per Order is meant: "minimum" = exactly that many units per order (the default);
+ *  "upto" = whatever Flipkart allows up to that many, the rest goes back to the batch. */
+export type QuantityMode = "minimum" | "upto";
+
 export interface JobRequestSnapshot {
   platform: string;
   paymentMode: string;
@@ -86,6 +90,7 @@ export interface JobRequestSnapshot {
   cards: MaskedCard[];
   totalQuantity?: number;
   quantityPerOrder?: number;
+  quantityPerOrderMode?: QuantityMode;
   totalAttempts?: number;
 }
 
@@ -169,6 +174,8 @@ export interface CheckoutJobData {
   quantity: number;
   totalQuantity: number;
   quantityPerOrder: number;
+  /** See QuantityMode; absent = "minimum". */
+  quantityMode?: QuantityMode;
   totalAttempts: number;
   cartAmountLimit?: number;
   deliverySlaDays?: number;

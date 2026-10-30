@@ -78,6 +78,8 @@ export interface HttpCheckoutInput {
   dryRun: boolean;
   /** How long to wait after Pay for My Orders to list the order (default VERIFY_WAIT_MS). */
   verifyWaitMs?: number;
+  /** "upto": when Flipkart caps the units below `quantity`, place the capped amount (≥ 1) instead of handing off; default "minimum" = exactly `quantity`. */
+  quantityMode?: "minimum" | "upto";
   log: (level: LogLevel, message: string, step?: string) => void;
   /** Called right before the order call — the line between "safe to re-run" and "an order may exist". */
   onBeforePay?: () => Promise<void>;
@@ -89,6 +91,8 @@ export interface HttpStepTimings {
 
 export interface HttpPlaced {
   kind: "placed";
+  /** Units actually on the order — below the quantity asked only in "upto" mode. */
+  quantityPlaced?: number;
   orderId: string;
   referenceId: string;
   /** Flipkart's My Orders lists the order (checked after the pay call). false = the pay call said
@@ -441,6 +445,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
 
   let ctx: APIRequestContext | null = null;
   let addedToCart = false;
+  let placedQty = input.quantity;
   try {
     ctx = await newSession(input.cookies, input.proxy);
     const rome = new Rome(ctx);
@@ -472,10 +477,21 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
     lap("cart_view");
 
     // 2. add to cart
-    const add = await rome.post("/api/5/cart", { cartContext: { [ids.lid]: { productId: ids.pid, quantity: input.quantity, cashifyDiscountApplied: false, vulcanDiscountApplied: false, payWithEMISelected: false, selectedActions: [] } }, pageType: "ProductPage" }, "cart add");
+    const cartBody = (qty: number) => ({ cartContext: { [ids.lid]: { productId: ids.pid, quantity: qty, cashifyDiscountApplied: false, vulcanDiscountApplied: false, payWithEMISelected: false, selectedActions: [] } }, pageType: "ProductPage" });
+    const add = await rome.post("/api/5/cart", cartBody(input.quantity), "cart add");
     const cartResponse = (R(add).cartResponse ?? {}) as Record<string, Json>;
-    const mine = cartResponse[ids.lid] ?? Object.values(cartResponse)[0];
+    let mine = cartResponse[ids.lid] ?? Object.values(cartResponse)[0];
     if (!mine) throw new Fallback("cart add answered without a cartResponse for the listing");
+    if (mine.errorCode && !mine.presentInCart && input.quantityMode === "upto" && input.quantity > 1) {
+      // Upto: Flipkart refused the quantity itself; take the cap it names (else 1) and add that.
+      const capMatch = String(mine.errorMessage || "").match(/(\d+)/);
+      const cap = Math.max(1, Math.min(input.quantity - 1, capMatch ? Number(capMatch[1]) : 1));
+      log("warn", `[http] cart add refused ${input.quantity} unit(s) (${String(mine.errorMessage || mine.errorCode)}) — Upto mode, adding ${cap}`, "cart");
+      const again = await rome.post("/api/5/cart", cartBody(cap), "cart add (upto)");
+      const r2 = (R(again).cartResponse ?? {}) as Record<string, Json>;
+      mine = r2[ids.lid] ?? Object.values(r2)[0] ?? mine;
+      if (!(mine.errorCode && !mine.presentInCart)) placedQty = cap;
+    }
     if (mine.errorCode && !mine.presentInCart) {
       return { kind: "failed", failure: new CheckoutFailure("ADD_TO_CART_FAILED", `${String(mine.errorCode)}${mine.errorMessage ? `: ${String(mine.errorMessage)}` : ""}`), timings };
     }
@@ -585,7 +601,12 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
       if (others.length) throw new Fallback(`checkout holds ${others.length} other item(s) (${others.map((v) => v.listingId).join(", ")}) — the page flow empties the cart`);
     }
     const qtyOnCheckout = cards.filter((v) => String(v.listingId).toUpperCase() === ids.lid).reduce((a, v) => a + (Number(v.quantity) || 0), 0);
-    if (cards.length && qtyOnCheckout !== input.quantity) throw new Fallback(`checkout shows quantity ${qtyOnCheckout}, the job wants ${input.quantity} — the page flow sets it`);
+    if (cards.length && qtyOnCheckout !== placedQty) {
+      if (input.quantityMode === "upto" && qtyOnCheckout >= 1 && qtyOnCheckout < placedQty) {
+        log("warn", `[http] checkout holds ${qtyOnCheckout} of the ${placedQty} unit(s) asked — Upto mode, placing ${qtyOnCheckout}`, "checkout");
+        placedQty = qtyOnCheckout;
+      } else throw new Fallback(`checkout shows quantity ${qtyOnCheckout}, the job wants ${placedQty} — the page flow sets it`);
+    }
     if (input.cartAmountLimit && totalCost && totalCost > input.cartAmountLimit) {
       return { kind: "failed", failure: new CheckoutFailure("CART_AMOUNT_LIMIT", `Cart total ₹${totalCost} is above the limit ₹${input.cartAmountLimit}`), timings };
     }
@@ -689,7 +710,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
       const verify = await verifyPlaced(rome, orderId, log, input.verifyWaitMs && input.verifyWaitMs >= 5_000 ? input.verifyWaitMs : VERIFY_WAIT_MS);
       lap("verify");
       if (verify.confirmed) log("info", `[http] COD order placed — ${orderId} · ₹${(paise / 100).toFixed(0)}${fee ? ` · ${fee}` : ""} · My Orders: ${verify.listedStatus} after ${verify.verifyMs} ms · ${Date.now() - t0} ms end to end`, "paid");
-      return { kind: "placed", orderId, referenceId: shortOrderId(orderId), confirmed: verify.confirmed, listedStatus: verify.listedStatus, verifyMs: verify.verifyMs, amount: paise ? `₹${(paise / 100).toFixed(2)}` : "", paymentFee: fee, checkoutTotal: totalCost, deliveryDays, deliveryText, exitIp, details: { ...details, orderStatus: details.orderStatus || verify.listedStatus || undefined }, timings };
+      return { kind: "placed", quantityPlaced: placedQty, orderId, referenceId: shortOrderId(orderId), confirmed: verify.confirmed, listedStatus: verify.listedStatus, verifyMs: verify.verifyMs, amount: paise ? `₹${(paise / 100).toFixed(2)}` : "", paymentFee: fee, checkoutTotal: totalCost, deliveryDays, deliveryText, exitIp, details: { ...details, orderStatus: details.orderStatus || verify.listedStatus || undefined }, timings };
     }
     const message = String(findKey(payJson, "default_text") || findKey(payJson, "message") || payText.slice(0, 200));
     if (payStatus === 401 || payStatus === 403 || payStatus === 429) throw new Fallback(`pay answered ${payStatus} — challenge`);

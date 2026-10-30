@@ -2350,7 +2350,8 @@ export class FlipkartCheckout {
   async verifyAddressOnOrderSummary(
     address: AddressDetails,
     expectedQty: number,
-    gstMandatory = true
+    gstMandatory = true,
+    quantityMode: "minimum" | "upto" = "minimum"
   ): Promise<void> {
     const MAX_RETRIES = 3;
 
@@ -2379,7 +2380,7 @@ export class FlipkartCheckout {
         console.log(`Order summary page URL: ${pageUrl}`);
 
         // Step 1: Verify quantity on order summary
-        await this.verifyQuantityOnOrderSummary(expectedQty);
+        await this.verifyQuantityOnOrderSummary(expectedQty, quantityMode);
         quantityDone = true;
 
         // Step 2: Verify delivery address
@@ -2461,7 +2462,30 @@ export class FlipkartCheckout {
    * reliable one, because Flipkart otherwise answers an over-limit quantity by
    * quietly capping it or showing a bare "Something went wrong".
    */
-  private async verifyQuantityOnOrderSummary(expectedQty: number): Promise<void> {
+  /** "upto": Flipkart's per-order cap is the quantity, not a failure — continue with what the summary holds. */
+  private async verifyQuantityOnOrderSummary(expectedQty: number, quantityMode: "minimum" | "upto" = "minimum"): Promise<void> {
+    try {
+      await this.verifyQuantityExact(expectedQty);
+    } catch (err) {
+      const capped = err instanceof CheckoutFailure && ((err as { code?: string }).code === "MAX_UNITS_REACHED" || QTY_LIMIT_RE.test(err.details));
+      if (quantityMode === "upto" && capped) {
+        await this.page.keyboard.press("Escape").catch(() => undefined);
+        await sleep(500);
+        const now = await this.evaluate(() => {
+          const m = (document.body?.innerText || "").match(/Qty:\s*(\d+)/i);
+          return m ? Number(m[1]) : 0;
+        });
+        if (now >= 1 && now < expectedQty) {
+          this.summaryQty = now;
+          console.log(`Upto mode: Flipkart allows ${now} of ${expectedQty} unit(s) — continuing with ${now}`);
+          return;
+        }
+      }
+      throw err;
+    }
+  }
+
+  private async verifyQuantityExact(expectedQty: number): Promise<void> {
     console.log(`Verifying quantity on order summary: expected=${expectedQty}`);
     this.summaryQty = expectedQty;
 

@@ -39,6 +39,8 @@ export async function enqueueCheckoutJob(input: {
   quantityPerOrder: number;
   totalQuantity: number;
   totalAttempts: number;
+  /** "upto" = whatever Flipkart allows up to quantityPerOrder; absent = "minimum" (exactly). */
+  quantityMode?: "minimum" | "upto";
   cartAmountLimit?: number;
   deliverySlaDays?: number;
   gstMandatory?: boolean;
@@ -103,6 +105,7 @@ export async function enqueueCheckoutJob(input: {
     totalQuantity: input.totalQuantity,
     quantityPerOrder: perOrderQty,
     totalAttempts: input.totalAttempts,
+    quantityMode: input.quantityMode,
     cartAmountLimit: input.cartAmountLimit,
     deliverySlaDays: input.deliverySlaDays,
     gstMandatory: input.gstMandatory,

@@ -31,6 +31,7 @@ export interface ICheckoutBatch {
   attemptsUsed: number;
   totalQuantity: number;
   quantityPerOrder: number;
+  quantityPerOrderMode: "minimum" | "upto";
   totalAttempts: number;
   /** What the batch is for — copied from the request so a list needs no job lookup. */
   productUrl: string;
@@ -59,6 +60,7 @@ const CheckoutBatchSchema = new Schema<ICheckoutBatch>(
     attemptsUsed: { type: Number, default: 0 },
     totalQuantity: { type: Number, required: true },
     quantityPerOrder: { type: Number, required: true },
+    quantityPerOrderMode: { type: String, enum: ["minimum", "upto"], default: "minimum" },
     totalAttempts: { type: Number, required: true },
     productUrl: { type: String, default: "" },
     productName: { type: String, default: "" },

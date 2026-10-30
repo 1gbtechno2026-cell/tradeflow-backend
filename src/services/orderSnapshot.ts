@@ -51,6 +51,7 @@ export function requestSnapshot(data: NormalizedCreateJob): JobRequestSnapshot {
     cards: maskCards(data.cards),
     totalQuantity: data.totalQuantity,
     quantityPerOrder: data.quantityPerOrder,
+    quantityPerOrderMode: data.quantityPerOrderMode,
     totalAttempts: data.totalAttempts,
   };
 }

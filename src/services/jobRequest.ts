@@ -37,6 +37,7 @@ const addressSchema = z.object({
 const normalizedSchema = z.object({
   productUrl: z.string().url(),
   quantityPerOrder: z.number().int().positive(),
+  quantityPerOrderMode: z.enum(["minimum", "upto"]).default("minimum"),
   totalQuantity: z.number().int().positive({
     message: "quantity (totalQuantity) must be a positive integer",
   }),
@@ -77,6 +78,11 @@ export function normalizeExecutionVersion(raw: string | undefined): "chrome" | "
   return v === "high_speed" || v === "sonic_boom" || v === "http" ? "high_speed" : "chrome";
 }
 
+/** "Upto" / "up_to" / "UP TO" → upto; anything else (incl. BulkOrderBuddy's "minimum") → minimum. */
+export function normalizeQuantityMode(raw: unknown): "minimum" | "upto" {
+  return /^up/i.test(String(raw ?? "").trim()) ? "upto" : "minimum";
+}
+
 /** Accepts both the Trade Flow camelCase body and the Smart Bulk Order snake_case payload. */
 export function parseCreateJobBody(raw: unknown): NormalizedCreateJob {
   const b = (raw ?? {}) as Record<string, unknown>;
@@ -89,6 +95,7 @@ export function parseCreateJobBody(raw: unknown): NormalizedCreateJob {
   const parsed = normalizedSchema.parse({
     productUrl: asString(b.productUrl) ?? asString(b.product_url),
     quantityPerOrder,
+    quantityPerOrderMode: normalizeQuantityMode(asString(b.quantity_per_order_mode) ?? asString(b.quantityPerOrderMode)),
     totalQuantity: asNumber(b.quantity) ?? asNumber(b.totalQuantity),
     totalAttempts: asNumber(b.total_attempts) ?? asNumber(b.totalAttempts),
     cartAmountLimit: asNumber(b.cartAmountLimit) ?? asNumber(b.cart_amount_limit),

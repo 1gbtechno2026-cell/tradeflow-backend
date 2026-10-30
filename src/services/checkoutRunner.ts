@@ -178,6 +178,7 @@ async function maybeEnqueueRetry(
     quantityPerOrder,
     totalQuantity,
     totalAttempts,
+    quantityMode: data.quantityMode,
     cartAmountLimit: data.cartAmountLimit,
     deliverySlaDays: data.deliverySlaDays,
     gstMandatory: data.gstMandatory ?? request?.gstMandatory,
@@ -533,6 +534,7 @@ async function runClaimedCheckoutJob(
       cookies: session.cookies,
       proxy: egress?.proxy ?? null,
       verifyWaitMs: checkoutSettings ? checkoutSettings.httpVerifyWaitSec * 1000 : undefined,
+      quantityMode: data.quantityMode,
       productUrl: data.productUrl,
       quantity: quantityPerOrder,
       pincode: (data.address.checkoutPincode || data.address.pincode || ""),
@@ -585,7 +587,16 @@ async function runClaimedCheckoutJob(
         listedStatus: outcome.confirmed ? outcome.listedStatus || "listed" : "pending",
         listingCheckedAt: new Date(),
       });
+      // Upto: Flipkart may have held fewer units than asked. Record what was placed, give the
+      // rest back to the batch and queue a follow-up order for it on this account.
+      const placedQty = outcome.quantityPlaced ?? data.quantity;
+      await patchResult(data.jobId, { quantityPlaced: placedQty });
       reservationHeld = false;
+      if (placedQty < quantityPerOrder) {
+        const left = await releaseBatchReservation(data.batchId, quantityPerOrder - placedQty);
+        httpLog("info", `Upto mode: Flipkart allowed ${placedQty} of ${quantityPerOrder} unit(s) — ${quantityPerOrder - placedQty} unit(s) given back to the batch (purchased now ${left})`, "batch");
+        if (data.quantityMode === "upto") await maybeEnqueueRetry(data, job.userId, "upto: units still to place", job.request);
+      }
       const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
       if (!outcome.confirmed) {
         httpLog("warn", `${outcome.orderId}: not in My Orders yet after ${Math.round(outcome.verifyMs / 1000)} s — counted as placed; the order sync keeps checking for ~8 h and parks it only if Flipkart never lists it`, "paid");
@@ -884,7 +895,8 @@ async function runClaimedCheckoutJob(
     await checkout.verifyAddressOnOrderSummary(
       address,
       data.quantity,
-      data.gstMandatory ?? job.request?.gstMandatory ?? true
+      data.gstMandatory ?? job.request?.gstMandatory ?? true,
+      data.quantityMode || "minimum"
     );
     await patchResult(data.jobId, {
       quantityPlaced: checkout.summaryQty || data.quantity,
@@ -979,6 +991,14 @@ async function runClaimedCheckoutJob(
       log("info", `Stopping at payment page — ${payment.reason}`, "payment");
     }
     reservationHeld = false;
+    if (payment.attempted && payment.ok) {
+      const placedQty = checkout.summaryQty || data.quantity;
+      if (placedQty < quantityPerOrder) {
+        const left = await releaseBatchReservation(data.batchId, quantityPerOrder - placedQty);
+        log("info", `Upto mode: Flipkart allowed ${placedQty} of ${quantityPerOrder} unit(s) — ${quantityPerOrder - placedQty} unit(s) given back to the batch (purchased now ${left})`, "batch");
+        if (data.quantityMode === "upto") await maybeEnqueueRetry(data, job.userId, "upto: units still to place", job.request);
+      }
+    }
     const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
     log(
       "info",

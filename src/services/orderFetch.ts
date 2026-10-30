@@ -1494,6 +1494,7 @@ async function processAccountViaApi(
     if (job.invoices !== "off" && !job.cancelled) {
       const inv = await captureInvoicesForAccount({
         userId, platformAccountId: row.id, email: row.email, mode: job.invoices, justEnriched: enrichedUnits,
+        api: ctx,
         getPage: async () => {
           if (!fallbackPage) {
             fallbackPage = await getPage();

@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import type { APIRequestContext } from "playwright";
+import { OrderApiError, romeCall } from "./orderApi.js";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -296,12 +298,29 @@ export interface InvoiceCaptureSummary {
  * The after-enrichment step for one account. `justEnriched` is the set of unit
  * ids mapped in this run (what "new" means); "missing" ignores it.
  */
+/**
+ * The order's invoice bundle over Flipkart's API — the request the page's
+ * "Download Invoice" button makes (recorded 2026-10-30 on OD339012711228057100:
+ * GET <dc>.rome.api.flipkart.com/api/1/self-serve/invoice/download/<orderId>
+ * → application/octet-stream, 3.3 MB, 24 pages, in 2.2 s; DC-switched like
+ * every rome call). One PDF with every tax invoice of the order.
+ */
+export async function downloadInvoiceViaApi(ctx: APIRequestContext, orderId: string): Promise<Buffer> {
+  const { res } = await romeCall(ctx, (host) => ctx.get(`${host}/api/1/self-serve/invoice/download/${orderId}`, { timeout: 60_000 }));
+  if (!res.ok()) throw new OrderApiError(`invoice download for ${orderId} answered HTTP ${res.status()}`, res.status(), "");
+  const body = await res.body();
+  if (body.subarray(0, 4).toString() !== "%PDF") throw new Error(`invoice download for ${orderId} is not a PDF (${res.headers()["content-type"] || "?"}, ${body.length} bytes)`);
+  return body;
+}
+
 export async function captureInvoicesForAccount(opts: {
   userId: string;
   platformAccountId: unknown;
   email: string;
   mode: InvoiceMode;
   justEnriched: Set<string>;
+  /** API mode: the account's order-API session; the page is opened only when the API cannot deliver. */
+  api?: APIRequestContext;
   getPage: () => Promise<Page>;
   cancelled: () => boolean;
   log: (level: "info" | "warn", message: string) => void;
@@ -328,7 +347,18 @@ export async function captureInvoicesForAccount(opts: {
   const batch = wanted.slice(0, cap);
   out.skippedCap = wanted.length - batch.length;
   opts.log("info", `${opts.email}: invoices — ${wanted.length} delivered unit(s) without a PDF${out.skippedCap ? ` (doing ${cap}, ${out.skippedCap} left for the next run)` : ""}`);
-  const page = await opts.getPage();
+  let page: Page | null = null;
+  const pageOf = async () => (page ||= await opts.getPage());
+  const pdfsOf = async (orderId: string, orderUrl: string): Promise<Buffer[]> => {
+    if (opts.api) {
+      try {
+        return [await downloadInvoiceViaApi(opts.api, orderId)];
+      } catch (err) {
+        opts.log("warn", `${orderId}: invoice over the API failed (${err instanceof Error ? err.message.split("\n")[0].slice(0, 120) : String(err)}) — the page`);
+      }
+    }
+    return captureInvoicePdfs(await pageOf(), orderUrl);
+  };
   // One object per order, captured once per run however many of its units
   // are in the batch; each unit row then points at the shared key.
   const doneOrders = new Map<string, { key: string; size: number; parts: InvoicePart[] }>();
@@ -339,7 +369,7 @@ export async function captureInvoicesForAccount(opts: {
       let stamped = doneOrders.get(orderId);
       let fresh = false;
       if (!stamped) {
-        const pdfs = await captureInvoicePdfs(page, String(r.order_url || ""));
+        const pdfs = await pdfsOf(orderId, String(r.order_url || ""));
         const bundle = await mergeInvoiceBundle(pdfs);
         const productParts = bundle.parts.filter((p) => p.type === "product").length;
         const key = rawInvoiceKey(opts.userId, orderId);

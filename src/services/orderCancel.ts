@@ -12,7 +12,9 @@ import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
 import { getCancelQueue, type CancelJobData } from "../queue.js";
 import { blockFlipkartLogout, desktopContext, flipkartLoginUrl, launchStealthBrowser, restoreFlipkartSession } from "./browser.js";
 import { lockAccount } from "./accountLock.js";
-import { fetchOrderDetails, mapApiUnitToOrder, openOrderApiSession, orderViewFromPageFetch, type ApiOrderView } from "./orderApi.js";
+import { fetchOrderDetails, mapApiUnitToOrder, openOrderApiSession, orderViewFromPageFetch, OrderApiSessionError, type ApiOrderView } from "./orderApi.js";
+import { cancelUnitViaApi, HttpCancelHandoff } from "./httpCancel.js";
+import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { fallbackUnitId, saveMappedUnit, type OrderAccount } from "./orderFetch.js";
 import { claimEgress } from "./proxyPool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
@@ -57,6 +59,11 @@ const UNIT_TIMEOUT_MS = 4 * 60 * 1000;
 const STALE_RUNNING_MS = 10 * 60 * 1000;
 
 class UnitTimeoutError extends Error {}
+
+async function unitStillQueued(requestId: string, unitId: string): Promise<boolean> {
+  const r = await CancelRequest.findOne({ _id: requestId, units: { $elemMatch: { unitId, status: { $in: ["queued", "running"] } } } }).select("_id").lean();
+  return Boolean(r);
+}
 
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: NodeJS.Timeout;
@@ -668,6 +675,62 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
 
     const lease = await claimEgress(`cancel:${requestId}:${email}`).catch(() => ({ egress: null, release: async () => undefined }));
     const egress = lease.egress;
+
+    // API mode (the fetch-mode switch): every unit through Flipkart's cancel API
+    // first — no browser. What the API cannot answer stays for the Chrome flow.
+    const fetchMode = await resolveOrderFetchMode(userId).catch(() => null);
+    if (fetchMode?.mode === "api" && units.length) {
+      const leftover: ICancelUnit[] = [];
+      let api: APIRequestContext | null = null;
+      try {
+        api = await openOrderApiSession(session.cookies, egress ? { proxy: egress.proxy } : {});
+        log(`API mode: ${units.length} unit(s) over the cancel API${egress ? ` via ${egress.label}` : ""}`);
+        for (let i = 0; i < units.length; i++) {
+          const u = units[i];
+          await setUnit(requestId, u.unitId, { status: "running", startedAt: new Date() });
+          await Order.updateOne({ userId: request.userId, unit_id: u.unitId }, { $set: { cancel_status: "running" } });
+          try {
+            const outcome = await withTimeout(
+              cancelUnitViaApi(api, { orderId: u.orderId, unitId: u.unitId, itemId: u.itemId }, { dryRun: request.dryRun, log }),
+              90_000,
+              `${u.orderId}/${u.unitId} (api)`
+            );
+            const note = "feeNote" in outcome && outcome.feeNote ? ` — fee: ${outcome.feeNote}` : "";
+            if (outcome.kind === "cancelled") await finish(u, "cancelled", `${outcome.message}${outcome.refundTat ? ` · ${outcome.refundTat}` : ""}${note}`);
+            else if (outcome.kind === "dry_run") await finish(u, "dry_run", `${outcome.message}${note}`);
+            else await finish(u, "not_cancellable", outcome.message);
+          } catch (err) {
+            const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+            if (err instanceof OrderApiSessionError) {
+              log(`API refused the session (${message.slice(0, 100)}) — the rest in Chrome`);
+              leftover.push(...units.slice(i));
+              break;
+            }
+            if (err instanceof HttpCancelHandoff || err instanceof UnitTimeoutError || TRANSIENT.test(message)) {
+              log(`${u.orderId}/${u.unitId} ${message.slice(0, 120)} — Chrome`);
+              leftover.push(u);
+            } else {
+              await finish(u, "failed", message.slice(0, 500));
+            }
+          }
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      } catch (err) {
+        log(`API pass could not start (${err instanceof Error ? err.message.split("\n")[0].slice(0, 120) : String(err)}) — Chrome`);
+        const seen = new Set(leftover.map((u) => u.unitId));
+        for (const u of units) if (!seen.has(u.unitId) && (await unitStillQueued(requestId, u.unitId))) leftover.push(u);
+      } finally {
+        await api?.dispose().catch(() => undefined);
+      }
+      units.length = 0;
+      units.push(...leftover);
+      if (!units.length && !orders.length) {
+        await lease.release().catch(() => undefined);
+        return;
+      }
+      log(`Chrome for ${units.length} unit(s)${orders.length ? ` and ${orders.length} order page(s)` : ""}`);
+    }
+
     const browser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
     const artifactDir = path.resolve("debug/cancel-runs", requestId);
     const speed = await resolveCancelSpeed(userId).catch(() => null);

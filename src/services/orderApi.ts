@@ -48,7 +48,7 @@ const sessionDc = new WeakMap<APIRequestContext, string>();
 const romeHost = (ctx: APIRequestContext) => `https://${sessionDc.get(ctx) || DEFAULT_DC}.rome.api.flipkart.com`;
 
 /** Run a rome call; on "DC Change" switch this session's prefix and run it once more. */
-async function romeCall<T extends { status(): number; text(): Promise<string> }>(ctx: APIRequestContext, call: (host: string) => Promise<T>): Promise<{ res: T; text: string }> {
+export async function romeCall<T extends { status(): number; text(): Promise<string> }>(ctx: APIRequestContext, call: (host: string) => Promise<T>): Promise<{ res: T; text: string }> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const res = await call(romeHost(ctx));
     const text = await res.text();
@@ -173,7 +173,7 @@ export interface ApiOrder {
 export interface ApiOrderView extends ApiOrder {
   customerInfo?: { businessName?: string | null; gstNumber?: string | null; phoneNumber?: string; emailId?: string };
   addresses?: Record<string, { name?: string; phoneNumber?: string; pinCode?: string; city?: string; state?: string; addressLine1?: string; addressLine2?: string }>;
-  actionEligibilityResponses?: Record<string, { eligible?: boolean; eligibilityReason?: string; actionData?: Record<string, unknown> }>;
+  actionEligibilityResponses?: Record<string, { eligible?: boolean; eligibilityReason?: string; actionMessage?: string | null; actionData?: Record<string, unknown> }>;
 }
 
 export interface OrderListPage {

@@ -361,7 +361,20 @@ async function runClaimedCheckoutJob(
   job: NonNullable<Awaited<ReturnType<typeof claimCheckoutJob>>>
 ) {
 
-  const { quantityPerOrder, totalQuantity, totalAttempts } = batchLimits(data);
+  const limits = batchLimits(data);
+  const { totalQuantity, totalAttempts } = limits;
+  // Upto: the last order of a batch takes only what is still missing (9 units in orders of
+  // 2 → the fifth order asks for 1), so an uneven total can still be completed.
+  let quantityPerOrder = limits.quantityPerOrder;
+  if (data.quantityMode === "upto" && quantityPerOrder > 1) {
+    const now = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
+    const remaining = totalQuantity - now.purchasedQuantity;
+    if (remaining >= 1 && remaining < quantityPerOrder) {
+      await appendLog(data.jobId, "info", `Upto mode: only ${remaining} of ${totalQuantity} unit(s) still to place — this order asks for ${remaining} instead of ${quantityPerOrder}`, "batch");
+      quantityPerOrder = remaining;
+      data = { ...data, quantity: remaining };
+    }
+  }
 
   // ADMISSION, before an attempt is reserved: a job that cannot pay right now
   // — no handset free under its corporate, every card paused — waits, it does

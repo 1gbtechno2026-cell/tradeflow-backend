@@ -408,12 +408,27 @@ async function runClaimedCheckoutJob(
     return;
   }
 
-  const slot = await reserveBatchSlot({
+  let slot = await reserveBatchSlot({
     batchId: data.batchId,
     quantityPerOrder,
     totalQuantity,
     totalAttempts,
   });
+  // Upto, the race the first live run hit (2026-10-30, 9 units in orders of 2): five jobs read
+  // "0 placed" together, four reserved 2 each, the fifth was refused a full 2 with 8/9 done.
+  // When the refusal leaves 1..N-1 units open, take exactly those.
+  if (slot.kind === "skip_target" && data.quantityMode === "upto") {
+    const remaining = totalQuantity - slot.purchasedQuantity;
+    if (remaining >= 1 && remaining < quantityPerOrder) {
+      const retry = await reserveBatchSlot({ batchId: data.batchId, quantityPerOrder: remaining, totalQuantity, totalAttempts });
+      if (retry.kind === "ok") {
+        await appendLog(data.jobId, "info", `Upto mode: ${remaining} of ${totalQuantity} unit(s) still open — this order asks for ${remaining} instead of ${quantityPerOrder}`, "batch");
+        quantityPerOrder = remaining;
+        data = { ...data, quantity: remaining };
+        slot = retry;
+      }
+    }
+  }
   if (slot.kind === "skip_target") {
     await finishWithoutChrome(
       data.jobId,

@@ -532,7 +532,6 @@ async function runClaimedCheckoutJob(
     const outcome = await runHttpCheckout({
       cookies: session.cookies,
       proxy: egress?.proxy ?? null,
-      addressMatch: checkoutSettings?.addressMatchPhrase ? "phrase" : "name",
       verifyWaitMs: checkoutSettings ? checkoutSettings.httpVerifyWaitSec * 1000 : undefined,
       productUrl: data.productUrl,
       quantity: quantityPerOrder,

@@ -25,8 +25,7 @@ export interface IOrderSyncSettings {
   fetchScheduleChangedAt: Date | null;
   /** Scheduled fetch downloads invoices ("All missing": every delivered unit without a PDF, capped per run). Dashboard Settings toggle; null = FETCH_SCHEDULE_INVOICES / off. */
   /** Proxy mode per environment (services/proxyMode.ts): off | preferred | required; null = that process's PROXY_MODE env. */
-  /** HTTP checkout engine: accept a saved address by its Match Phrase; seconds to wait for My Orders after Pay. null = default. */
-  addressMatchPhrase: boolean | null;
+  /** HTTP checkout engine: seconds to wait for My Orders after Pay. null = default. */
   httpVerifyWaitSec: number | null;
   checkoutChangedBy: string;
   checkoutChangedAt: Date | null;
@@ -62,8 +61,7 @@ const OrderSyncSettingsSchema = new Schema<IOrderSyncSettings>(
     proxyChangedBy: { type: String, default: "" },
     proxyChangedAt: { type: Date, default: null },
     scheduledInvoices: { type: Boolean, default: null },
-    // HTTP checkout engine switches (services/checkoutSettings.ts); null = default.
-    addressMatchPhrase: { type: Boolean, default: null },
+    // HTTP checkout engine (services/checkoutSettings.ts); null = default.
     httpVerifyWaitSec: { type: Number, default: null },
     checkoutChangedBy: { type: String, default: "" },
     checkoutChangedAt: { type: Date, default: null },

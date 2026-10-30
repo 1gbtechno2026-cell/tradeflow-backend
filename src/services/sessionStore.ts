@@ -121,6 +121,5 @@ export async function resolveAddress(input: {
     companyName,
     label: row.label || "",
     gstLabel,
-    matchPhrase: (row.matchPhrase || "").trim(),
   };
 }

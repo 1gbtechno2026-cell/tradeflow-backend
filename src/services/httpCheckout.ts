@@ -76,8 +76,6 @@ export interface HttpCheckoutInput {
   gstMandatory?: boolean;
   /** Stop after the payment token; nothing is bought; the cart is cleaned. */
   dryRun: boolean;
-  /** "phrase": a saved address also counts when its text contains address.matchPhrase (default "name": identical contact name). */
-  addressMatch?: "name" | "phrase";
   /** How long to wait after Pay for My Orders to list the order (default VERIFY_WAIT_MS). */
   verifyWaitMs?: number;
   log: (level: LogLevel, message: string, step?: string) => void;
@@ -267,13 +265,9 @@ function contactsFrom(json: Json): Contact[] {
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
-export function contactMatches(c: Contact, address: AddressDetails, pincode: string, mode: "name" | "phrase" = "name"): boolean {
-  if (c.pincode !== pincode) return false;
+function contactMatches(c: Contact, address: AddressDetails, pincode: string): boolean {
   const wanted = norm(address.companyName || address.name || "");
-  if (!wanted || norm(c.name) === wanted) return true;
-  // Match Phrase: the saved entry is ours when its name or address text carries the phrase.
-  const phrase = mode === "phrase" ? norm(address.matchPhrase || "") : "";
-  return phrase.length >= 3 && norm(`${c.name} ${c.addressLine1} ${c.city}`).includes(phrase);
+  return c.pincode === pincode && (!wanted || norm(c.name) === wanted);
 }
 
 function contactBody(address: AddressDetails, pincode: string, phone: string): Json {
@@ -533,7 +527,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
     // address (its phone stays), else add it; then select it on the checkout.
     if (input.address && (!sum.addressId || (sum.summaryPin && sum.summaryPin !== pincode))) {
       const contacts = contactsFrom(await rome.get("/api/1/contacts", "address book"));
-      let target = contacts.find((c) => contactMatches(c, input.address!, pincode, input.addressMatch || "name")) || null;
+      let target = contacts.find((c) => contactMatches(c, input.address!, pincode)) || null;
       if (!target) {
         const base = contacts.find((c) => c.isDefault) || contacts[0] || null;
         const phone = (base?.phone || input.address.mobile || "").replace(/\D/g, "").slice(-10);
@@ -547,7 +541,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
         target = { id, name: body.name as string, pincode, phone, addressLine1: body.addressLine1 as string, city: body.city as string, isDefault: true };
         log("info", `[http] address book: ${base ? `edited ${base.city || "?"} ${base.pincode} into` : "added"} ${body.city} ${pincode} (contact ${id})`, "address");
       } else {
-        log("info", `[http] address book: saved address ${target.city} ${target.pincode} matches${input.addressMatch === "phrase" && input.address.matchPhrase ? ` (phrase "${input.address.matchPhrase}")` : ""} (contact ${target.id})`, "address");
+        log("info", `[http] address book: saved address ${target.city} ${target.pincode} matches (contact ${target.id})`, "address");
       }
       const refs = cartItemRefIds(R(sum.summary));
       if (!refs.length) throw new Fallback("checkout page shows no cart item ref — cannot select the address; the page flow does it");

@@ -447,6 +447,22 @@ function cartLines(json: Json): Array<{ listingId: string; productId: string }> 
   return out;
 }
 
+/**
+ * Is a GST invoice already applied to this checkout? Read from the summary's
+ * checkoutSummaryTrackingData (gbCheckBoxSelected = ticked, gstApplicable = the
+ * box is offered for this item/account).
+ *
+ * Ticking GST is deliberately NOT done over the API. The checkout exposes a
+ * `CHECKOUT_UPDATE_GST` action and it answers actionSuccess:true, but Flipkart
+ * does not actually apply the invoice from that single call — gbCheckBoxSelected
+ * stays false in the response and in a fresh fetch. Applying GST needs the
+ * page's multi-step drawer confirm, which the Chrome flow does reliably. A
+ * GST-mandatory order placed without the invoice is a tax problem, so when GST
+ * must be on and is not already ticked, this engine hands the order to the
+ * Chrome flow rather than guessing. (If Flipkart ever applies it from the API,
+ * this is where to revisit — see git history for the probe.)
+ */
+
 export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpCheckoutOutcome> {
   const timings: HttpStepTimings = {};
   const t0 = Date.now();
@@ -597,8 +613,26 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
     if (summaryPin && summaryPin !== pincode) throw new Fallback(`checkout address pincode ${summaryPin} is not the job's ${pincode} — the page flow selects the address`);
     if (serviceable === false) return { kind: "failed", failure: new CheckoutFailure("ITEM_NOT_DELIVERABLE", `Pincode ${pincode} is not serviceable for this cart`), timings };
     if (track.addressError === true) throw new Fallback(`address error on checkout: ${String(track.addressErrorReason || "")}`);
+
+    // GST invoice, driven entirely by the job's toggle (gstMandatory):
+    //   ON  → the box MUST end up ticked. Already ticked → proceed. Not ticked
+    //         but Flipkart does not offer GST on this item (gstApplicable false)
+    //         → the order cannot carry it: GST_NOT_APPLICABLE (a real verdict,
+    //         the same one Chrome gives, so no pointless fallback). Not ticked
+    //         but offered → the Chrome flow ticks it reliably (its GST drawer).
+    //   OFF → do nothing: the box is left untouched (it is unticked by default;
+    //         Flipkart does not pre-tick GST without a saved default), so the
+    //         order passes without GST.
     // gstApplicable says the box exists; gbCheckBoxSelected says it is ticked.
-    if (input.gstMandatory && track.gbCheckBoxSelected !== true) throw new Fallback("GST invoice required and the GST box is not ticked on this checkout — the page flow ticks it");
+    if (input.gstMandatory && track.gbCheckBoxSelected !== true) {
+      if (track.gstApplicable !== true) {
+        return { kind: "failed", failure: new CheckoutFailure("GST_NOT_APPLICABLE", "GST invoice is mandatory but Flipkart does not offer a GST invoice for this item on this account"), timings };
+      }
+      throw new Fallback("GST invoice required and not ticked — the page flow ticks it (reliably, via the GST drawer)");
+    }
+    if (input.gstMandatory && track.gbCheckBoxSelected === true) {
+      log("info", "[http] GST invoice already applied on the checkout", "gst");
+    }
     // The checkout's own lines: every product card must be this listing, at this quantity.
     const cards = findAll(R(summary), (o) => o.type === "CART_PAGE_PRODUCT_CARD" && typeof o.data === "object")
       .map((o) => (((o.data as Json).productInfo as Json | undefined)?.baseInfo as Json | undefined)?.value as Json | undefined)

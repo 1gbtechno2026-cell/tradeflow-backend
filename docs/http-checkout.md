@@ -101,9 +101,23 @@ Outcomes, settled exactly like a Chrome card order:
 | `failed` CODE | a Flipkart-side verdict (not deliverable / amount limit / SLA) or a card/bank failure from the payment phase | `failed` with the code; card-pool verdict applies as in Chrome |
 | fallback → Chrome | **GST mandatory and the box is not auto-ticked**, a login/captcha challenge, a cart it cannot settle, or the pay page not rendering from the HTTP token | the full Chrome flow runs and handles it (it ticks GST) |
 
-**GST:** a GST-mandatory card order whose checkout does not auto-tick the GST box
-**falls back to the full Chrome flow**, which ticks it — nothing is left
-unhandled. (If a B2B account auto-ticks, the HTTP path proceeds.)
+**GST (toggle-driven, every flow and medium):** the job's GST Mandatory toggle
+is authoritative in both engines.
+
+| Toggle | Checkout state | HTTP engine (COD + card) | Chrome |
+|---|---|---|---|
+| ON | GST already ticked | proceed with GST | leave it |
+| ON | GST offered, not ticked | **fall back to Chrome**, which ticks it via the GST drawer | ticks it |
+| ON | GST **not** offered for the item (`gstApplicable` false) | `GST_NOT_APPLICABLE` (failed) | `GST_NOT_APPLICABLE` |
+| OFF | anything | skip GST, order passes without it | skip |
+
+The engine does **not** tick GST over the API: Flipkart's `CHECKOUT_UPDATE_GST`
+action answers `actionSuccess:true` but does not actually apply the invoice from
+that one call (`gbCheckBoxSelected` stays false in the response and a fresh
+fetch), so a GST-mandatory order would silently place without its invoice — a
+tax problem. Applying GST needs Flipkart's multi-step drawer, which the Chrome
+flow does reliably, so GST-on-not-yet-ticked orders fall back to Chrome. The
+probe that established this is in git history.
 
 Test it outside the queue (card data from a CSV, never logged beyond last 4):
 

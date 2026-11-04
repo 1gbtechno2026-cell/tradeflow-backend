@@ -2756,8 +2756,10 @@ export class FlipkartCheckout {
   private async verifyGstCheckboxOnSummary(address: AddressDetails, gstMandatory = true): Promise<void> {
     const gstNumber = (address.gstNumber || "").trim().toUpperCase();
     const companyName = (address.companyName || "").trim();
-    if (!gstMandatory && !gstNumber) {
-      console.log("GST not mandatory and no GST on job — skipping GST invoice");
+    // The toggle is authoritative: OFF skips GST entirely, even if the job (or
+    // the account) carries a GST number. ON applies it below.
+    if (!gstMandatory) {
+      console.log("GST toggle off — skipping GST invoice");
       return;
     }
     console.log(`Verifying GST on order summary: ${gstNumber || "(none)"} / ${companyName || "(none)"} mandatory=${gstMandatory}`);

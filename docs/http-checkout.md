@@ -68,8 +68,62 @@ The engine decides on its own only what it can be sure of:
 | proxy error before pay | tunnel dropped | PROXY_FAILED path: attempt refunded, job re-queued, proxy reported |
 
 What still goes to Chrome today: **GST invoice** (the GST box; `CHECKOUT_UPDATE_GST`
-is not implemented), card payments, accounts whose saved address cannot be
-edited.
+is not implemented), accounts whose saved address cannot be edited.
+
+## Card payments (High Speed + card) — the hybrid
+
+Card orders (`high_speed` + a card payment mode, e.g. HDFC Virtual) run the
+**Flipkart side over HTTP and only the payment surface in a browser**. The
+engine never touches a card number.
+
+| Leg | How | Code |
+|---|---|---|
+| cart → add → checkout → address → GST/SLA/amount checks → payment token | HTTP, `paymentMode: "card"` — identical to COD, every COD fallback applies | `httpCheckout.ts` returns `{ kind: "card_handoff", token, payPageUrl, dc, … }` |
+| card fill → Pay → bank 3-D Secure password → confirmation | a browser opens `pay.flipkart.com/payments?token=…` in the account's own session and runs the existing payment phase + bank strategy unchanged | `checkoutRunner.ts` (the "HTTP engine, card" block) → `runPaymentPhase` → `paymentStrategies/*` |
+
+Why a browser for the bank leg: the 3-D Secure step authenticates the cardholder
+on the **bank's** own ACS page (HDFC hashes a static password client-side with a
+page-embedded, rotating salt and runs bot-defense). That page is the bank's
+anti-fraud control; it is driven on its own page by the proven `hdfcVirtual`
+strategy, not reconstructed over raw HTTP.
+
+Routing is unchanged: a card job stays on the browser-scaled `checkout-card`
+queue (one browser per order), not the high-concurrency `checkout-http` queue —
+the HTTP part only replaces the ~25–30 s of Chrome navigation (desktop
+preflight + m-site + product + cart + checkout) with a ~2.5 s HTTP build, then
+the browser opens straight at the pay page.
+
+Outcomes, settled exactly like a Chrome card order:
+
+| Outcome | When | Job |
+|---|---|---|
+| `paid` | the payment phase authenticated and Flipkart confirmed | `paid`, card + order fields recorded |
+| `failed` CODE | a Flipkart-side verdict (not deliverable / amount limit / SLA) or a card/bank failure from the payment phase | `failed` with the code; card-pool verdict applies as in Chrome |
+| fallback → Chrome | **GST mandatory and the box is not auto-ticked**, a login/captcha challenge, a cart it cannot settle, or the pay page not rendering from the HTTP token | the full Chrome flow runs and handles it (it ticks GST) |
+
+**GST:** a GST-mandatory card order whose checkout does not auto-tick the GST box
+**falls back to the full Chrome flow**, which ticks it — nothing is left
+unhandled. (If a B2B account auto-ticks, the HTTP path proceeds.)
+
+Test it outside the queue (card data from a CSV, never logged beyond last 4):
+
+```
+npm run test:card-http -- --n 1 --email a@b.in --cards ./hdfc.csv
+    SMOKE (default): HTTP → pay page → fill the real card → STOP before Pay.
+    No money. Proves the token carries and the form fills.
+npm run test:card-http -- --n 5 --cards ./hdfc.csv --real 5
+    REAL: places up to 5 real card orders (card + bank password + confirm).
+    --gst 1 (GST mandatory → expect fallback)  --sla 1 / --limit 100 (failures)
+    --direct   --skip N   --out ./debug/card-http
+```
+
+Verified 2026-11-04 (smoke, nunplybra@bobbhai.in, DC 2, proxy): HTTP built the
+checkout and returned the token in ~2.0–2.7 s; the token **carried** into a fresh
+browser (the pay page rendered the card option); the card filled completely
+(PAN 16, expiry 11/26, CVV 3, "Pay ₹208"); GST-mandatory fell back to Chrome;
+`--sla 1` → `SLA_EXCEEDED`; `--limit 100` → `CART_AMOUNT_LIMIT`. The bank leg is
+the same payment phase that placed real Chrome card order OD439063160087718100
+earlier the same day. Real orders are operator-triggered (`--real`).
 
 ## Bench (engine alone, no queue)
 

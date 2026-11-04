@@ -80,6 +80,11 @@ export interface HttpCheckoutInput {
   verifyWaitMs?: number;
   /** "upto": when Flipkart caps the units below `quantity`, place the capped amount (≥ 1) instead of handing off; default "minimum" = exactly `quantity`. */
   quantityMode?: "minimum" | "upto";
+  /** "cod" (default): the engine places the order itself with the COD pay call.
+   *  "card": the engine runs the whole Flipkart side to the payment token and
+   *  then hands the checkout back (a browser opens the pay page for the card +
+   *  bank + confirm). The engine never touches a card itself. */
+  paymentMode?: "cod" | "card";
   log: (level: LogLevel, message: string, step?: string) => void;
   /** Called right before the order call — the line between "safe to re-run" and "an order may exist". */
   onBeforePay?: () => Promise<void>;
@@ -121,6 +126,26 @@ export interface HttpDryRun {
   cartCleaned: boolean;
   timings: HttpStepTimings;
 }
+/**
+ * Card mode only: the Flipkart side is done and the payment token is in hand.
+ * The caller opens a browser at `payPageUrl` (the account's own session) and
+ * runs the card + bank + confirmation there. Nothing has been paid yet; the
+ * cart still holds the item, which is what the pay page needs.
+ */
+export interface HttpCardHandoff {
+  kind: "card_handoff";
+  token: string;
+  /** pay.flipkart.com/payments?token=… — where the browser takes over. */
+  payPageUrl: string;
+  /** The data-centre prefix the session settled on (the pay page is DC-scoped). */
+  dc: string;
+  checkoutTotal: number | null;
+  deliveryDays: number | null;
+  deliveryText: string;
+  addressId: string;
+  exitIp: string;
+  timings: HttpStepTimings;
+}
 export interface HttpFallback {
   kind: "fallback";
   reason: string;
@@ -134,7 +159,7 @@ export interface HttpFailed {
   payUnknown?: boolean;
   timings: HttpStepTimings;
 }
-export type HttpCheckoutOutcome = HttpPlaced | HttpDryRun | HttpFallback | HttpFailed;
+export type HttpCheckoutOutcome = HttpPlaced | HttpDryRun | HttpCardHandoff | HttpFallback | HttpFailed;
 
 class Fallback extends Error {}
 
@@ -641,6 +666,26 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
       lap("cart_cleanup");
       log("info", `[http] DRY RUN — payment token obtained in ${Date.now() - t0} ms; nothing bought; cart ${cartCleaned ? "cleaned" : "NOT cleaned"}`, "dry_run");
       return { kind: "dry_run", token, checkoutTotal: totalCost, deliveryDays, deliveryText, addressId, exitIp, cartCleaned, timings };
+    }
+
+    // Card: the Flipkart side is done. Hand the checkout to the browser — the
+    // item stays in the cart (the pay page needs it), nothing is paid here, and
+    // the engine never sees the card. The caller opens payPageUrl in the
+    // account's own session and runs the card + bank + confirmation.
+    if (input.paymentMode === "card") {
+      log("info", `[http] card hand-off — Flipkart side done in ${Date.now() - t0} ms on DC ${rome.dc}; browser takes the payment page`, "card_handoff");
+      return {
+        kind: "card_handoff",
+        token,
+        payPageUrl: `${PAY_PAGE}/payments?token=${token}`,
+        dc: rome.dc,
+        checkoutTotal: totalCost,
+        deliveryDays,
+        deliveryText,
+        addressId,
+        exitIp,
+        timings,
+      };
     }
 
     // 6. the payment page, for its cookies

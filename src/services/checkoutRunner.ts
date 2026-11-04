@@ -681,8 +681,10 @@ async function runClaimedCheckoutJob(
       await endHere();
       return;
     }
-    // fallback → the page flow, one Chrome slot at a time
-    httpLog("info", `[http] handing this order to the Chrome flow (${outcome.reason})`, "session");
+    // fallback → the page flow, one Chrome slot at a time. (The COD engine never
+    // returns card_handoff; this narrows the union for the fallthrough.)
+    const fallbackReason = outcome.kind === "fallback" ? outcome.reason : "unexpected outcome";
+    httpLog("info", `[http] handing this order to the Chrome flow (${fallbackReason})`, "session");
     releaseChromeSlot = await acquireChromeFallbackSlot();
     // The wait at the gate can be long; a batch cancelled meanwhile must not open Chrome.
     const latestAfterWait = await CheckoutJob.findById(data.jobId).select("status");
@@ -693,6 +695,185 @@ async function runClaimedCheckoutJob(
       await endHere();
       return;
     }
+  }
+
+  // ── HTTP engine ("High Speed", card) ─────────────────────────────────────
+  // The Flipkart side runs over HTTP (services/httpCheckout.ts, paymentMode
+  // "card"): cart, address, GST check, SLA, amount, payment token — every
+  // fallback the COD engine has. It then hands a payment token back and a
+  // browser opens straight at the pay page, where the existing payment phase
+  // (runPaymentPhase) does the card, the bank password (the strategy) and the
+  // confirmation. The bank leg is unchanged. A fallback (GST box not ticked, a
+  // challenge, anything the HTTP side cannot settle) carries on into the full
+  // Chrome flow below, which handles all of it.
+  if (data.executionVersion === "high_speed" && cls === "card") {
+    const httpLog = (level: LogLevel, message: string, step?: string) => void appendLog(data.jobId, level, message, step);
+    const endHere = async () => {
+      await releaseEgress().catch(() => undefined);
+      const latest = await CheckoutJob.findById(data.jobId).select("status");
+      if (latest?.status === "cancelled") await releaseReservation();
+      await unlockAccount();
+      await settleBatchIfCancelling(data.batchId).catch(() => undefined);
+    };
+    const handoff = await runHttpCheckout({
+      cookies: session.cookies,
+      proxy: egress?.proxy ?? null,
+      quantityMode: data.quantityMode,
+      paymentMode: "card",
+      productUrl: data.productUrl,
+      quantity: quantityPerOrder,
+      pincode: data.address.checkoutPincode || data.address.pincode || "",
+      address: data.address,
+      cartAmountLimit: data.cartAmountLimit,
+      deliverySlaDays: data.deliverySlaDays,
+      gstMandatory: data.gstMandatory ?? job.request?.gstMandatory ?? true,
+      dryRun: PAYMENT_DRY_RUN,
+      log: httpLog,
+    });
+    const timing = Object.entries(handoff.timings).map(([k, v]) => `${k} ${v}ms`).join(" · ");
+    if (timing) httpLog("info", `[http] ${handoff.kind} · ${timing}`, "session");
+    if (egress && "exitIp" in handoff && handoff.exitIp) {
+      await recordProxyUse(egress.id, data.jobId, handoff.exitIp);
+      await patchResult(data.jobId, { egressProxy: egress.label, exitIp: handoff.exitIp });
+    } else if (handoff.kind !== "fallback") {
+      await patchResult(data.jobId, { egressProxy: egress ? egress.label : "direct" });
+    }
+
+    // Proxy dropped before any card work: refund + re-queue, as the COD engine does.
+    if (handoff.kind === "fallback" && egress && isProxyError(handoff.reason)) {
+      const retired = await reportProxyFailure(egress.id, handoff.reason.split("\n")[0]);
+      httpLog("warn", `[proxy] ${egress.label} failed in the HTTP card engine: ${handoff.reason.slice(0, 200)}${retired ? " — marked DEAD" : ""}; attempt refunded, job re-queued`, "session");
+      await releaseReservation();
+      await refundBatchAttempt(data.batchId);
+      await requeueCheckoutJob(data, config.proxyWaitMs, `proxy ${egress.label} failed — PROXY_FAILED`);
+      await endHere();
+      return;
+    }
+    // A Flipkart-side verdict (not deliverable, over the amount limit, SLA, COD
+    // n/a does not arise for card): record and let the batch continue.
+    if (handoff.kind === "failed") {
+      const failure = handoff.failure;
+      httpLog("error", `${failure.display}: ${failure.details}`, failure.failedStep);
+      await reporterFor(data.jobId)?.beforeTerminal();
+      await CheckoutJob.updateOne({ _id: data.jobId, status: { $ne: "cancelled" } }, { $set: { status: "failed", completedAt: new Date(), step: failure.failedStep, ...failureFields(failure) } });
+      await releaseReservation();
+      if (failure.noRetry) httpLog("info", `${failure.code} is a verdict on this platform ID — not re-queued; the batch continues with the next ID`, "batch");
+      else await maybeEnqueueRetry(data, job.userId, failure.failedStep, job.request);
+      await endHere();
+      return;
+    }
+    if (handoff.kind === "card_handoff") {
+      // Open the account's own session at the pay page. If the token does not
+      // render a payment page there (session/token not carried), close and fall
+      // through to the full Chrome flow — nothing has been paid.
+      const mob = await launchMobileBrowser({ headless: config.headless, proxy: egress?.proxy });
+      const mobContext = await mobileContext(mob);
+      const cardApiWatcher = new FlipkartApiWatcher();
+      cardApiWatcher.attach(mobContext);
+      const cardPaymentApi = new PaymentApiWatcher().attach(mobContext);
+      const cardPage = await mobContext.newPage();
+      await blockFlipkartLogout(cardPage);
+      await restoreFlipkartSession(cardPage, session.cookies);
+      let rendered = false;
+      try {
+        await cardPage.goto(handoff.payPageUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+        rendered = await cardPage
+          .getByText(/Credit\s*\/\s*Debit\s*\/\s*ATM Card/i)
+          .first()
+          .waitFor({ state: "visible", timeout: 20_000 })
+          .then(() => true)
+          .catch(() => false);
+      } catch (err) {
+        httpLog("warn", `[http] card: pay page navigation failed (${err instanceof Error ? err.message.split("\n")[0].slice(0, 120) : String(err)})`, "payment");
+      }
+      if (!rendered) {
+        httpLog("warn", "[http] card: the payment page did not render from the HTTP token — falling back to the full Chrome flow", "session");
+        await mobContext.close().catch(() => undefined);
+        await mob.close().catch(() => undefined);
+        // fall through to Chrome (do NOT return)
+      } else {
+        httpLog("info", `[http] card hand-off reached the pay page (DC ${handoff.dc}) — card + bank over the browser`, "payment");
+        job.status = "reached_payment";
+        job.step = "payment";
+        job.paymentUrl = cardPage.url();
+        await job.save();
+        await patchResult(data.jobId, { paymentUrl: cardPage.url() });
+        let settled = false;
+        try {
+          const payment = await runPaymentPhase({
+            page: cardPage,
+            data,
+            log: httpLog,
+            dryRun: PAYMENT_DRY_RUN,
+            paymentApi: cardPaymentApi,
+            onBeforePay: async () => {
+              await CheckoutJob.updateOne({ _id: data.jobId }, { $set: { paymentStartedAt: new Date() } });
+            },
+          });
+          if (payment.attempted && payment.ok && PAYMENT_DRY_RUN) {
+            await releaseReservation();
+            await refundBatchAttempt(data.batchId);
+            await reporterFor(data.jobId)?.beforeTerminal();
+            await CheckoutJob.updateOne({ _id: data.jobId }, { $set: { status: "dry_run", step: "dry_run", completedAt: new Date() } });
+            httpLog("warn", "DRY RUN — HTTP card engine reached the pay page; nothing was placed.", "dry_run");
+            settled = true;
+          } else if (payment.attempted && !payment.ok) {
+            if (payment.cardUsed) await patchResult(data.jobId, payment.cardUsed);
+            const failure = payment.failure;
+            httpLog("error", `${failure.display}: ${failure.details}`, failure.failedStep);
+            await reporterFor(data.jobId)?.beforeTerminal();
+            await CheckoutJob.updateOne({ _id: data.jobId, status: { $ne: "cancelled" } }, { $set: { status: "failed", completedAt: new Date(), step: failure.failedStep, ...failureFields(failure) } });
+            await releaseReservation();
+            if (failure.noRetry) httpLog("info", `${failure.code} is a verdict on this platform ID — not re-queued; the batch continues with the next ID`, "batch");
+            else await maybeEnqueueRetry(data, job.userId, failure.failedStep, job.request);
+            settled = true;
+          } else if (payment.attempted && payment.ok) {
+            await reporterFor(data.jobId)?.beforeTerminal();
+            job.status = "paid";
+            job.step = "paid";
+            job.completedAt = new Date();
+            await job.save();
+            await patchResult(data.jobId, {
+              ...(payment.result
+                ? { cardTypeName: payment.result.cardTypeName, cardLast4: payment.result.cardLast4, authType: payment.result.authType, employeeId: payment.result.employeeId, authenticatedAt: payment.result.authenticatedAt }
+                : {}),
+              ...(payment.confirmation?.orderId ? { flipkartOrderId: payment.confirmation.orderId } : {}),
+              ...(payment.confirmation?.referenceId ? { flipkartReferenceId: payment.confirmation.referenceId } : {}),
+              ...(payment.confirmation?.amount ? { transactionAmount: payment.confirmation.amount } : {}),
+              ...orderDetailFields(payment.confirmation?.details),
+              ...(payment.cardUsed ?? {}),
+              ...(handoff.checkoutTotal ? { cartAmount: `₹${handoff.checkoutTotal}` } : {}),
+              ...(handoff.deliveryText ? { deliveryText: handoff.deliveryText } : {}),
+              ...(handoff.deliveryDays != null ? { deliveryDays: handoff.deliveryDays } : {}),
+            });
+            reservationHeld = false;
+            const progress = await readBatchProgress(data.batchId, totalQuantity, totalAttempts);
+            httpLog("info", `Payment authenticated with card ${payment.cardId} (${payment.ordersOnCard} order(s) on it) — batch purchased ${progress.purchasedQuantity}/${totalQuantity}, attempts ${progress.attemptsUsed}/${totalAttempts}`, "paid");
+            settled = true;
+          }
+        } catch (err) {
+          // runPaymentPhase itself threw (not a returned failure): record it so
+          // the slot is released and the batch is not left hanging.
+          const failure = err instanceof CheckoutFailure ? err : classifyThrownMessage(err instanceof Error ? err.message : String(err));
+          httpLog("error", `[http] card payment phase threw: ${failure.display}: ${failure.details}`, failure.failedStep);
+          await reporterFor(data.jobId)?.beforeTerminal();
+          await CheckoutJob.updateOne({ _id: data.jobId, status: { $ne: "cancelled" } }, { $set: { status: "failed", completedAt: new Date(), step: failure.failedStep, ...failureFields(failure) } });
+          await releaseReservation();
+          if (!failure.noRetry) await maybeEnqueueRetry(data, job.userId, failure.failedStep, job.request);
+          settled = true;
+        } finally {
+          await sleep(config.keepBrowserOpenMs);
+          await mobContext.close().catch(() => undefined);
+          await mob.close().catch(() => undefined);
+        }
+        void settled;
+        await endHere();
+        return;
+      }
+    }
+    // handoff.kind === "fallback" (not a proxy error): carry on into Chrome.
+    const cardFallbackReason = handoff.kind === "fallback" ? handoff.reason : "pay page not reachable over HTTP";
+    httpLog("info", `[http] card: handing this order to the full Chrome flow (${cardFallbackReason})`, "session");
   }
 
   // One watcher across both legs — see testFlow for why.

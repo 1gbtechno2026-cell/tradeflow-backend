@@ -40,6 +40,10 @@ const VERBOSE = has("verbose");
 const NAME = arg("name", "DASHMOBILES PRIVATE LIMITED");
 const QTY = Math.max(1, Number(arg("qty", "1")) || 1);
 const QMODE = arg("qmode", "minimum") === "upto" ? "upto" : "minimum";
+// "cod" (default) or "card": card stops at the pay-page hand-off (the bench does
+// not drive a browser), so --mode card --real proves the Flipkart side + the
+// token for a card order without paying.
+const MODE = arg("mode", "cod") === "card" ? "card" : "cod";
 const ADDRESS = { name: NAME, mobile: "", pincode: PINCODE, locality: "UDYOG VIHAR", addressLine1: "Cabin 2, 581 , PHASE -5", city: "Gurugram", state: "Haryana", addressType: "Home" as const, gstNumber: "06AALCD3578N1Z0", companyName: "DASHMOBILES PRIVATE LIMITED", checkoutPincode: "" };
 const DIRECT = has("direct");
 
@@ -87,6 +91,7 @@ async function main() {
         productUrl: PRODUCT,
         quantity: QTY,
         quantityMode: QMODE,
+        paymentMode: MODE,
         pincode: PINCODE,
         address: has("no-address-fix") ? undefined : ADDRESS,
         deliverySlaDays: Number(arg("sla", "9")) || 9,
@@ -99,7 +104,16 @@ async function main() {
       });
       const ms = Date.now() - t;
       results.push({ email: acct.email, outcome, ms, proxy: proxy ? proxy.server.replace(/^https?:\/\//, "") : "direct" });
-      const tag = outcome.kind === "failed" ? `failed ${outcome.failure.code}` : outcome.kind === "fallback" ? `fallback: ${outcome.reason.slice(0, 90)}` : outcome.kind === "placed" ? `PLACED ${outcome.orderId}${outcome.quantityPlaced != null ? ` qty ${outcome.quantityPlaced}` : ""}` : `dry_run ₹${outcome.checkoutTotal ?? "?"}${outcome.cartCleaned ? "" : " (cart not cleaned)"}`;
+      const tag =
+        outcome.kind === "failed"
+          ? `failed ${outcome.failure.code}`
+          : outcome.kind === "fallback"
+            ? `fallback: ${outcome.reason.slice(0, 90)}`
+            : outcome.kind === "placed"
+              ? `PLACED ${outcome.orderId}${outcome.quantityPlaced != null ? ` qty ${outcome.quantityPlaced}` : ""}`
+              : outcome.kind === "card_handoff"
+                ? `CARD HANDOFF ₹${outcome.checkoutTotal ?? "?"} token ${outcome.token.slice(0, 16)}… (pay page not driven by bench)`
+                : `dry_run ₹${outcome.checkoutTotal ?? "?"}${outcome.cartCleaned ? "" : " (cart not cleaned)"}`;
       console.log(`${String(results.length).padStart(4)}/${picked.length} ${String(ms).padStart(6)} ms  ${acct.email.padEnd(34)} ${tag}`);
       await acct.unlock().catch(() => undefined);
     }

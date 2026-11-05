@@ -601,6 +601,7 @@ async function runClaimedCheckoutJob(
       await patchResult(data.jobId, {
         flipkartOrderId: outcome.orderId,
         flipkartReferenceId: outcome.referenceId,
+        ...(outcome.productName ? { productName: outcome.productName } : {}),
         ...(outcome.amount ? { transactionAmount: outcome.amount } : {}),
         ...(outcome.paymentFee ? { paymentFee: outcome.paymentFee, paymentFeeDetails: outcome.paymentFee } : {}),
         ...(outcome.details.orderStatus ? { orderStatus: outcome.details.orderStatus } : {}),
@@ -763,6 +764,7 @@ async function runClaimedCheckoutJob(
       return;
     }
     if (handoff.kind === "card_handoff") {
+      if (handoff.productName) await patchResult(data.jobId, { productName: handoff.productName });
       // Open the account's own session at the pay page. If the token does not
       // render a payment page there (session/token not carried), close and fall
       // through to the full Chrome flow — nothing has been paid.

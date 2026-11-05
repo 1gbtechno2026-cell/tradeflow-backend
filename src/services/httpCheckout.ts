@@ -112,6 +112,8 @@ export interface HttpPlaced {
   deliveryDays: number | null;
   deliveryText: string;
   exitIp: string;
+  /** Product title read off the checkout's own product card (same field the Chrome scrape fills). */
+  productName: string;
   details: { orderStatus?: string; sellerName?: string; price?: number; mrp?: number; slaDays?: number | null };
   timings: HttpStepTimings;
 }
@@ -123,6 +125,7 @@ export interface HttpDryRun {
   deliveryText: string;
   addressId: string;
   exitIp: string;
+  productName: string;
   cartCleaned: boolean;
   timings: HttpStepTimings;
 }
@@ -144,6 +147,7 @@ export interface HttpCardHandoff {
   deliveryText: string;
   addressId: string;
   exitIp: string;
+  productName: string;
   timings: HttpStepTimings;
 }
 export interface HttpFallback {
@@ -637,6 +641,16 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
     const cards = findAll(R(summary), (o) => o.type === "CART_PAGE_PRODUCT_CARD" && typeof o.data === "object")
       .map((o) => (((o.data as Json).productInfo as Json | undefined)?.baseInfo as Json | undefined)?.value as Json | undefined)
       .filter((v): v is Json => !!v && typeof v.listingId === "string");
+    // The product's own title, straight off the checkout card for this listing.
+    // Same value the Chrome scrape records as result.productName; the HTTP flow
+    // never had it before, so High Speed batches showed no product name.
+    const myCardRaw = findAll(R(summary), (o) => o.type === "CART_PAGE_PRODUCT_CARD" && typeof o.data === "object")
+      .map((o) => o.data as Json)
+      .find((d) => String((((d.productInfo as Json | undefined)?.baseInfo as Json | undefined)?.value as Json | undefined)?.listingId || "").toUpperCase() === ids.lid);
+    const myCardValue = ((myCardRaw?.productInfo as Json | undefined)?.baseInfo as Json | undefined)?.value as Json | undefined;
+    const productTitle = String(
+      myCardValue?.title || myCardValue?.productTitle || myCardValue?.name || findKey(myCardRaw || {}, "title") || ""
+    ).replace(/\s+/g, " ").trim();
     let others = cards.filter((v) => String(v.listingId).toUpperCase() !== ids.lid);
     if (others.length) {
       // Another listing rides on this checkout (left in the cart by an earlier
@@ -699,7 +713,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
       }
       lap("cart_cleanup");
       log("info", `[http] DRY RUN — payment token obtained in ${Date.now() - t0} ms; nothing bought; cart ${cartCleaned ? "cleaned" : "NOT cleaned"}`, "dry_run");
-      return { kind: "dry_run", token, checkoutTotal: totalCost, deliveryDays, deliveryText, addressId, exitIp, cartCleaned, timings };
+      return { kind: "dry_run", token, checkoutTotal: totalCost, deliveryDays, deliveryText, addressId, exitIp, productName: productTitle, cartCleaned, timings };
     }
 
     // Card: the Flipkart side is done. Hand the checkout to the browser — the
@@ -718,6 +732,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
         deliveryText,
         addressId,
         exitIp,
+        productName: productTitle,
         timings,
       };
     }
@@ -789,7 +804,7 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
       const verify = await verifyPlaced(rome, orderId, log, input.verifyWaitMs && input.verifyWaitMs >= 5_000 ? input.verifyWaitMs : VERIFY_WAIT_MS);
       lap("verify");
       if (verify.confirmed) log("info", `[http] COD order placed — ${orderId} · ₹${(paise / 100).toFixed(0)}${fee ? ` · ${fee}` : ""} · My Orders: ${verify.listedStatus} after ${verify.verifyMs} ms · ${Date.now() - t0} ms end to end`, "paid");
-      return { kind: "placed", quantityPlaced: placedQty, orderId, referenceId: shortOrderId(orderId), confirmed: verify.confirmed, listedStatus: verify.listedStatus, verifyMs: verify.verifyMs, amount: paise ? `₹${(paise / 100).toFixed(2)}` : "", paymentFee: fee, checkoutTotal: totalCost, deliveryDays, deliveryText, exitIp, details: { ...details, orderStatus: details.orderStatus || verify.listedStatus || undefined }, timings };
+      return { kind: "placed", quantityPlaced: placedQty, orderId, referenceId: shortOrderId(orderId), confirmed: verify.confirmed, listedStatus: verify.listedStatus, verifyMs: verify.verifyMs, amount: paise ? `₹${(paise / 100).toFixed(2)}` : "", paymentFee: fee, checkoutTotal: totalCost, deliveryDays, deliveryText, exitIp, productName: productTitle, details: { ...details, orderStatus: details.orderStatus || verify.listedStatus || undefined }, timings };
     }
     const message = String(findKey(payJson, "default_text") || findKey(payJson, "message") || payText.slice(0, 200));
     if (payStatus === 401 || payStatus === 403 || payStatus === 429) throw new Fallback(`pay answered ${payStatus} — challenge`);

@@ -63,6 +63,11 @@ const normalizedSchema = z.object({
   corporateId: z.string().optional(),
   deliverySlaDays: z.number().int().positive(),
   cards: z.array(z.record(z.unknown())).optional(),
+  /** The dashboard's Ordering Phone pool: contact numbers used as the order's
+   *  delivery/billing phone, rotated per account at checkout instead of reading
+   *  the account's own registered mobile off its Flipkart profile. Empty =
+   *  none configured (the dashboard rejects real batches in that case). */
+  orderingPhones: z.array(z.string()).optional().default([]),
   /** Orders one card may place in this batch; absent = no cap. */
   cardMaxUsage: z.number().int().positive().optional(),
   dryRun: z.boolean().default(false),
@@ -118,6 +123,11 @@ export function parseCreateJobBody(raw: unknown): NormalizedCreateJob {
     corporateId: (asString(b.corporateId) ?? asString(b.corporate_id))?.toUpperCase(),
     deliverySlaDays: asNumber(b.deliverySlaDays) ?? asNumber(b.delivery_sla_days),
     cards: Array.isArray(b.cards) ? b.cards : undefined,
+    orderingPhones: Array.isArray(b.ordering_phones)
+      ? b.ordering_phones.map(String)
+      : Array.isArray(b.orderingPhones)
+        ? b.orderingPhones.map(String)
+        : undefined,
     cardMaxUsage:
       asNumber(b.cardMaxUsage) ??
       asNumber(b.card_max_usage) ??

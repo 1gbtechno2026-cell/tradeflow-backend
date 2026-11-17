@@ -88,6 +88,10 @@ export interface JobRequestSnapshot {
    *  only as its fallback; anything else = the Chrome page flow. */
   executionVersion?: ExecutionVersion;
   cards: MaskedCard[];
+  /** The dashboard's Ordering Phone pool for this batch — the delivery/billing
+   *  numbers the runner rotates through (per account) instead of the account's
+   *  own registered mobile. */
+  orderingPhones?: string[];
   totalQuantity?: number;
   quantityPerOrder?: number;
   quantityPerOrderMode?: QuantityMode;

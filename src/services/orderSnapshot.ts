@@ -49,6 +49,9 @@ export function requestSnapshot(data: NormalizedCreateJob): JobRequestSnapshot {
     gstMandatory: data.gstMandatory,
     executionVersion: data.executionVersion,
     cards: maskCards(data.cards),
+    // Not a secret — plain contact numbers; persisted so the runner can rotate
+    // one onto the delivery address and the order row can show which was used.
+    orderingPhones: data.orderingPhones || [],
     totalQuantity: data.totalQuantity,
     quantityPerOrder: data.quantityPerOrder,
     quantityPerOrderMode: data.quantityPerOrderMode,

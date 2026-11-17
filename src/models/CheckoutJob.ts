@@ -175,6 +175,10 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
         ],
         default: [],
       },
+      // The dashboard's Ordering Phone pool for this batch; the runner rotates
+      // one onto the delivery address per account. Declared explicitly or
+      // Mongoose strict mode drops it on save.
+      orderingPhones: { type: [String], default: [] },
     },
     result: {
       productName: { type: String, default: "" },

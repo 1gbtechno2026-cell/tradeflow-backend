@@ -31,6 +31,7 @@ import { jobClassFor } from "./jobClass.js";
 import { availablePhoneCapacity } from "./employeePhoneLease.js";
 import { cardPoolAdmission } from "./cardPool.js";
 import { getRedis } from "../lib/redis.js";
+import { nextOrderingPhone } from "./orderingPhonePool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
 import { lockAccount } from "./accountLock.js";
 import { enqueueOrderSync } from "./orderSync.js";
@@ -937,21 +938,25 @@ async function runClaimedCheckoutJob(
       throw new Error("Session expired: Flipkart showed the login page on viewcart");
     }
 
-    log("info", "Pre-flight: fetch account mobile", "preflight");
-    const mobile = await checkout.fetchAccountMobile();
-    if (mobile) {
-      const normalised = mobile.replace(/\D/g, "").slice(-10);
-      if (normalised) {
-        address.mobile = normalised;
-        // The dashboard's address has no phone; the one on the Flipkart
-        // address IS the account's. Recorded so the order row can show it.
-        await patchResult(data.jobId, { billingPhone: normalised });
-      }
-      await checkout.ensureAddressForAccount(address, mobile);
-      log("info", `Pre-flight done: one Flipkart address, mobile ending ${normalised.slice(-4)}`, "preflight");
-    } else {
-      log("warn", "Could not read mobile from /account — using job config mobile", "preflight");
+    // Pre-flight: /account is still fetched, but NOT for its number any more —
+    // only as the session guard (fetchAccountMobile throws if /account bounced
+    // to /account/login). The delivery/billing phone now comes from the
+    // dashboard's Ordering Phone pool, picked per account, instead of the
+    // account's own registered mobile.
+    log("info", "Pre-flight: verify session, resolve ordering phone", "preflight");
+    await checkout.fetchAccountMobile();
+    // Per-order round-robin across the batch's pool (one Redis INCR per order).
+    const orderingPhone = await nextOrderingPhone(job.request?.orderingPhones ?? [], data.batchId);
+    if (!orderingPhone) {
+      throw new Error(
+        "No ordering phone available — add active numbers in the dashboard (Platform Accounts → Ordering Phone No)."
+      );
     }
+    address.mobile = orderingPhone;
+    // Recorded so the order row can show which number this account ordered with.
+    await patchResult(data.jobId, { billingPhone: orderingPhone });
+    await checkout.ensureAddressForAccount(address, orderingPhone);
+    log("info", `Pre-flight done: one Flipkart address, ordering phone ending ${orderingPhone.slice(-4)}`, "preflight");
 
     if (flipkartLoginUrl(page.url())) {
       throw new Error("Session expired: Flipkart showed the login page during pre-flight");

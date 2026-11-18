@@ -41,6 +41,9 @@ const TERMINAL = /deliver|cancel|return|refund|fail/i;
 const IN_FLIGHT = new Set(["queued", "running"]);
 const LOCK_RETRY_MS = 30_000;
 const STALE_RUNNING_MS = 10 * 60 * 1000;
+/** Reschedule reaper: sweep period, and how long an open request must be quiet to count as stranded. */
+const REAP_EVERY_MS = 60 * 1000;
+const REAP_STALE_MS = 5 * 60 * 1000;
 const PAGE_TIMEOUT_MS = 60_000;
 const UNIT_TIMEOUT_MS = 3 * 60 * 1000;
 export const SECONDS_PER_UNIT = 12;
@@ -196,6 +199,46 @@ export async function getRescheduleRequest(userId: string, requestId: string) {
   if (!Types.ObjectId.isValid(requestId)) return null;
   const row = await RescheduleRequest.findOne({ _id: requestId, userId }).lean();
   return row ? publicRequest(row) : null;
+}
+
+/**
+ * Admin "Force clear" for a stranded reschedule (the twin of the cancellation /
+ * update Force-clear): drop any per-account jobs still on the queue, mark the
+ * queued/running units terminal and close the request. "reset" (default) also
+ * frees the Order rows this request parked (reschedule_status queued/running)
+ * so the units can be re-submitted cleanly; "abort" just closes it.
+ */
+export async function abortRescheduleRequest(userId: string, requestId: string, by: string, mode: "reset" | "abort" = "reset") {
+  if (!Types.ObjectId.isValid(requestId)) return null;
+  const row = await RescheduleRequest.findOne({ _id: requestId, userId }).lean();
+  if (!row) return null;
+
+  // 1) Drop any BullMQ jobs still carrying this request (one per account email).
+  const emails = [...new Set((row.units || []).map((u) => u.email))];
+  const queue = getRescheduleQueue();
+  await Promise.all(emails.map((email) => queue.remove(`${requestId}-${email}`).catch(() => undefined)));
+
+  // 2) Free the Order rows this request parked in-flight, so they re-schedule cleanly.
+  let freedRows = 0;
+  if (mode === "reset") {
+    const res = await Order.updateMany(
+      { userId, reschedule_request_id: requestId, reschedule_status: { $in: ["queued", "running"] } },
+      { $set: { reschedule_status: "", reschedule_request_id: "", reschedule_date: "", reschedule_message: "" } }
+    );
+    freedRows = res.modifiedCount || 0;
+  }
+
+  // 3) Mark the stuck units terminal and close the request (settled units stay as they are).
+  const note = `Cleared by ${by || "admin"}${mode === "reset" ? " — reset for re-run" : ""}`;
+  await RescheduleRequest.updateOne(
+    { _id: requestId },
+    { $set: { "units.$[u].status": "failed", "units.$[u].message": note, "units.$[u].finishedAt": new Date(), status: "done", finishedAt: new Date() } },
+    { arrayFilters: [{ "u.status": { $in: ["queued", "running"] } }] }
+  );
+
+  console.log(`[reschedule ${requestId}] force-cleared by ${by || "admin"} (mode=${mode}, freed ${freedRows} order row(s))`);
+  const updated = await RescheduleRequest.findById(requestId).lean();
+  return updated ? { ...publicRequest(updated), freedRows } : null;
 }
 
 export async function listRescheduleRequests(userId: string, limit = 20) {
@@ -440,4 +483,62 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
       console.log(`[reschedule ${requestId}] done`);
     }
   }
+}
+
+// ── reschedule reaper ─────────────────────────────────────────────────────────
+// The twin of the cancel / update reaper. Each account is one fire-and-forget
+// job; a request whose jobs are lost — worker restarted mid-delay, jobs removed
+// on a transient failure, or a request created against a Redis this worker no
+// longer reads — sits "queued"/"running" forever with nothing to pick it up.
+// This sweep finds such stranded requests (open units, quiet a while, no live
+// job) and re-enqueues the missing per-account jobs; runRescheduleJob re-picks
+// the account's queued / stale-running units from the doc.
+
+let reapingReschedules = false;
+
+export async function reapStuckReschedules(): Promise<number> {
+  if (reapingReschedules) return 0;
+  reapingReschedules = true;
+  try {
+    const staleBefore = new Date(Date.now() - REAP_STALE_MS);
+    const open = await RescheduleRequest.find({ status: { $in: ["queued", "running"] }, updatedAt: { $lt: staleBefore } })
+      .select("_id units.email units.status units.startedAt")
+      .lean();
+    if (!open.length) return 0;
+
+    const queue = getRescheduleQueue();
+    const isStaleRunning = (status: string, startedAt?: Date | null) =>
+      status === "running" && (!startedAt || Date.now() - new Date(startedAt).getTime() > STALE_RUNNING_MS);
+
+    let requeued = 0;
+    for (const r of open) {
+      const requestId = String(r._id);
+      const emails = new Set<string>();
+      for (const u of r.units || []) if (u.status === "queued" || isStaleRunning(u.status, u.startedAt)) emails.add(u.email);
+
+      for (const email of emails) {
+        const jobId = `${requestId}-${email}`;
+        // A live job (waiting/active/delayed) means it is already being handled.
+        const existing = await queue.getJob(jobId).catch(() => null);
+        if (existing) continue;
+        await queue.add("reschedule", { requestId, email }, { jobId }).catch(() => undefined);
+        requeued++;
+        console.log(`[reschedule-reaper] re-enqueued stranded ${requestId.slice(0, 8)} / ${email}`);
+      }
+    }
+    if (requeued) console.log(`[reschedule-reaper] re-enqueued ${requeued} stranded reschedule job(s) across ${open.length} open request(s)`);
+    return requeued;
+  } finally {
+    reapingReschedules = false;
+  }
+}
+
+/** Start the periodic reschedule reaper (worker, reschedule role only). Returns the timer. */
+export function startRescheduleReaper() {
+  const t = setInterval(() => {
+    void reapStuckReschedules().catch((e) => console.error("[reschedule-reaper]", e instanceof Error ? e.message : e));
+  }, REAP_EVERY_MS);
+  t.unref();
+  console.log(`[reschedule-reaper] on — re-enqueues stranded reschedules every ${Math.round(REAP_EVERY_MS / 1000)}s (stranded after ${Math.round(REAP_STALE_MS / 60000)}m quiet)`);
+  return t;
 }

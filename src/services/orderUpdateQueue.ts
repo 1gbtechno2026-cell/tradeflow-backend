@@ -5,8 +5,7 @@ import { config } from "../config.js";
 import { isDestroyedContext } from "../lib/evalOnPage.js";
 import { Order } from "../models/Order.js";
 import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
-import { OrderUnitEvent } from "../models/OrderUnitEvent.js";
-import { PlatformId } from "../models/PlatformId.js";
+import { markSessionEligibleForRelogin } from "./sessionEligibility.js";
 import { OrderUpdateRequest, type IOrderUpdateRequest, type IUpdateAccount, type UpdateSource } from "../models/OrderUpdateRequest.js";
 import { getUpdateQueue, type UpdateJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
@@ -43,6 +42,9 @@ import { resolveLoggedInSession, workspaceUserId } from "./sessionStore.js";
 const STALE_ACCOUNT_MS = 20 * 60 * 1000;
 const LOCK_RETRY_MS = 20_000;
 const LOG_KEEP = 300;
+/** Update reaper: how often it sweeps, and how long an open request must be quiet to count as stranded. */
+const UPDATE_REAP_EVERY_MS = 60 * 1000;
+const UPDATE_REAP_STALE_MS = 5 * 60 * 1000;
 /** Active-unit sweep / Out-for-delivery recheck periods (ms). */
 export const UPDATE_SWEEP_MS = Math.max(15 * 60 * 1000, Number(process.env.UPDATE_SWEEP_MS) || 6 * 60 * 60 * 1000);
 export const UPDATE_OFD_SWEEP_MS = Math.max(15 * 60 * 1000, Number(process.env.UPDATE_OFD_SWEEP_MS) || 2 * 60 * 60 * 1000);
@@ -147,6 +149,55 @@ export async function getUpdateRequest(userId: string, requestId: string) {
   if (!Types.ObjectId.isValid(requestId)) return null;
   const row = await OrderUpdateRequest.findOne({ _id: requestId, userId }).lean();
   return row ? publicUpdateRequest(row) : null;
+}
+
+/**
+ * Admin "Force clear" for a stranded update (the twin of the cancellation
+ * Force-clear): drop any per-account jobs still on the queue, mark the
+ * queued/running accounts terminal and close the request. An update only
+ * re-reads Flipkart — it parks no Order rows — so there is nothing to free:
+ * the user simply presses Update again. `mode` is kept for API symmetry with
+ * the cancel abort; both just clear here.
+ */
+export async function abortUpdateRequest(userId: string, requestId: string, by: string, mode: "reset" | "abort" = "reset") {
+  if (!Types.ObjectId.isValid(requestId)) return null;
+  const row = await OrderUpdateRequest.findOne({ _id: requestId, userId }).lean();
+  if (!row) return null;
+
+  // 1) Drop any BullMQ jobs still carrying this request (one per account email).
+  const emails = [...new Set((row.accounts || []).map((a) => a.email))];
+  const queue = getUpdateQueue();
+  let removed = 0;
+  await Promise.all(
+    emails.map(async (email) => {
+      const job = await queue.getJob(`${requestId}-${email}`).catch(() => null);
+      if (job) {
+        await job.remove().catch(() => undefined);
+        removed++;
+      }
+    })
+  );
+
+  // 2) Close the stuck accounts and the request (accounts already done stay as they are).
+  const stuckAccounts = (row.accounts || []).filter((a) => a.status === "queued" || a.status === "running").length;
+  const note = `Cleared by ${by || "admin"} — press Update to re-run`;
+  await OrderUpdateRequest.updateOne(
+    { _id: requestId },
+    {
+      $set: {
+        "accounts.$[a].status": "cancelled",
+        "accounts.$[a].message": note,
+        "accounts.$[a].finishedAt": new Date(),
+        status: "cancelled",
+        finishedAt: new Date(),
+      },
+    },
+    { arrayFilters: [{ "a.status": { $in: ["queued", "running"] } }] }
+  );
+  await pushLog(requestId, "warn", `Force-cleared by ${by || "admin"} — ${removed} queue job(s) dropped, ${stuckAccounts} stuck account(s) closed`);
+  console.log(`[orders-update ${requestId}] force-cleared by ${by || "admin"} (mode=${mode}, ${removed} job(s) dropped, ${stuckAccounts} account(s) closed)`);
+  const updated = await OrderUpdateRequest.findById(requestId).lean();
+  return updated ? { ...publicUpdateRequest(updated), removed, stuckAccounts } : null;
 }
 
 export async function listUpdateRequests(userId: string, limit = 20) {
@@ -303,6 +354,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
     const session = await resolveLoggedInSession(me);
     if (!session.ok) {
       await setAccount(requestId, me, { status: "failed", finishedAt: new Date(), message: `Session: ${session.reason} — re-login this ID` });
+      await markSessionEligibleForRelogin({ userId: request.userId, platformId: account.platformId, email: me, reason: `Update: ${session.reason} — re-login this ID`, via: "worker", requestId });
       await log("warn", `session: ${session.reason} — re-login this ID`);
       return;
     }
@@ -385,10 +437,9 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
       // the login is the problem, not the orders. Mark the Platform ID's last
       // check as an error (Session Health → Suspect) and tell the dashboard.
       if (noData > 0 && (final?.done ?? 0) === 0 && noData === account.units.length) {
-        const reason = `Update: ${noData} order page(s) rendered nothing and the API refused the session — re-check this ID`;
-        await PlatformId.updateOne({ _id: acct.id }, { $set: { lastChecked: new Date(), sessionCheck: { at: new Date(), outcome: "error", reason, via: "worker" } } }).catch(() => undefined);
-        await OrderUnitEvent.create({ userId: request.userId, orderId: "", unitId: "", email: me, productName: "", type: "account_unreadable", at: new Date(), before: null, after: { units: noData, via, reason }, requestId, processed: false, processedAt: null }).catch(() => undefined);
-        await log("warn", `every order page rendered nothing (${noData}) — Platform ID marked for re-check`);
+        const reason = `Update: ${noData} order page(s) rendered nothing and the API refused the session — re-login this ID`;
+        await markSessionEligibleForRelogin({ userId: request.userId, platformId: acct.id, email: me, reason, via, requestId });
+        await log("warn", `every order page rendered nothing (${noData}) — Platform ID set eligible for re-login`);
       }
       await setAccount(requestId, me, {
         status: "done",
@@ -452,4 +503,63 @@ export async function ensureUpdateSchedules(): Promise<void> {
   await queue.upsertJobScheduler("order-update-active", { every: UPDATE_SWEEP_MS }, { name: "sweep", data: { requestId: "", email: "", sweep: "active" }, opts: { attempts: 1 } });
   await queue.upsertJobScheduler("order-update-ofd", { every: UPDATE_OFD_SWEEP_MS }, { name: "sweep", data: { requestId: "", email: "", sweep: "ofd" }, opts: { attempts: 1 } });
   console.log(`[orders-update] schedules: all active units every ${Math.round(UPDATE_SWEEP_MS / 60000)} min, Out for delivery every ${Math.round(UPDATE_OFD_SWEEP_MS / 60000)} min`);
+}
+
+// ── update reaper ─────────────────────────────────────────────────────────────
+// The twin of the cancel reaper. Each account is one fire-and-forget job
+// (attempts:1); a request whose jobs are lost — worker restarted mid-delay, jobs
+// removed on a transient failure, or a request created against a Redis this
+// worker no longer reads (e.g. submitted while the dashboard still pointed at a
+// now-gone AWS) — sits "queued"/"running" forever at 0/N with nothing to pick it
+// up. This sweep finds such stranded requests (open accounts, quiet a while, no
+// live job) and re-enqueues the missing per-account jobs; runOrderUpdateJob
+// re-reads the account's units from the request doc, so a half-done run resumes.
+
+let reapingUpdates = false;
+
+export async function reapStuckUpdates(): Promise<number> {
+  if (reapingUpdates) return 0;
+  reapingUpdates = true;
+  try {
+    const staleBefore = new Date(Date.now() - UPDATE_REAP_STALE_MS);
+    const open = await OrderUpdateRequest.find({ status: { $in: ["queued", "running"] }, updatedAt: { $lt: staleBefore } })
+      .select("_id accounts.email accounts.status accounts.startedAt")
+      .lean();
+    if (!open.length) return 0;
+
+    const queue = getUpdateQueue();
+    const isStaleRunning = (status: string, startedAt?: Date | null) =>
+      status === "running" && (!startedAt || Date.now() - new Date(startedAt).getTime() > STALE_ACCOUNT_MS);
+
+    let requeued = 0;
+    for (const r of open) {
+      const requestId = String(r._id);
+      const emails = new Set<string>();
+      for (const a of r.accounts || []) if (a.status === "queued" || isStaleRunning(a.status, a.startedAt)) emails.add(a.email);
+
+      for (const email of emails) {
+        const jobId = `${requestId}-${email}`;
+        // A live job (waiting/active/delayed) means it is already being handled.
+        const existing = await queue.getJob(jobId).catch(() => null);
+        if (existing) continue;
+        await queue.add("update", { requestId, email }, { jobId }).catch(() => undefined);
+        requeued++;
+        console.log(`[update-reaper] re-enqueued stranded ${requestId.slice(0, 8)} / ${email}`);
+      }
+    }
+    if (requeued) console.log(`[update-reaper] re-enqueued ${requeued} stranded update job(s) across ${open.length} open request(s)`);
+    return requeued;
+  } finally {
+    reapingUpdates = false;
+  }
+}
+
+/** Start the periodic update reaper (worker, update role only). Returns the timer. */
+export function startUpdateReaper() {
+  const t = setInterval(() => {
+    void reapStuckUpdates().catch((e) => console.error("[update-reaper]", e instanceof Error ? e.message : e));
+  }, UPDATE_REAP_EVERY_MS);
+  t.unref();
+  console.log(`[update-reaper] on — re-enqueues stranded updates every ${Math.round(UPDATE_REAP_EVERY_MS / 1000)}s (stranded after ${Math.round(UPDATE_REAP_STALE_MS / 60000)}m quiet)`);
+  return t;
 }

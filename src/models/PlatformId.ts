@@ -8,6 +8,12 @@ export interface IPlatformId {
   sessionCookies: unknown[];
   sessionState: { cookies: unknown[]; origins: unknown[] };
   sessionSavedAt: Date | null;
+  /** Last time a worker / the dashboard's Verify checked this saved session. */
+  lastChecked: Date | null;
+  /** Set when a worker demoted this row from logged_in to pending (cookies kept). The dashboard's verify-undo reverses it. */
+  statusBeforeDemote?: string;
+  /** The last session check a worker recorded — read by Session Health. Mirrors the dashboard model's richer field (kept Mixed here). */
+  sessionCheck?: unknown;
 }
 
 const PlatformIdSchema = new Schema<IPlatformId>(
@@ -19,8 +25,11 @@ const PlatformIdSchema = new Schema<IPlatformId>(
     sessionCookies: { type: [Schema.Types.Mixed], default: [] },
     sessionState: { type: Schema.Types.Mixed, default: { cookies: [], origins: [] } },
     sessionSavedAt: { type: Date, default: null },
+    lastChecked: { type: Date, default: null },
+    statusBeforeDemote: { type: String, default: "" },
+    sessionCheck: { type: Schema.Types.Mixed, default: null },
   },
-  { timestamps: true }
+  { timestamps: true, strict: false }
 );
 
 export const PlatformId = mongoose.model<IPlatformId>("PlatformId", PlatformIdSchema);

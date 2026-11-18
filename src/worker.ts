@@ -6,9 +6,9 @@ import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
 import { currentProxyMode } from "./services/proxyMode.js";
 import { resolveCancelSpeed, runCancelJob, startCancelReaper } from "./services/orderCancel.js";
-import { rescheduleConcurrency, runRescheduleJob } from "./services/orderReschedule.js";
+import { rescheduleConcurrency, runRescheduleJob, startRescheduleReaper } from "./services/orderReschedule.js";
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
-import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob } from "./services/orderUpdateQueue.js";
+import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob, startUpdateReaper } from "./services/orderUpdateQueue.js";
 import { describeError, isTransientError, throttledWarn } from "./lib/resilience.js";
 
 /**
@@ -168,6 +168,7 @@ async function main() {
       console.error(`[worker] FAILED ${RESCHEDULE_QUEUE} job=${job?.id}:`, err.message);
     });
     rescheduleWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${RESCHEDULE_QUEUE}):`, err.message));
+    startRescheduleReaper();
     names.push([RESCHEDULE_QUEUE, rescheduleWindows]);
   }
   // Order sync: finished checkouts' orders into Order Units, plus the sweep.
@@ -215,6 +216,7 @@ async function main() {
     };
     setInterval(() => void followUpdate(), 10_000).unref();
     await ensureUpdateSchedules();
+    startUpdateReaper();
     names.push([UPDATE_QUEUE, windows]);
   }
 

@@ -11,11 +11,12 @@ import {
 } from "../services/orderFetch.js";
 import { resolveCheckoutSettings, setCheckoutSettings } from "../services/checkoutSettings.js";
 import { abortCancelRequest, getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
-import { getRescheduleRequest, listRescheduleRequests, previewReschedule, requestReschedule, retryRescheduleRequest } from "../services/orderReschedule.js";
+import { abortRescheduleRequest, getRescheduleRequest, listRescheduleRequests, previewReschedule, requestReschedule, retryRescheduleRequest } from "../services/orderReschedule.js";
 import { proxyModeStatus, setProxyMode } from "../services/proxyMode.js";
 import { listRuns, syncPanel } from "../services/orderJobRuns.js";
 import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays, setScheduledInvoices } from "../services/orderFetchSchedule.js";
 import {
+  abortUpdateRequest,
   cancelUpdateRequest,
   createUpdateRequest,
   getUpdateRequest,
@@ -275,6 +276,26 @@ orderFetchRouter.get("/update/requests/:id", async (req, res) => {
   res.json(row);
 });
 
+/**
+ * Admin "Force clear" for a stranded update — the twin of /cancel/:id/abort.
+ * Drops any per-account jobs still on the queue and closes the stuck request so
+ * the panel is clean; an update parks no Order rows, so re-running is just the
+ * Update button again. Body: { by?, mode? } (mode kept for API symmetry).
+ */
+orderFetchRouter.post("/update/requests/:id/abort", async (req, res) => {
+  try {
+    const mode = String(req.body?.mode || "reset").toLowerCase() === "abort" ? "abort" : "reset";
+    const result = await abortUpdateRequest(userIdFrom(req), req.params.id, String(req.body?.by || "").trim(), mode);
+    if (!result) {
+      res.status(404).json({ error: "Update request not found" });
+      return;
+    }
+    res.status(200).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not clear the update" });
+  }
+});
+
 /** Update speed and schedules. PUT body: { windows, by? } — applies to the next job, no restart. */
 orderFetchRouter.get("/update/settings", async (req, res) => {
   const userId = String(req.query.userId || "").trim() || workspaceUserId();
@@ -432,6 +453,24 @@ orderFetchRouter.post("/reschedule/:id/retry", async (req, res) => {
     res.status(202).json(result);
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : "Could not retry the reschedule" });
+  }
+});
+
+/**
+ * Admin "Force clear" for a stranded reschedule — the twin of the cancel /
+ * update abort. "reset" frees its units for a re-run; "abort" just closes it.
+ */
+orderFetchRouter.post("/reschedule/:id/abort", async (req, res) => {
+  try {
+    const mode = String(req.body?.mode || "reset").toLowerCase() === "abort" ? "abort" : "reset";
+    const result = await abortRescheduleRequest(userIdFrom(req), req.params.id, String(req.body?.by || "").trim(), mode);
+    if (!result) {
+      res.status(404).json({ error: "Reschedule request not found" });
+      return;
+    }
+    res.status(200).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not clear the reschedule" });
   }
 });
 

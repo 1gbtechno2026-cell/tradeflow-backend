@@ -57,6 +57,9 @@ const TRANSIENT = /timeout|timed out|net::|ECONN|ETIMEDOUT|EAI_AGAIN|socket hang
 const UNIT_TIMEOUT_MS = 4 * 60 * 1000;
 /** A unit "running" this long with no finish was abandoned by a hung or dead worker; pick it up again. */
 const STALE_RUNNING_MS = 10 * 60 * 1000;
+/** Cancel reaper cadence, and how quiet a request must be before it's judged stranded. */
+const REAP_EVERY_MS = 60 * 1000;
+const REAP_STALE_MS = 5 * 60 * 1000;
 
 class UnitTimeoutError extends Error {}
 
@@ -457,10 +460,129 @@ export async function retryCancelRequest(userId: string, requestId: string, by: 
   return requestCancellation(userId, { type: "unit", ids: failedUnits, dryRun: row.dryRun, by, retryOf: requestId, extraOrders: failedOrders, failIfEmpty: true });
 }
 
+/**
+ * Force-clear a stuck cancel request (SuperAdmin, from the dashboard). This is
+ * the productised version of the hand-run DB fix: drop any queue jobs still
+ * carrying the request, free the units that never finished so they can be
+ * re-cancelled, and close the request — WITHOUT touching units it already
+ * cancelled.
+ *
+ *   mode "reset" (default): clear the stuck units' Order rows so a fresh
+ *                           cancellation accepts them (re-run locally).
+ *   mode "abort":           just close the request; leave Order rows as-is.
+ */
+export async function abortCancelRequest(
+  userId: string,
+  requestId: string,
+  by: string,
+  mode: "reset" | "abort" = "reset"
+) {
+  if (!Types.ObjectId.isValid(requestId)) return null;
+  const row = await CancelRequest.findOne({ _id: requestId, userId }).lean();
+  if (!row) return null;
+
+  // 1) Drop any BullMQ jobs still carrying this request (one per account email).
+  const emails = [...new Set([...(row.units || []).map((u) => u.email), ...(row.orders || []).map((o) => o.email)])];
+  const queue = getCancelQueue();
+  await Promise.all(emails.map((email) => queue.remove(`${requestId}-${email}`).catch(() => undefined)));
+
+  // 2) Free the Order rows this request parked in-flight, so they re-cancel cleanly.
+  let freedRows = 0;
+  if (mode === "reset") {
+    const res = await Order.updateMany(
+      { userId, cancel_request_id: requestId, cancel_status: { $in: ["queued", "running"] } },
+      { $set: { cancel_status: "", cancel_request_id: "", cancel_requested_at: null, cancel_requested_by: "", cancel_error: "" } }
+    );
+    freedRows = res.modifiedCount || 0;
+  }
+
+  // 3) Mark the stuck units/orders terminal and close the request (cancelled ones stay).
+  const note = `Cleared by ${by || "admin"}${mode === "reset" ? " — reset for re-run" : ""}`;
+  await CancelRequest.updateOne(
+    { _id: requestId },
+    {
+      $set: {
+        "units.$[u].status": "failed",
+        "units.$[u].message": note,
+        "units.$[u].finishedAt": new Date(),
+        "orders.$[o].status": "failed",
+        "orders.$[o].message": note,
+        "orders.$[o].finishedAt": new Date(),
+        status: "done",
+        finishedAt: new Date(),
+      },
+    },
+    { arrayFilters: [{ "u.status": { $in: ["queued", "running"] } }, { "o.status": { $in: ["queued", "running"] } }] }
+  );
+
+  console.log(`[cancel ${requestId}] force-cleared by ${by || "admin"} (mode=${mode}, freed ${freedRows} order row(s))`);
+  const updated = await CancelRequest.findById(requestId).lean();
+  return updated ? { ...publicRequest(updated), freedRows } : null;
+}
+
 export async function getCancelRequest(userId: string, requestId: string) {
   if (!Types.ObjectId.isValid(requestId)) return null;
   const row = await CancelRequest.findOne({ _id: requestId, userId }).lean();
   return row ? publicRequest(row) : null;
+}
+
+// ── Cancel reaper ────────────────────────────────────────────────────────────
+// Cancel jobs are fire-and-forget on the queue (attempts:1, removeOnFail), so a
+// request whose per-account jobs are lost — worker restarted mid-delay, jobs
+// removed on a transient failure, a request created against a Redis this worker
+// no longer reads — sits "queued"/"running" forever with nothing to pick it up.
+// That is exactly how a cancellation gets stuck at 0/N. This sweep finds such
+// stranded requests (open units, quiet a while, no live job) and re-enqueues the
+// missing account jobs; runCancelJob already knows how to re-pick the units.
+
+let reaping = false;
+
+export async function reapStuckCancels(): Promise<number> {
+  if (reaping) return 0;
+  reaping = true;
+  try {
+    const staleBefore = new Date(Date.now() - REAP_STALE_MS);
+    const open = await CancelRequest.find({ status: { $in: ["queued", "running"] }, updatedAt: { $lt: staleBefore } })
+      .select("_id units orders")
+      .lean();
+    if (!open.length) return 0;
+
+    const queue = getCancelQueue();
+    const isStaleRunning = (status: string, startedAt?: Date | null) =>
+      status === "running" && (!startedAt || Date.now() - new Date(startedAt).getTime() > STALE_RUNNING_MS);
+
+    let requeued = 0;
+    for (const r of open) {
+      const requestId = String(r._id);
+      const emails = new Set<string>();
+      for (const u of r.units || []) if (u.status === "queued" || isStaleRunning(u.status, u.startedAt)) emails.add(u.email);
+      for (const o of r.orders || []) if (o.status === "queued" || isStaleRunning(o.status, o.startedAt)) emails.add(o.email);
+
+      for (const email of emails) {
+        const jobId = `${requestId}-${email}`;
+        // A live job (waiting/active/delayed) means it is already being handled.
+        const existing = await queue.getJob(jobId).catch(() => null);
+        if (existing) continue;
+        await queue.add("cancel", { requestId, email }, { jobId }).catch(() => undefined);
+        requeued++;
+        console.log(`[cancel-reaper] re-enqueued stranded ${requestId.slice(0, 8)} / ${email}`);
+      }
+    }
+    if (requeued) console.log(`[cancel-reaper] re-enqueued ${requeued} stranded cancel job(s) across ${open.length} open request(s)`);
+    return requeued;
+  } finally {
+    reaping = false;
+  }
+}
+
+/** Start the periodic reaper (worker, cancel role only). Returns the timer. */
+export function startCancelReaper() {
+  const t = setInterval(() => {
+    void reapStuckCancels().catch((e) => console.error("[cancel-reaper]", e instanceof Error ? e.message : e));
+  }, REAP_EVERY_MS);
+  t.unref();
+  console.log(`[cancel-reaper] on — re-enqueues stranded cancels every ${Math.round(REAP_EVERY_MS / 1000)}s (stranded after ${Math.round(REAP_STALE_MS / 60000)}m quiet)`);
+  return t;
 }
 
 /**

@@ -5,7 +5,7 @@ import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
 import { currentProxyMode } from "./services/proxyMode.js";
-import { resolveCancelSpeed, runCancelJob } from "./services/orderCancel.js";
+import { resolveCancelSpeed, runCancelJob, startCancelReaper } from "./services/orderCancel.js";
 import { rescheduleConcurrency, runRescheduleJob } from "./services/orderReschedule.js";
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
 import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob } from "./services/orderUpdateQueue.js";
@@ -152,6 +152,8 @@ async function main() {
     };
     void follow();
     setInterval(() => void follow(), 10_000).unref();
+    // Re-enqueue cancel requests whose jobs were lost, so none sits stuck at 0/N.
+    startCancelReaper();
     names.push([CANCEL_QUEUE, cancelConcurrency]);
   }
   // Order reschedules: one job per account; RESCHEDULE_CONCURRENCY accounts at once (default 1).

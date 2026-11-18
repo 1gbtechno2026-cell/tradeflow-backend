@@ -10,7 +10,7 @@ import {
   stopOrderFetch,
 } from "../services/orderFetch.js";
 import { resolveCheckoutSettings, setCheckoutSettings } from "../services/checkoutSettings.js";
-import { getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
+import { abortCancelRequest, getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import { getRescheduleRequest, listRescheduleRequests, previewReschedule, requestReschedule, retryRescheduleRequest } from "../services/orderReschedule.js";
 import { proxyModeStatus, setProxyMode } from "../services/proxyMode.js";
 import { listRuns, syncPanel } from "../services/orderJobRuns.js";
@@ -369,6 +369,25 @@ orderFetchRouter.post("/cancel/:id/retry", async (req, res) => {
     res.status(202).json(result);
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : "Could not retry the cancellation" });
+  }
+});
+
+/**
+ * Force-clear a stuck cancel request (SuperAdmin — the dashboard gates the role).
+ * Body: { by?: string, userId?: string, mode?: "reset" | "abort" }. Default
+ * "reset" frees the stuck units so they can be re-cancelled; "abort" just closes it.
+ */
+orderFetchRouter.post("/cancel/:id/abort", async (req, res) => {
+  try {
+    const mode = String(req.body?.mode || "reset").toLowerCase() === "abort" ? "abort" : "reset";
+    const result = await abortCancelRequest(userIdFrom(req), req.params.id, String(req.body?.by || "").trim(), mode);
+    if (!result) {
+      res.status(404).json({ error: "Cancel request not found" });
+      return;
+    }
+    res.status(200).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : "Could not clear the cancellation" });
   }
 });
 

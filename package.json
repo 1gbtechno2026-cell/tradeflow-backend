@@ -9,6 +9,9 @@
     "postinstall": "npm run build",
     "start": "node dist/index.js",
     "worker": "tsx src/worker.ts",
+    "worker:prod": "node dist/worker.js",
+    "up": "concurrently -k -r -n api,worker -c blue,magenta \"npm:dev\" \"npm:worker\"",
+    "up:prod": "npm run build && concurrently -k -r -n api,worker -c blue,magenta \"npm:start\" \"npm:worker:prod\"",
     "typecheck": "tsc --noEmit",
     "test:otp": "tsx src/scripts/otpParseTest.ts",
     "test:flow": "tsx src/scripts/testFlowCli.ts",
@@ -49,6 +52,7 @@
     "@types/express": "^5.0.3",
     "@types/node": "^22.16.5",
     "@types/node-cron": "^3.0.11",
+    "concurrently": "^10.0.7",
     "typescript": "^5.8.3"
   }
 }

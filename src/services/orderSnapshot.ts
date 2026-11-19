@@ -52,6 +52,7 @@ export function requestSnapshot(data: NormalizedCreateJob): JobRequestSnapshot {
     // Not a secret — plain contact numbers; persisted so the runner can rotate
     // one onto the delivery address and the order row can show which was used.
     orderingPhones: data.orderingPhones || [],
+    useOrderingPhone: data.useOrderingPhone !== false,
     totalQuantity: data.totalQuantity,
     quantityPerOrder: data.quantityPerOrder,
     quantityPerOrderMode: data.quantityPerOrderMode,

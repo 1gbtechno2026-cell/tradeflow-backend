@@ -68,6 +68,12 @@ const normalizedSchema = z.object({
    *  the account's own registered mobile off its Flipkart profile. Empty =
    *  none configured (the dashboard rejects real batches in that case). */
   orderingPhones: z.array(z.string()).optional().default([]),
+  /** Whether this batch uses the Ordering Phone pool for the delivery address
+   *  phone. true (card default) → rotate a pool number per account. false (COD,
+   *  or the operator turned it off) → fall back to the account's own phone:
+   *  the live /account mobile on the Chrome flow, the saved address-book phone
+   *  on the HTTP/COD flow. Defaults true so existing callers are unchanged. */
+  useOrderingPhone: z.boolean().optional().default(true),
   /** Orders one card may place in this batch; absent = no cap. */
   cardMaxUsage: z.number().int().positive().optional(),
   dryRun: z.boolean().default(false),
@@ -128,6 +134,7 @@ export function parseCreateJobBody(raw: unknown): NormalizedCreateJob {
       : Array.isArray(b.orderingPhones)
         ? b.orderingPhones.map(String)
         : undefined,
+    useOrderingPhone: asBool(b.use_ordering_phone) ?? asBool(b.useOrderingPhone) ?? undefined,
     cardMaxUsage:
       asNumber(b.cardMaxUsage) ??
       asNumber(b.card_max_usage) ??

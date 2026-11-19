@@ -591,7 +591,10 @@ export async function runHttpCheckout(input: HttpCheckoutInput): Promise<HttpChe
       let target = contacts.find((c) => contactMatches(c, input.address!, pincode)) || null;
       if (!target) {
         const base = contacts.find((c) => c.isDefault) || contacts[0] || null;
-        const phone = (base?.phone || input.address.mobile || "").replace(/\D/g, "").slice(-10);
+        // Prefer the phone the runner resolved for this order (Ordering pool, or
+        // the Platform ID's own DB phone) over whatever is on the saved contact;
+        // fall back to the saved contact's number only when none was resolved.
+        const phone = (String(input.address.mobile || "").replace(/\D/g, "").slice(-10)) || (base?.phone || "").replace(/\D/g, "").slice(-10);
         if (!phone) throw new Fallback("account has no saved address and the job has no phone — the page flow adds the address");
         const body = contactBody(input.address, pincode, phone);
         const saved = base

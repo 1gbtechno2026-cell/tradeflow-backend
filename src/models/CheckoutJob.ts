@@ -179,6 +179,10 @@ const CheckoutJobSchema = new Schema<ICheckoutJob>(
       // one onto the delivery address per account. Declared explicitly or
       // Mongoose strict mode drops it on save.
       orderingPhones: { type: [String], default: [] },
+      // Whether to use that pool for the delivery phone (card default). false
+      // (COD, or operator off) falls back to the account's own phone. Defaults
+      // true so older jobs/callers keep today's behaviour.
+      useOrderingPhone: { type: Boolean, default: true },
     },
     result: {
       productName: { type: String, default: "" },

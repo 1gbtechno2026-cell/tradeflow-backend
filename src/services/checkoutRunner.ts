@@ -32,6 +32,7 @@ import { availablePhoneCapacity } from "./employeePhoneLease.js";
 import { cardPoolAdmission } from "./cardPool.js";
 import { getRedis } from "../lib/redis.js";
 import { nextOrderingPhone } from "./orderingPhonePool.js";
+import { PlatformId } from "../models/PlatformId.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
 import { lockAccount } from "./accountLock.js";
 import { enqueueOrderSync } from "./orderSync.js";
@@ -541,6 +542,28 @@ async function runClaimedCheckoutJob(
   // is right — every job in this process uses the same proxy.
   if (egress) setNavigationTimeoutScale(Math.max(2, Number(process.env.NAV_TIMEOUT_SCALE || 1)));
 
+  // ── Delivery phone, resolved once for whichever engine runs below ─────────
+  // Toggle ON (card default) → a rotated Ordering Phone pool number (one Redis
+  // INCR per order). Toggle OFF → this Platform ID's own phone, read from the
+  // DB (no live /account step). Written onto the job's address so the HTTP COD,
+  // HTTP card and Chrome paths all place the order with the same number.
+  const useOrderingPhone = job.request?.useOrderingPhone !== false;
+  const deliveryPhoneSource: "ordering" | "platform" = useOrderingPhone ? "ordering" : "platform";
+  let deliveryPhone = "";
+  if (useOrderingPhone) {
+    deliveryPhone = await nextOrderingPhone(job.request?.orderingPhones ?? [], data.batchId);
+  } else {
+    const row = await PlatformId.findOne({ userId: job.userId, platform: "flipkart", email: String(data.email).toLowerCase() })
+      .select("phone")
+      .lean();
+    deliveryPhone = String(row?.phone || "").replace(/\D/g, "").slice(-10);
+  }
+  if (data.address && deliveryPhone) data.address.mobile = deliveryPhone;
+  if (deliveryPhone) {
+    await patchResult(data.jobId, { billingPhone: deliveryPhone }).catch(() => undefined);
+    console.log(`[${data.jobId}] delivery phone: ${deliveryPhoneSource} ending ${deliveryPhone.slice(-4)}`);
+  }
+
   // ── HTTP engine ("High Speed", COD) ──────────────────────────────────────
   // The order is placed with Flipkart's own API calls (services/httpCheckout.ts)
   // and no Chrome. Three of its four outcomes end the job right here; the
@@ -938,25 +961,39 @@ async function runClaimedCheckoutJob(
       throw new Error("Session expired: Flipkart showed the login page on viewcart");
     }
 
-    // Pre-flight: /account is still fetched, but NOT for its number any more —
-    // only as the session guard (fetchAccountMobile throws if /account bounced
-    // to /account/login). The delivery/billing phone now comes from the
-    // dashboard's Ordering Phone pool, picked per account, instead of the
-    // account's own registered mobile.
-    log("info", "Pre-flight: verify session, resolve ordering phone", "preflight");
-    await checkout.fetchAccountMobile();
-    // Per-order round-robin across the batch's pool (one Redis INCR per order).
-    const orderingPhone = await nextOrderingPhone(job.request?.orderingPhones ?? [], data.batchId);
-    if (!orderingPhone) {
+    // Pre-flight: /account is the session guard (fetchAccountMobile throws if
+    // /account bounced to login). The delivery phone was already resolved above
+    // (ordering pool, or this ID's stored DB phone) and written onto the
+    // address; only if the toggle is off AND no phone is stored do we fall back
+    // to the account's own live mobile here.
+    log("info", "Pre-flight: verify session", "preflight");
+    const accountMobile = await checkout.fetchAccountMobile();
+    let phone = String(address.mobile || "").replace(/\D/g, "").slice(-10);
+    if (!phone && !useOrderingPhone) {
+      // Toggle off but this ID had no cached phone in the DB — read it live from
+      // /account this once and cache it on the Platform ID so the next order
+      // skips the read (the "one step reduced" the operator asked for).
+      phone = String(accountMobile || "").replace(/\D/g, "").slice(-10);
+      if (phone.length === 10) {
+        await PlatformId.updateOne(
+          { userId: job.userId, platform: "flipkart", email: String(data.email).toLowerCase() },
+          { $set: { phone } }
+        ).catch(() => undefined);
+        log("info", `Cached the account's phone ending ${phone.slice(-4)} on the Platform ID for next time`, "preflight");
+      }
+    }
+    if (phone.length !== 10) {
       throw new Error(
-        "No ordering phone available — add active numbers in the dashboard (Platform Accounts → Ordering Phone No)."
+        useOrderingPhone
+          ? "No ordering phone available — add active numbers in the dashboard (Platform Accounts → Ordering Phone No), or turn the Ordering Phone toggle off."
+          : "No Platform-ID phone stored for this account and its registered mobile could not be read. Add a phone on the Platform ID, or turn the Ordering Phone toggle on."
       );
     }
-    address.mobile = orderingPhone;
+    address.mobile = phone;
     // Recorded so the order row can show which number this account ordered with.
-    await patchResult(data.jobId, { billingPhone: orderingPhone });
-    await checkout.ensureAddressForAccount(address, orderingPhone);
-    log("info", `Pre-flight done: one Flipkart address, ordering phone ending ${orderingPhone.slice(-4)}`, "preflight");
+    await patchResult(data.jobId, { billingPhone: phone });
+    await checkout.ensureAddressForAccount(address, phone);
+    log("info", `Pre-flight done: one Flipkart address, ${deliveryPhoneSource} phone ending ${phone.slice(-4)}`, "preflight");
 
     if (flipkartLoginUrl(page.url())) {
       throw new Error("Session expired: Flipkart showed the login page during pre-flight");

@@ -8,6 +8,10 @@ export interface IPlatformId {
   sessionCookies: unknown[];
   sessionState: { cookies: unknown[]; origins: unknown[] };
   sessionSavedAt: Date | null;
+  /** The Platform ID's own contact number, stored in the dashboard. Used as the
+   *  delivery phone when a batch turns the Ordering Phone pool off — read from
+   *  here (the DB) instead of Flipkart's /account, so it costs no extra step. */
+  phone: string;
   /** Last time a worker / the dashboard's Verify checked this saved session. */
   lastChecked: Date | null;
   /** Set when a worker demoted this row from logged_in to pending (cookies kept). The dashboard's verify-undo reverses it. */
@@ -25,6 +29,7 @@ const PlatformIdSchema = new Schema<IPlatformId>(
     sessionCookies: { type: [Schema.Types.Mixed], default: [] },
     sessionState: { type: Schema.Types.Mixed, default: { cookies: [], origins: [] } },
     sessionSavedAt: { type: Date, default: null },
+    phone: { type: String, default: "" },
     lastChecked: { type: Date, default: null },
     statusBeforeDemote: { type: String, default: "" },
     sessionCheck: { type: Schema.Types.Mixed, default: null },

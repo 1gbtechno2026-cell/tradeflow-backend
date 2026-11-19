@@ -92,6 +92,9 @@ export interface JobRequestSnapshot {
    *  numbers the runner rotates through (per account) instead of the account's
    *  own registered mobile. */
   orderingPhones?: string[];
+  /** Whether to use the Ordering Phone pool for the delivery phone (card
+   *  default). false (COD / operator off) → the account's own phone instead. */
+  useOrderingPhone?: boolean;
   totalQuantity?: number;
   quantityPerOrder?: number;
   quantityPerOrderMode?: QuantityMode;

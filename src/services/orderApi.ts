@@ -503,6 +503,52 @@ export interface MappedOrderUnit {
   };
 }
 
+/**
+ * The delivery OTP for an out-for-delivery unit. The API carries it under
+ * deliveryDataBag.otpCallout / handOverInfo, but we have never captured a live
+ * out-for-delivery unit that actually had one, so the exact shape is unconfirmed
+ * (every recorded sample has otpCallout: null). This reads the shapes we can be
+ * sure about — a bare 4–6 digit string/number, an "OTP … 123456" string, or a
+ * known OTP key on an object — and returns null otherwise. The first time either
+ * field is non-null it logs the raw shape, so a real out-for-delivery unit tells
+ * us exactly what to lock in. Conservative on purpose: no blind digit-scan, so it
+ * never mistakes a pincode / amount for an OTP.
+ */
+let otpShapeLogged = false;
+function pickOtp(v: unknown): string | null {
+  if (v == null) return null;
+  if (typeof v === "number") return /^\d{4,6}$/.test(String(v)) ? String(v) : null;
+  if (typeof v === "string") {
+    const t = v.trim();
+    if (/^\d{4,6}$/.test(t)) return t;
+    const m = v.match(/otp[^0-9]{0,10}(\d{4,6})/i);
+    return m ? m[1] : null;
+  }
+  if (typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    for (const k of ["otp", "otpCode", "otpValue", "code", "value", "text", "calloutText", "title", "subtitle", "message"]) {
+      const got = pickOtp(o[k]);
+      if (got) return got;
+    }
+  }
+  return null;
+}
+function extractDeliveryOtp(dd: ApiUnit["deliveryDataBag"]): string | null {
+  if (!dd) return null;
+  const otpCallout = dd.otpCallout;
+  const handOverInfo = dd.handOverInfo;
+  const hasAny = (otpCallout != null && otpCallout !== "") || (handOverInfo != null && handOverInfo !== "");
+  if (hasAny && !otpShapeLogged) {
+    otpShapeLogged = true;
+    try {
+      console.log(`[orders-api] delivery OTP field is present — raw shape: ${JSON.stringify({ otpCallout, handOverInfo }).slice(0, 600)}`);
+    } catch {
+      /* ignore */
+    }
+  }
+  return pickOtp(otpCallout) ?? pickOtp(handOverInfo);
+}
+
 export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?: ApiUnit | null): MappedOrderUnit {
   const unit: ApiUnit = { ...(listUnit || {}), ...((view.units || {})[unitId] || {}) };
   const meta = unit.metaData || {};
@@ -607,7 +653,7 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
     business_name: String(b2b.businessName || view.customerInfo?.businessName || ""),
     business_gst_no: String(b2b.gstNumber || view.customerInfo?.gstNumber || ""),
     tracking_id: String(meta.trackingId || "").toUpperCase(),
-    delivery_otp: null, // deliveryDataBag.otpCallout — not yet seen on a live out-for-delivery unit
+    delivery_otp: extractDeliveryOtp(unit.deliveryDataBag), // otpCallout / handOverInfo — null until a live out-for-delivery unit carries one
     tracking,
     last_tracking_step: lastTrackingStep(tracking),
     billing_phone_number: String(billing.phoneNumber || view.customerInfo?.phoneNumber || "") || null,

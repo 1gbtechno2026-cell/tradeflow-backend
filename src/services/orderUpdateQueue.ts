@@ -51,7 +51,37 @@ export const UPDATE_OFD_SWEEP_MS = Math.max(15 * 60 * 1000, Number(process.env.U
 export const UPDATE_SCHEDULE_ENABLED = String(process.env.UPDATE_SCHEDULE ?? "1") !== "0";
 /** Statuses the 2-hour recheck covers: the last mile, where the OTP and the delivery land. */
 export const OFD_STATUSES = ["Out for delivery", "Dispatched"];
-export const WINDOW_LIMITS = { min: 1, max: 6 } as const;
+/** A unit can only carry a delivery OTP while it is in one of these stages. */
+const OFD_RE = /out for delivery|dispatched/i;
+/**
+ * HTTP "windows" = accounts refreshed in parallel. In API mode each window is a
+ * light HTTP context (tens of MB), so the cap is high; Chrome is separately gated
+ * below. Pure-Chrome runs should stay low — each account is a ~0.5 GB browser.
+ */
+export const WINDOW_LIMITS = { min: 1, max: 20 } as const;
+
+/**
+ * Global cap on concurrent Chrome contexts across ALL update windows, independent
+ * of the HTTP window count. At 12 HTTP windows a burst of page fallbacks could try
+ * to open 12 browsers (~6 GB); this baton-passing semaphore holds that to a few at
+ * a time so RAM can't blow up. HTTP fetching stays fully parallel.
+ */
+const CHROME_GATE_MAX = Math.max(1, Math.floor(Number(process.env.UPDATE_CHROME_CONCURRENCY) || 4));
+let chromeInUse = 0;
+const chromeWaiters: Array<() => void> = [];
+async function acquireChrome(): Promise<void> {
+  if (chromeInUse < CHROME_GATE_MAX) {
+    chromeInUse++;
+    return;
+  }
+  await new Promise<void>((resolve) => chromeWaiters.push(resolve));
+  // Resolved = a releaser handed us its slot; the in-use count was kept, not re-incremented.
+}
+function releaseChrome(): void {
+  const next = chromeWaiters.shift();
+  if (next) next(); // pass the slot straight to the next waiter (count unchanged)
+  else chromeInUse--; // no one waiting: free the slot
+}
 
 // ── settings ────────────────────────────────────────────────────────────────
 
@@ -347,6 +377,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
   const userId = String(request.userId);
   const log = (level: "info" | "warn" | "error", msg: string) => pushLog(requestId, level, `${me}: ${msg}`);
   let launched: { browser: Browser; context: BrowserContext } | null = null;
+  let chromeHeld = false; // true once this account has taken a slot from the Chrome gate
   try {
     await OrderUpdateRequest.updateOne({ _id: requestId, status: "queued" }, { $set: { status: "running", startedAt: new Date() } });
     await setAccount(requestId, me, { status: "running", startedAt: new Date(), done: 0, failed: 0, statusChanged: 0, otpNew: 0, message: "" });
@@ -364,6 +395,12 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
     let page: Page | null = null;
     const openPage = async () => {
       if (page) return page;
+      // One browser per account, and no more than CHROME_GATE_MAX across all windows.
+      // Guard the acquire so a retry after a failed launch never takes a 2nd slot.
+      if (!chromeHeld) {
+        await acquireChrome();
+        chromeHeld = true;
+      }
       launched = await launchStealthContext({ headless: config.headless });
       page = await launched.context.newPage();
       await blockFlipkartLogout(page);
@@ -383,6 +420,11 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
     }
     let via = api ? "api" : "page";
     let noData = 0;
+    // Part A — value-aware hybrid: units the HTTP read leaves without an OTP while
+    // out for delivery are the only ones that genuinely need the page. Collect them
+    // in Phase 1 and scrape just those in Phase 2, so HTTP does the bulk and Chrome
+    // only opens for the OTP it alone can read.
+    const needsScrape: typeof account.units = [];
     try {
       for (let n = 0; n < account.units.length; n++) {
         const fresh = await OrderUpdateRequest.findById(requestId).select("status").lean();
@@ -395,6 +437,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
         const before = await snapshotUnit(userId, u.unitId);
         try {
           let result: Awaited<ReturnType<typeof scrapeAndSave>>;
+          let usedPage = false; // did this unit already go through Chrome this round?
           if (api) {
             try {
               result = await apiScrapeAndSave(api, userId, acct, card, { applyCalendar: false });
@@ -408,11 +451,18 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
                 await log("warn", `${u.orderId}/${u.unitId}: API read failed (${apiErr instanceof Error ? apiErr.message.slice(0, 140) : apiErr}) — page`);
               }
               result = await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
+              usedPage = true;
             }
           } else {
             result = await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
+            usedPage = true;
           }
           const after = await snapshotUnit(userId, u.unitId);
+          // Read over HTTP, out for delivery, still no OTP → the OTP is page-only here.
+          // Defer to Phase 2 rather than opening Chrome mid-loop.
+          if (!usedPage && after && OFD_RE.test(after.status_key || "") && !after.delivery_otp) {
+            needsScrape.push(u);
+          }
           // Stage changes (not a vocabulary swap between the API's "Approved" and the page's
           // "Order Confirmed"), new OTPs and address changes become order_unit_events rows
           // — the dashboard's alerts read those.
@@ -432,6 +482,35 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           await log("warn", `${u.orderId}/${u.unitId}: ${text.slice(0, 200)}`);
         }
       }
+      // ── Phase 2 — surgical scrape ───────────────────────────────────────────
+      // Only OFD units the API couldn't give an OTP for. One browser (gated), each
+      // unit already counted as `done` in Phase 1, so here we pick up only the OTP
+      // (and any stage move the page reveals) without re-counting.
+      if (needsScrape.length) {
+        await log("info", `${needsScrape.length} out-for-delivery unit(s) without an API OTP — scraping those for OTP`);
+        for (const u of needsScrape) {
+          const fresh = await OrderUpdateRequest.findById(requestId).select("status").lean();
+          if (!fresh || fresh.status === "cancelled") break;
+          const card = { orderId: u.orderId, itemId: u.itemId, unitId: u.unitId, orderUrl: u.orderUrl, amount: "" };
+          try {
+            const before = await snapshotUnit(userId, u.unitId);
+            await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
+            const after = await snapshotUnit(userId, u.unitId);
+            const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
+            if (changes.otpNew || changes.stageChanged) {
+              await bumpAccount(requestId, me, { ...(changes.stageChanged ? { statusChanged: 1 } : {}), ...(changes.otpNew ? { otpNew: 1 } : {}) });
+            }
+            if (changes.otpNew) {
+              via = via === "api" ? "api+scrape" : via;
+              await log("info", `${u.orderId}/${u.unitId}: OTP ${after?.delivery_otp} (page)`);
+            }
+          } catch (err) {
+            if (isDestroyedContext(err)) throw err;
+            await log("warn", `${u.orderId}/${u.unitId}: OTP scrape failed (${err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : err})`);
+          }
+        }
+      }
+
       const final = (await OrderUpdateRequest.findById(requestId).select("accounts").lean())?.accounts.find((a) => a.email === me);
       // Every unit's page rendered nothing and the API refused the session:
       // the login is the problem, not the orders. Mark the Platform ID's last
@@ -459,6 +538,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
       const l = launched as { browser: Browser; context: BrowserContext };
       await closeBrowser(l.browser, l.context).catch(() => undefined);
     }
+    if (chromeHeld) releaseChrome();
     await unlock();
     await settleRequest(requestId);
     await sleep(300);

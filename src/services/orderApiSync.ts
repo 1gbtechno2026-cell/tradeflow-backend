@@ -1,5 +1,6 @@
 import type { APIRequestContext } from "playwright";
 import {
+  extractOtpFromPageFetch,
   fetchOrderDetails,
   fetchOrderList,
   listUnits,
@@ -8,6 +9,9 @@ import {
   type MappedOrderUnit,
   type OrderListPage,
 } from "./orderApi.js";
+
+/** Non-terminal check: never attach an OTP to a delivered/cancelled/failed unit. */
+const OTP_TERMINAL_RE = /^(delivered|cancelled|canceled|returned|refunded|failed)$/i;
 
 /**
  * The API-mode half of order fetch: walk My Orders until the orders are older
@@ -116,8 +120,13 @@ export async function readUnitViaApi(
   listUnit?: ApiUnit | null
 ): Promise<ApiUnitRead> {
   const details = await fetchOrderDetails(ctx, orderId, unitId);
+  const mapped = mapApiUnitToOrder(details.orderView, unitId, listUnit);
+  // The OTP lives in a button widget in the raw page body, not in deliveryDataBag.
+  // Pull it from there so the fast HTTP path captures it exactly like the scraper.
+  const otp = extractOtpFromPageFetch(details.raw);
+  if (otp && !OTP_TERMINAL_RE.test(mapped.status_key || "")) mapped.delivery_otp = otp;
   return {
-    mapped: mapApiUnitToOrder(details.orderView, unitId, listUnit),
+    mapped,
     raw: details.raw,
     unitIds: Object.keys(details.orderView.units || {}),
     ms: details.ms,

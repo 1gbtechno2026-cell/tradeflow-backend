@@ -549,6 +549,33 @@ function extractDeliveryOtp(dd: ApiUnit["deliveryDataBag"]): string | null {
   return pickOtp(otpCallout) ?? pickOtp(handOverInfo);
 }
 
+/**
+ * The delivery OTP as the order-detail API actually carries it. Confirmed live
+ * (2026-11-20) against out-for-delivery units the page scraper had an OTP for:
+ * deliveryDataBag.otpCallout is ALWAYS null on the customer API, but the OTP sits
+ * in a "Share OTP" button widget at
+ *   RESPONSE.slots[N].widget.data.buttons.renderableComponents[i]
+ *      .action.params.templateReplacements.otpValue
+ * The slot index varies (seen at 4/5/6), so scan every slot's buttons. Keyed on
+ * the unambiguous otpValue field only — not on button display text, which also
+ * holds prices/pincodes — so it never mistakes another 4–6 digit value for an OTP.
+ * Returns null when no OTP is on the page (not out for delivery, or delivered).
+ */
+export function extractOtpFromPageFetch(raw: unknown): string | null {
+  const slots = (raw as { RESPONSE?: { slots?: unknown[] } })?.RESPONSE?.slots;
+  if (!Array.isArray(slots)) return null;
+  for (const slot of slots) {
+    const rcs = (slot as { widget?: { data?: { buttons?: { renderableComponents?: unknown[] } } } })?.widget?.data?.buttons?.renderableComponents;
+    if (!Array.isArray(rcs)) continue;
+    for (const rc of rcs) {
+      const v = (rc as { action?: { params?: { templateReplacements?: { otpValue?: unknown } } } })?.action?.params?.templateReplacements?.otpValue;
+      const t = String(v ?? "").trim();
+      if (/^\d{4,6}$/.test(t)) return t;
+    }
+  }
+  return null;
+}
+
 export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?: ApiUnit | null): MappedOrderUnit {
   const unit: ApiUnit = { ...(listUnit || {}), ...((view.units || {})[unitId] || {}) };
   const meta = unit.metaData || {};

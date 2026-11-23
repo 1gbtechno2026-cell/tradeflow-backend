@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import type { Page } from "playwright";
 import { createRequire } from "node:module";
 import { PDFDocument } from "pdf-lib";
+import { unzipSync } from "fflate";
 import { HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { config } from "../config.js";
 import { Types } from "mongoose";
@@ -302,15 +303,26 @@ export interface InvoiceCaptureSummary {
  * The order's invoice bundle over Flipkart's API — the request the page's
  * "Download Invoice" button makes (recorded 2026-10-30 on OD339012711228057100:
  * GET <dc>.rome.api.flipkart.com/api/1/self-serve/invoice/download/<orderId>
- * → application/octet-stream, 3.3 MB, 24 pages, in 2.2 s; DC-switched like
- * every rome call). One PDF with every tax invoice of the order.
+ * → application/octet-stream, DC-switched like every rome call). The body is
+ * either a single %PDF, or (multi-invoice orders — the common case) a PK zip
+ * of one PDF per tax invoice — the same bundle the page's "Download Invoice"
+ * button produces. Returns every PDF; the caller merges/classifies them.
  */
-export async function downloadInvoiceViaApi(ctx: APIRequestContext, orderId: string): Promise<Buffer> {
+export async function downloadInvoiceViaApi(ctx: APIRequestContext, orderId: string): Promise<Buffer[]> {
   const { res } = await romeCall(ctx, (host) => ctx.get(`${host}/api/1/self-serve/invoice/download/${orderId}`, { timeout: 60_000 }));
   if (!res.ok()) throw new OrderApiError(`invoice download for ${orderId} answered HTTP ${res.status()}`, res.status(), "");
   const body = await res.body();
-  if (body.subarray(0, 4).toString() !== "%PDF") throw new Error(`invoice download for ${orderId} is not a PDF (${res.headers()["content-type"] || "?"}, ${body.length} bytes)`);
-  return body;
+  if (body.subarray(0, 4).toString("latin1") === "%PDF") return [body];
+  if (body[0] === 0x50 && body[1] === 0x4b) {
+    const files = unzipSync(new Uint8Array(body));
+    const pdfs = Object.keys(files)
+      .filter((n) => n.toLowerCase().endsWith(".pdf"))
+      .sort()
+      .map((n) => Buffer.from(files[n]));
+    if (!pdfs.length) throw new Error(`invoice zip for ${orderId} had no PDF`);
+    return pdfs;
+  }
+  throw new Error(`invoice download for ${orderId} is neither PDF nor zip (${res.headers()["content-type"] || "?"}, ${body.length} bytes)`);
 }
 
 export async function captureInvoicesForAccount(opts: {
@@ -352,7 +364,7 @@ export async function captureInvoicesForAccount(opts: {
   const pdfsOf = async (orderId: string, orderUrl: string): Promise<Buffer[]> => {
     if (opts.api) {
       try {
-        return [await downloadInvoiceViaApi(opts.api, orderId)];
+        return await downloadInvoiceViaApi(opts.api, orderId);
       } catch (err) {
         opts.log("warn", `${orderId}: invoice over the API failed (${err instanceof Error ? err.message.split("\n")[0].slice(0, 120) : String(err)}) — the page`);
       }

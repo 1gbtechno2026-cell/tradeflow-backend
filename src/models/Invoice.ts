@@ -42,6 +42,9 @@ export interface IInvoice {
   processed_at: Date | null;
   retried_by: string;
   retried_at: Date | null;
+  /** Time-settled completeness: settled after the +48 h re-capture (or at capture when the order was delivered > 48 h ago, parts already final). */
+  settled: boolean;
+  captured_at: Date | null;
   unit_ids: string[];
   /** Every tax invoice in the bundle (written by the Lambda; the dashboard's invoiceParse.ts InvoiceLine). */
   lines: Record<string, unknown>[];
@@ -68,6 +71,8 @@ const InvoiceSchema = new Schema<IInvoice>(
     processed_at: { type: Date, default: null },
     retried_by: { type: String, default: "" },
     retried_at: { type: Date, default: null },
+    settled: { type: Boolean, default: false },
+    captured_at: { type: Date, default: null },
     unit_ids: { type: [String], default: [] },
     lines: { type: [new Schema<Record<string, unknown>>({}, { _id: false, strict: false })], default: [] },
     summary: { type: Schema.Types.Mixed, default: null },
@@ -79,5 +84,6 @@ InvoiceSchema.index({ s3_key: 1 }, { unique: true });
 InvoiceSchema.index({ userId: 1, order_id: 1 });
 InvoiceSchema.index({ userId: 1, processing_status: 1, updatedAt: -1 });
 InvoiceSchema.index({ processing_status: 1, processing_started_at: 1, updatedAt: 1 });
+InvoiceSchema.index({ userId: 1, settled: 1 });
 
 export const Invoice = mongoose.model<IInvoice>("Invoice", InvoiceSchema, "invoices");

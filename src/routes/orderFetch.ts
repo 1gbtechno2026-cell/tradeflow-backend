@@ -1,5 +1,6 @@
 import { parseInvoiceMode } from "../services/invoiceCapture.js";
 import { downloadInvoicesByOrderId, parseOrderIds } from "../services/invoiceOnDemand.js";
+import { getInvoiceQueue } from "../queue.js";
 import { Router } from "express";
 import { config } from "../config.js";
 import { workspaceUserId } from "../services/sessionStore.js";
@@ -14,7 +15,7 @@ import { resolveCheckoutSettings, setCheckoutSettings } from "../services/checko
 import { abortCancelRequest, getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import { abortRescheduleRequest, getRescheduleRequest, listRescheduleRequests, previewReschedule, requestReschedule, retryRescheduleRequest } from "../services/orderReschedule.js";
 import { proxyModeStatus, setProxyMode } from "../services/proxyMode.js";
-import { listRuns, syncPanel } from "../services/orderJobRuns.js";
+import { finishRun, listRuns, startRun, syncPanel } from "../services/orderJobRuns.js";
 import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays, setScheduledInvoices } from "../services/orderFetchSchedule.js";
 import {
   abortUpdateRequest,
@@ -276,11 +277,32 @@ orderFetchRouter.post("/invoices/download", async (req, res) => {
       res.status(400).json({ error: `Too many order IDs (${orderIds.length}); download at most ${MAX_INLINE_INVOICE_IDS} at once here` });
       return;
     }
-    const results = await downloadInvoicesByOrderId({ userId, orderIds, force, concurrency: 6 });
-    const summary = results.reduce<Record<string, number>>((a, r) => ((a[r.status] = (a[r.status] || 0) + 1), a), {});
-    res.json({ results, summary, total: results.length });
+    // Record it as an `invoices` run so the Sync panel / running indicator shows it.
+    await startRun(userId, "invoices", { trigger: "user", by: String(req.body?.by || "").trim(), total: orderIds.length, message: `Downloading ${orderIds.length} invoice(s)…` });
+    try {
+      const results = await downloadInvoicesByOrderId({ userId, orderIds, force, concurrency: 6 });
+      const summary = results.reduce<Record<string, number>>((a, r) => ((a[r.status] = (a[r.status] || 0) + 1), a), {});
+      const success = results.filter((r) => r.status === "downloaded" || r.status === "already").length;
+      const failed = results.filter((r) => r.status === "failed").length;
+      await finishRun(userId, "invoices", { status: "completed", total: results.length, processed: results.length, success, failed, cancelled: 0, message: `Downloaded ${summary.downloaded || 0}, already ${summary.already || 0}, failed ${failed}` });
+      res.json({ results, summary, total: results.length });
+    } catch (err) {
+      await finishRun(userId, "invoices", { status: "failed", total: orderIds.length, processed: 0, success: 0, failed: orderIds.length, cancelled: 0, message: err instanceof Error ? err.message : "download failed" });
+      throw err;
+    }
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Could not download invoices" });
+  }
+});
+
+/** Start the time-settled invoice sweep (the "Invoices" button). Enqueues one job; the worker runs it and the Sync panel shows it. */
+orderFetchRouter.post("/invoices/sweep", async (req, res) => {
+  try {
+    const by = String(req.body?.by || "").trim();
+    await getInvoiceQueue().add("sweep", { sweep: "manual", by }, { attempts: 1 });
+    res.json({ message: "Invoice sweep queued" });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Could not start the invoice sweep" });
   }
 });
 

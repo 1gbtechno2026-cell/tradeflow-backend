@@ -270,3 +270,42 @@ export function createUpdateWorker(
     maxStalledCount: 1,
   });
 }
+
+// ── Order invoice ──────────────────────────────────────────────────────────
+// Time-settled invoice capture (services/invoiceSweep.ts): a periodic "sweep"
+// job captures delivered orders with no invoice and re-captures + settles those
+// past the settle window. The sweep pools accounts internally, so this queue
+// runs one job at a time (concurrency 1) — the dev single-lock.
+
+export const INVOICE_QUEUE = "order-invoice";
+
+export interface InvoiceJobData {
+  /** "scheduled" (the cron) or "manual" (the Invoices button). */
+  sweep?: "scheduled" | "manual";
+  by?: string;
+}
+
+let invoiceQueue: Queue<InvoiceJobData> | null = null;
+
+export function getInvoiceQueue(): Queue<InvoiceJobData> {
+  if (!invoiceQueue) {
+    invoiceQueue = new Queue<InvoiceJobData>(INVOICE_QUEUE, {
+      connection: redisConnection(),
+      defaultJobOptions: { attempts: 1, removeOnComplete: true, removeOnFail: true } satisfies JobsOptions,
+    });
+  }
+  return invoiceQueue;
+}
+
+export function createInvoiceWorker(
+  concurrency: number,
+  processor: (job: Job<InvoiceJobData>, token: string | undefined) => Promise<void>
+) {
+  return new Worker<InvoiceJobData>(INVOICE_QUEUE, processor, {
+    connection: redisConnection(),
+    concurrency: Math.max(1, concurrency),
+    lockDuration: 30 * 60 * 1000,
+    stalledInterval: 60 * 1000,
+    maxStalledCount: 1,
+  });
+}

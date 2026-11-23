@@ -1,6 +1,6 @@
 import { connectDb } from "./db.js";
 import { config } from "./config.js";
-import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createRescheduleWorker, createSyncWorker, createUpdateWorker, getSyncQueue, HTTP_QUEUE, LEGACY_QUEUE, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
+import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createInvoiceWorker, createRescheduleWorker, createSyncWorker, createUpdateWorker, getInvoiceQueue, getSyncQueue, HTTP_QUEUE, INVOICE_QUEUE, LEGACY_QUEUE, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
 import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
@@ -9,6 +9,7 @@ import { resolveCancelSpeed, runCancelJob, startCancelReaper } from "./services/
 import { rescheduleConcurrency, runRescheduleJob, startRescheduleReaper } from "./services/orderReschedule.js";
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
 import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob, startUpdateReaper } from "./services/orderUpdateQueue.js";
+import { runTrackedInvoiceSweep, INVOICE_SCHEDULE_ENABLED, INVOICE_SWEEP_MS } from "./services/invoiceSweep.js";
 import { describeError, isTransientError, throttledWarn } from "./lib/resilience.js";
 
 /**
@@ -47,11 +48,11 @@ function classesFromEnv(): JobClass[] {
   return picked.length ? picked : [...JOB_CLASSES];
 }
 
-type Role = "checkout" | "cancel" | "sync" | "update" | "reschedule";
+type Role = "checkout" | "cancel" | "sync" | "update" | "reschedule" | "invoice";
 
 function rolesFromEnv(): Set<Role> {
   const raw = String(process.env.WORKER_ROLES || "").trim();
-  const all: Role[] = ["checkout", "cancel", "sync", "update", "reschedule"];
+  const all: Role[] = ["checkout", "cancel", "sync", "update", "reschedule", "invoice"];
   if (!raw) return new Set(all);
   const picked = raw.split(",").map((s) => s.trim()).filter((r): r is Role => (all as string[]).includes(r));
   return new Set(picked.length ? picked : all);
@@ -218,6 +219,25 @@ async function main() {
     await ensureUpdateSchedules();
     startUpdateReaper();
     names.push([UPDATE_QUEUE, windows]);
+  }
+
+  // Invoice capture: the time-settled sweep (services/invoiceSweep.ts). One job
+  // at a time (the sweep pools accounts itself) plus the periodic schedule.
+  if (roles.has("invoice")) {
+    const invoiceWorker = createInvoiceWorker(1, async (job) => {
+      if (job.name === "sweep") {
+        const out = await runTrackedInvoiceSweep(config.userId, { trigger: job.data.sweep === "manual" ? "user" : "system-cron", by: job.data.by });
+        if (out.skipped) console.log(`[worker] ${INVOICE_QUEUE} sweep skipped — ${out.reason}`);
+      }
+    });
+    invoiceWorker.on("failed", (job, err) => {
+      if (err.name !== "DelayedError") console.error(`[worker] FAILED ${INVOICE_QUEUE} job=${job?.id}:`, err.message);
+    });
+    invoiceWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${INVOICE_QUEUE}):`, err.message));
+    if (INVOICE_SCHEDULE_ENABLED) {
+      await getInvoiceQueue().upsertJobScheduler("order-invoice-sweep", { every: INVOICE_SWEEP_MS }, { name: "sweep", data: { sweep: "scheduled" }, opts: { attempts: 1 } });
+    }
+    names.push([INVOICE_QUEUE, 1]);
   }
 
   if (!names.length) {

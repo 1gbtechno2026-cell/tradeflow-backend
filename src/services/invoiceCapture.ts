@@ -61,7 +61,7 @@ export async function classifyInvoicePdf(buf: Buffer): Promise<{ type: InvoicePa
   }
   const invoiceNumber = (text.match(/Invoice Number\s*#?\s*:?\s*([A-Z0-9]{8,})/i) || [])[1] || (text.match(/Tax Invoice Number\s*:\s*([A-Z0-9]{8,})/i) || [])[1] || "";
   let type: InvoicePartType = "other";
-  if (/GT Charges|GOODS TRANSPORTED BY GTA|Goods Carriage/i.test(text)) type = "transport";
+  if (/GOODS TRANSPORTED BY GTA|Goods Carriage/i.test(text) || /NB[A-Z0-9]{8,}\s*Tax Invoice Number/i.test(text) || /\b(?:GT|Delivery)\s*Charges\s*996\d/i.test(text)) type = "transport";
   else if (/Protect Promise Fee/i.test(text)) type = "protect_promise";
   else if (/Corporate Card Fee|Offer Handling Fee|Flipkart Internet Private Limited/i.test(text) && !/FSN:/i.test(text)) type = "flipkart_fee";
   else if (/FSN:|HSN\/SAC:\s*\d{4,}|Product\s*Title|Total items:/i.test(text)) type = "product";

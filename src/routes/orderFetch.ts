@@ -1,4 +1,5 @@
 import { parseInvoiceMode } from "../services/invoiceCapture.js";
+import { downloadInvoicesByOrderId, parseOrderIds } from "../services/invoiceOnDemand.js";
 import { Router } from "express";
 import { config } from "../config.js";
 import { workspaceUserId } from "../services/sessionStore.js";
@@ -252,6 +253,34 @@ orderFetchRouter.post("/update/stop", async (req, res) => {
     res.json({ message: out ? `Order update stopped — ${out.removed} account(s) removed from the queue` : "No order update is running", ...(out || {}) });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Could not stop" });
+  }
+});
+
+/**
+ * On-demand invoice download by order ID (the "Download Order Invoices" modal).
+ * Body: { orderIds: string[] | "id id,id", force?: boolean }. Resolves each
+ * order's account, downloads the bundle over the API, and lets the pipeline
+ * re-extract. Inline for a modest batch; larger sets belong on the invoice job.
+ */
+const MAX_INLINE_INVOICE_IDS = 100;
+orderFetchRouter.post("/invoices/download", async (req, res) => {
+  try {
+    const userId = userIdFrom(req);
+    const orderIds = parseOrderIds(req.body?.orderIds);
+    const force = Boolean(req.body?.force);
+    if (!orderIds.length) {
+      res.status(400).json({ error: "No order IDs given" });
+      return;
+    }
+    if (orderIds.length > MAX_INLINE_INVOICE_IDS) {
+      res.status(400).json({ error: `Too many order IDs (${orderIds.length}); download at most ${MAX_INLINE_INVOICE_IDS} at once here` });
+      return;
+    }
+    const results = await downloadInvoicesByOrderId({ userId, orderIds, force, concurrency: 6 });
+    const summary = results.reduce<Record<string, number>>((a, r) => ((a[r.status] = (a[r.status] || 0) + 1), a), {});
+    res.json({ results, summary, total: results.length });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : "Could not download invoices" });
   }
 });
 

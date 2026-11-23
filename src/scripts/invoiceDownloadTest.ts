@@ -35,6 +35,7 @@ import {
 const args = new Set(process.argv.slice(2));
 const RUN = args.has("--run");
 const LIMIT = Number((process.argv.find((a) => a.startsWith("--limit=")) || "--limit=100").split("=")[1]) || 100;
+const CONC = Math.max(1, Number((process.argv.find((a) => a.startsWith("--concurrency=")) || "--concurrency=1").split("=")[1]) || 1);
 
 interface OrderPick {
   userId: string;
@@ -125,20 +126,21 @@ async function main() {
     return;
   }
 
-  // ---- real download ----
+  // ---- real download (parallel account-windows) ----
   const t0 = Date.now();
   const stat = { tried: 0, stored: 0, skippedExisting: 0, needsPage: 0, failed: 0 };
   const partCount: Record<string, number> = {};
-  for (const [accountId, picks] of byAccount) {
+
+  async function processAccount(accountId: string, picks: OrderPick[]) {
     const cookies = accountCookies.get(accountId);
-    if (!cookies) continue;
+    if (!cookies) return;
     let ctx;
     try {
       ctx = await openOrderApiSession(cookies);
     } catch (err) {
-      console.warn(`  account ${accountId}: session open failed (${(err as Error).message}) — skipping ${picks.length} orders`);
+      console.warn(`  account ${accountId}: session open failed (${(err as Error).message}) — skipping ${picks.length}`);
       stat.failed += picks.length;
-      continue;
+      return;
     }
     for (const p of picks) {
       stat.tried++;
@@ -168,17 +170,30 @@ async function main() {
         );
         for (const part of bundle.parts) partCount[part.type] = (partCount[part.type] || 0) + 1;
         stat.stored++;
-        if (stat.stored % 10 === 0) console.log(`  …${stat.stored} stored`);
+        if (stat.stored % 50 === 0) console.log(`  …${stat.stored} stored (${Math.round((Date.now() - t0) / 1000)}s)`);
       } catch (err) {
         const msg = (err as Error).message || String(err);
-        if (/not a PDF|HTTP 4|HTTP 5/.test(msg)) stat.needsPage++;
+        if (/not a PDF|neither PDF|HTTP 4|HTTP 5/.test(msg)) stat.needsPage++;
         else stat.failed++;
         console.warn(`  ${p.orderId}: ${msg.split("\n")[0].slice(0, 140)}`);
       }
-      await new Promise((r) => setTimeout(r, 400));
+      await new Promise((r) => setTimeout(r, 300));
     }
     await ctx.dispose().catch(() => undefined);
   }
+
+  // Pool of CONC accounts at a time.
+  const entries = [...byAccount.entries()];
+  console.log(`downloading with ${CONC} parallel account-window(s)…`);
+  let idx = 0;
+  async function worker() {
+    while (idx < entries.length) {
+      const [accountId, picks] = entries[idx++];
+      await processAccount(accountId, picks);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONC, entries.length) }, () => worker()));
+
   const secs = Math.round((Date.now() - t0) / 1000);
   console.log(`\n=== done in ${secs}s ===`);
   console.log(`tried=${stat.tried} stored=${stat.stored} skippedExisting=${stat.skippedExisting} needsPage=${stat.needsPage} failed=${stat.failed}`);

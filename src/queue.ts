@@ -309,3 +309,96 @@ export function createInvoiceWorker(
     maxStalledCount: 1,
   });
 }
+
+// ── Invoice batch ──────────────────────────────────────────────────────────
+// "Download Order Invoices" as a batch (services/invoiceRequests.ts): one job
+// per (invoice request, account); the account's orders are downloaded one
+// after another over one session, accounts in parallel up to
+// INVOICE_BATCH_CONCURRENCY (default 12).
+//
+// Its own queue, NOT a new job name on `order-invoice`: a worker started
+// before this existed completes any job on that queue whose name is not
+// "sweep" without doing anything, so a batch put there would vanish. On a
+// queue such a worker does not listen to, the jobs wait and the API's
+// watchdog fails the request with "restart the worker".
+
+export const INVOICE_BATCH_QUEUE = "order-invoice-batch";
+
+export interface InvoiceBatchJobData {
+  requestId: string;
+  /** PlatformId _id of the account whose orders this job downloads. */
+  accountId: string;
+}
+
+/** Lock / stall timings of the two request queues; the checks shorten them to watch a resume. */
+export interface RequestWorkerTimings {
+  lockDuration?: number;
+  stalledInterval?: number;
+  maxStalledCount?: number;
+}
+
+const requestQueues = new Map<string, Queue>();
+
+function requestQueue<T>(name: string): Queue<T> {
+  let q = requestQueues.get(name);
+  if (!q) {
+    q = new Queue(name, {
+      connection: redisConnection(),
+      defaultJobOptions: { attempts: 1, removeOnComplete: true, removeOnFail: true } satisfies JobsOptions,
+    });
+    requestQueues.set(name, q);
+  }
+  return q as unknown as Queue<T>;
+}
+
+/** `name` is only ever passed by the checks (a throwaway queue); everything else uses the default. */
+export function getInvoiceBatchQueue(name = INVOICE_BATCH_QUEUE): Queue<InvoiceBatchJobData> {
+  return requestQueue<InvoiceBatchJobData>(name);
+}
+
+export function createInvoiceBatchWorker(
+  concurrency: number,
+  processor: (job: Job<InvoiceBatchJobData>, token: string | undefined) => Promise<void>,
+  opts: RequestWorkerTimings & { queueName?: string } = {}
+) {
+  return new Worker<InvoiceBatchJobData>(opts.queueName || INVOICE_BATCH_QUEUE, processor, {
+    connection: redisConnection(),
+    concurrency: Math.max(1, concurrency),
+    // A job is one account's orders, a few seconds each: a short lock, renewed while
+    // the process lives, hands an account back within about a minute of a worker dying.
+    lockDuration: opts.lockDuration ?? 60 * 1000,
+    stalledInterval: opts.stalledInterval ?? 30 * 1000,
+    maxStalledCount: opts.maxStalledCount ?? 3,
+  });
+}
+
+// ── Company coupons ────────────────────────────────────────────────────────
+// "Apply Company Coupons" (services/couponRequests.ts): one job per (coupon
+// request, account); every coupon link is opened with that account's saved
+// session over plain HTTP. Its own queue for the same reason as the invoice
+// batch. COUPON_CONCURRENCY accounts at once (default 4).
+
+export const COUPON_QUEUE = "order-coupon-apply";
+
+export interface CouponJobData {
+  requestId: string;
+  email: string;
+}
+
+export function getCouponQueue(name = COUPON_QUEUE): Queue<CouponJobData> {
+  return requestQueue<CouponJobData>(name);
+}
+
+export function createCouponWorker(
+  concurrency: number,
+  processor: (job: Job<CouponJobData>, token: string | undefined) => Promise<void>,
+  opts: RequestWorkerTimings & { queueName?: string } = {}
+) {
+  return new Worker<CouponJobData>(opts.queueName || COUPON_QUEUE, processor, {
+    connection: redisConnection(),
+    concurrency: Math.max(1, concurrency),
+    lockDuration: opts.lockDuration ?? 60 * 1000,
+    stalledInterval: opts.stalledInterval ?? 30 * 1000,
+    maxStalledCount: opts.maxStalledCount ?? 3,
+  });
+}

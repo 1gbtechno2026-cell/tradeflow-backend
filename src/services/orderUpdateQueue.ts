@@ -13,6 +13,7 @@ import { blockFlipkartLogout, closeBrowser, flipkartLoginUrl, launchStealthConte
 import { openOrderApiSession, OrderApiSessionError } from "./orderApi.js";
 import { apiScrapeAndSave, scrapeAndSave, type OrderAccount } from "./orderFetch.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
+import { DEFAULT_UPDATE_STATUSES } from "./orderLifecycle.js";
 import { resolveTargets, type UpdateTriggerInput } from "./orderUpdate.js";
 import { recordUnitChanges, snapshotUnit } from "./orderUnitEvents.js";
 import { resolveLoggedInSession, workspaceUserId } from "./sessionStore.js";
@@ -107,7 +108,7 @@ async function pushLog(requestId: Types.ObjectId | string, level: "info" | "warn
   await OrderUpdateRequest.updateOne({ _id: requestId }, { $push: { logs: { $each: [{ time: new Date(), level, message }], $slice: -LOG_KEEP } } }).catch(() => undefined);
 }
 
-export async function createUpdateRequest(userId: string, input: UpdateTriggerInput, opts: { source?: UpdateSource; by?: string } = {}) {
+export async function createUpdateRequest(userId: string, input: UpdateTriggerInput, opts: { source?: UpdateSource; by?: string; params?: Record<string, unknown>; parentId?: string } = {}) {
   const targets = await resolveTargets(userId, input);
   if (!targets.length) throw new Error("No active order units to update. Fetch first, or paste a logged-in email + order id.");
 
@@ -138,6 +139,8 @@ export async function createUpdateRequest(userId: string, input: UpdateTriggerIn
     userId: new Types.ObjectId(userId),
     source: opts.source || "manual",
     selectionMethod: input.selectionMethod || (input.orderIds?.length ? "order_ids" : input.emails?.length ? "emails" : input.csvRows?.length ? "csv" : input.orderStatus?.length ? "order_status" : "active"),
+    params: opts.params || {},
+    parentId: String(opts.parentId || "").trim(),
     createdBy: String(opts.by || "").trim(),
     status: "queued",
     mode: mode.mode,
@@ -248,6 +251,8 @@ export function publicUpdateRequest(r: Partial<IOrderUpdateRequest> & { _id: unk
     id: String(r._id),
     source: r.source || "manual",
     selectionMethod: r.selectionMethod || "",
+    params: r.params || {},
+    parentId: r.parentId || "",
     createdBy: r.createdBy || "",
     status: r.status || "queued",
     mode: r.mode || "api",
@@ -562,7 +567,12 @@ export async function runUpdateSweep(kind: "active" | "ofd"): Promise<void> {
   }
   try {
     const input: UpdateTriggerInput = kind === "ofd" ? { orderStatus: OFD_STATUSES, selectionMethod: "schedule_ofd" } : { selectionMethod: "schedule_active" };
-    const req = await createUpdateRequest(userId, input, { source, by: "schedule" });
+    const req = await createUpdateRequest(userId, input, {
+      source,
+      by: "schedule",
+      // "All active" names no status: it records the in-progress list it stands for — the schedule's own rule, which leaves Returned out.
+      params: { platform: "FLIPKART", selection_method: input.selectionMethod, force: false, statuses_to_update: input.orderStatus || DEFAULT_UPDATE_STATUSES.filter((s) => s !== "Returned"), status_keys: input.orderStatus || [], email_ids_count: 0, order_ids_count: 0, order_email_pairs_count: 0 },
+    });
     console.log(`[orders-update] ${kind} sweep → request ${req.id}: ${req.counts.units} unit(s) on ${req.counts.accounts} account(s)`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

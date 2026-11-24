@@ -6,6 +6,10 @@ import { jobsRouter } from "./routes/jobs.js";
 import { testRouter } from "./routes/test.js";
 import { orderFetchRouter } from "./routes/orderFetch.js";
 import { startFetchSchedule } from "./services/orderFetchSchedule.js";
+import { closeInterruptedFetchRuns } from "./services/orderJobRuns.js";
+import { startInvoiceRequestWatchdog } from "./services/invoiceRequests.js";
+import { startCouponRequestWatchdog } from "./services/couponRequests.js";
+import { hostName } from "./services/requestCommon.js";
 import { startQueueMetrics } from "./services/queueMetrics.js";
 import { smsRouter } from "./routes/sms.js";
 import { describeError, isTransientError, throttledWarn } from "./lib/resilience.js";
@@ -106,6 +110,14 @@ async function main() {
   // Scheduled Fetch (FETCH_SCHEDULE); off unless set.
   startFetchSchedule();
   startQueueMetrics();
+  // A fetch lives in this process: a fetch row an earlier process of this machine left open is closed.
+  void closeInterruptedFetchRuns(hostName(), process.pid)
+    .then((n) => n && console.log(`[trade-flow] closed ${n} fetch run(s) an earlier API process left open`))
+    .catch(() => undefined);
+  // Invoice and coupon batches run on the worker's own queues; a request no worker takes
+  // (one started before those queues existed) is failed with "restart the worker".
+  startInvoiceRequestWatchdog();
+  startCouponRequestWatchdog();
 }
 
 main().catch((err) => {

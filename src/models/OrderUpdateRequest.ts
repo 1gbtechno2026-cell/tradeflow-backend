@@ -48,6 +48,16 @@ export interface IOrderUpdateRequest {
   userId: Types.ObjectId;
   source: UpdateSource;
   selectionMethod: string;
+  /**
+   * What was asked, kept so the batch list can show it later: platform,
+   * selection_method, statuses_to_update (the labels as sent), status_keys
+   * (what they matched here), email_ids_count, order_ids_count,
+   * order_email_pairs_count. Empty on requests made before 2026-11-24 and on
+   * the two schedules.
+   */
+  params: Record<string, unknown>;
+  /** The request this one follows — the fetch's ledger run id for `after_fetch`. */
+  parentId: string;
   createdBy: string;
   status: "queued" | "running" | "done" | "cancelled";
   mode: "scrape" | "api";
@@ -103,6 +113,8 @@ const OrderUpdateRequestSchema = new Schema<IOrderUpdateRequest>(
     userId: { type: Schema.Types.ObjectId, required: true, index: true },
     source: { type: String, enum: ["manual", "schedule", "ofd", "cancel"], default: "manual" },
     selectionMethod: { type: String, default: "" },
+    params: { type: Schema.Types.Mixed, default: () => ({}) },
+    parentId: { type: String, default: "" },
     createdBy: { type: String, default: "" },
     status: { type: String, enum: ["queued", "running", "done", "cancelled"], default: "queued" },
     mode: { type: String, enum: ["scrape", "api"], default: "api" },

@@ -1,21 +1,27 @@
-import { parseInvoiceMode } from "../services/invoiceCapture.js";
 import { downloadInvoicesByOrderId, parseOrderIds } from "../services/invoiceOnDemand.js";
 import { getInvoiceQueue } from "../queue.js";
-import { Router } from "express";
+import { Router, type Response } from "express";
 import { config } from "../config.js";
 import { workspaceUserId } from "../services/sessionStore.js";
 import { resolveOrderFetchMode, setOrderFetchMode } from "../services/orderSyncSettings.js";
 import {
   getOrderFetchJob,
-  parseSinceDate,
+  isOrderFetchPreparing,
+  OrderFetchStoppedError,
+  reserveOrderFetch,
   startOrderFetch,
   stopOrderFetch,
+  type OrderFetchStartOptions,
 } from "../services/orderFetch.js";
+import { createInvoiceRequest, getInvoiceRequest, listInvoiceRequests, stopInvoiceRequest } from "../services/invoiceRequests.js";
+import { createCouponRequest, getCouponRequest, listCouponRequests, stopCouponRequest } from "../services/couponRequests.js";
+import { assertFlipkart, hostName, RequestInputError } from "../services/requestCommon.js";
+import { parseFetchBody, parseUpdateBody, planFetch, planUpdate, queueUpdateAfterFetch } from "../services/startRequests.js";
 import { resolveCheckoutSettings, setCheckoutSettings } from "../services/checkoutSettings.js";
 import { abortCancelRequest, getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import { abortRescheduleRequest, getRescheduleRequest, listRescheduleRequests, previewReschedule, requestReschedule, retryRescheduleRequest } from "../services/orderReschedule.js";
 import { proxyModeStatus, setProxyMode } from "../services/proxyMode.js";
-import { finishRun, listRuns, startRun, syncPanel } from "../services/orderJobRuns.js";
+import { createQueuedRun, failRunById, finishRun, listRuns, startRun, stopRunById, syncPanel } from "../services/orderJobRuns.js";
 import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays, setScheduledInvoices } from "../services/orderFetchSchedule.js";
 import {
   abortUpdateRequest,
@@ -34,16 +40,6 @@ import {
 
 export const orderFetchRouter = Router();
 
-function parseEmails(value: unknown): string[] {
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item || "").trim().toLowerCase()).filter(Boolean);
-  }
-  return String(value || "")
-    .split(/[\s,]+/)
-    .map((item) => item.trim().toLowerCase())
-    .filter(Boolean);
-}
-
 function parseIds(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.map((item) => String(item || "").trim()).filter(Boolean);
@@ -59,41 +55,93 @@ function userIdFrom(req: { body?: { userId?: unknown } }) {
   return fromBody || workspaceUserId();
 }
 
+/** A body the trigger refuses answers with its own status and code; anything else is the route's usual 400. */
+function sendError(res: Response, err: unknown, fallback: string, status = 400) {
+  if (err instanceof RequestInputError) {
+    res.status(err.status).json({ error: err.message, code: err.code });
+    return;
+  }
+  res.status(status).json({ error: err instanceof Error ? err.message : fallback });
+}
+
+/** Up to this many accounts the trigger answers once the run is going; a longer list is prepared in the background (≈0.1 s per account). */
+const FETCH_INLINE_START_MAX = 100;
+
+/**
+ * Fetch Order Units. Body — the reference's, and the one this route always took:
+ *   { platform, email_ids? | emails?, fetch_orders_after_date?, enable_login?,
+ *     force_fetch?, run_update_after_fetch?, invoices?, by? }
+ * No emails = every logged-in Flipkart account of the workspace. No date = the
+ * workspace's look-back. Answers with `request_id` (the ledger run id). What
+ * was asked is kept on that run (meta.params). `enable_login` and
+ * `force_fetch` are recorded only: an account that is not logged in is
+ * skipped and listed, as before, and one fetch runs at a time.
+ */
 orderFetchRouter.post("/fetch/trigger", async (req, res) => {
+  // The workspace's one fetch slot, held from the first check until startOrderFetch has taken over:
+  // working out who to fetch takes a second or two, and a second trigger in that window is refused, not answered.
+  let release: (() => void) | undefined;
   try {
-    const platform = String(req.body?.platform || "FLIPKART").toUpperCase();
-    if (platform !== "FLIPKART") {
-      res.status(400).json({ error: "Only FLIPKART fetch is supported" });
-      return;
-    }
-    const emails = parseEmails(req.body?.emails);
-    if (!emails.length) {
-      res.status(400).json({ error: "Paste Flipkart emails in Fetch (comma or space separated)" });
-      return;
-    }
-    const after = String(req.body?.fetch_orders_after_date || "").trim();
-    if (!after) {
-      res.status(400).json({ error: "Pick Fetch Orders After date" });
-      return;
-    }
-    const sinceDate = parseSinceDate(after);
+    const body = parseFetchBody(req.body);
     const userId = userIdFrom(req);
-    await startOrderFetch(userId, emails, sinceDate, { invoices: parseInvoiceMode(req.body?.invoices), trigger: req.body?.trigger === "system-cron" ? "system-cron" : "user", by: String(req.body?.by || "").trim() });
+    release = reserveOrderFetch(userId);
+    const plan = await planFetch(userId, body);
+    if (!plan.loggedIn) throw new Error(`None of the ${plan.emails.length} email(s) are logged in. Login them in platform id first.`);
+    const opts: OrderFetchStartOptions = {
+      invoices: body.invoices,
+      trigger: body.trigger,
+      by: body.by,
+      params: plan.params,
+      reserved: true,
+      onFinished: body.runUpdateAfterFetch
+        ? async (info) => {
+            await queueUpdateAfterFetch(userId, { runId: info.runId, emails: info.emails, selection: plan.selection, cancelled: info.cancelled, by: body.by, trigger: body.trigger });
+          }
+        : undefined,
+    };
+    const preparing = plan.emails.length > FETCH_INLINE_START_MAX;
+    let requestId = "";
+    if (preparing) {
+      // The id is handed out now; the run adopts this row when its account list is ready.
+      requestId = await createQueuedRun(userId, "fetch", {
+        trigger: body.trigger,
+        by: body.by,
+        total: plan.loggedIn,
+        message: `Preparing ${plan.loggedIn} account(s) — the fetch starts when their saved units are read`,
+        meta: { platform: body.platform, params: plan.params, emails_count: plan.loggedIn, host: hostName(), pid: process.pid },
+      });
+      void startOrderFetch(userId, plan.emails, plan.sinceDate, { ...opts, runId: requestId }).catch((err) => {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.warn(`[orders-fetch] fetch ${requestId} could not start: ${reason}`);
+        // Force kill during the preparation is a stop, not a failure.
+        return err instanceof OrderFetchStoppedError ? stopRunById(requestId, reason) : failRunById(requestId, `Could not start: ${reason}`);
+      });
+    } else {
+      requestId = (await startOrderFetch(userId, plan.emails, plan.sinceDate, opts)).runId;
+    }
     const job = getOrderFetchJob(userId);
+    const queued = preparing ? plan.loggedIn : job.total;
     res.json({
       message: "Order fetch triggered successfully",
-      platform,
-      selection_method: "email",
-      total_accounts_found: emails.length,
-      valid_accounts_queued: job.total,
-      tasks_created: job.total,
-      windows: job.windows,
-      fetch_orders_after_date: after,
-      invoices: parseInvoiceMode(req.body?.invoices),
+      platform: body.platform,
+      selection_method: plan.selection,
+      total_accounts_found: plan.emails.length,
+      valid_accounts_queued: queued,
+      tasks_created: queued,
+      windows: preparing ? null : job.windows,
+      fetch_orders_after_date: plan.afterDate,
+      fetch_orders_after_date_source: plan.afterDateSource,
+      invoices: body.invoices,
+      request_id: requestId,
+      params: plan.params,
+      preparing,
       timestamp: Math.floor(Date.now() / 1000),
     });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : "Could not start fetch" });
+    sendError(res, err, "Could not start fetch");
+  } finally {
+    // startOrderFetch marks the workspace as preparing before its first await, so nothing slips in between.
+    release?.();
   }
 });
 
@@ -113,7 +161,8 @@ orderFetchRouter.get("/fetch/status", async (req, res) => {
   // While idle, report the mode the NEXT run would use (the dashboard switch,
   // else .env); while running, the mode this run was started with.
   const resolved = await resolveOrderFetchMode(userId).catch(() => null);
-  res.json({ ...job, mode: job.running ? job.mode : resolved?.mode || job.mode, modeSource: resolved?.source || "env" });
+  // `preparing`: a fetch has been asked for and its account list is still being read — it is not `running` yet.
+  res.json({ ...job, mode: job.running ? job.mode : resolved?.mode || job.mode, modeSource: resolved?.source || "env", preparing: isOrderFetchPreparing(userId) });
 });
 
 /** The fetch/update mode switch — what the dashboard pill shows and flips. */
@@ -148,52 +197,51 @@ orderFetchRouter.put("/fetch/mode", async (req, res) => {
   }
 });
 
-function parseCsvRows(value: unknown): Array<{ email: string; order_id: string }> {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((row) => {
-      const rec = row && typeof row === "object" ? (row as Record<string, unknown>) : {};
-      return {
-        email: String(rec.email || "").trim().toLowerCase(),
-        order_id: String(rec.order_id || rec.orderId || "").trim(),
-      };
-    })
-    .filter((row) => row.email && row.order_id);
-}
+/**
+ * Refresh Order Units Status & OTP. Body — the reference's six, and the one this route always took:
+ *   { platform } | { platform, order_status } | { platform, email_ids | emails }
+ *   | { platform, order_status, email_ids } | { platform, order_ids }
+ *   | { platform, order_email_pairs | csv_rows: [{ email, order_id }] }   (+ source, by, parent_id)
+ * Status labels are the reference's and are matched to how units store them
+ * (services/startRequests.ts). At most 2000 order ids / emails / pairs.
+ */
+/**
+ * Workspaces whose update request is being put together right now. Reading the
+ * units and their accounts normally takes 1-4 s, but has been seen to take
+ * minutes on a slow database; a second press (or a retry after the dashboard
+ * gave up waiting) must not queue the same update twice.
+ */
+const updatesBeingPrepared = new Set<string>();
 
 orderFetchRouter.post("/update/trigger", async (req, res) => {
+  let held = "";
   try {
-    const platform = String(req.body?.platform || "FLIPKART").toUpperCase();
-    if (platform !== "FLIPKART") {
-      res.status(400).json({ error: "Only FLIPKART update is supported" });
+    const body = parseUpdateBody(req.body);
+    const userId = userIdFrom(req);
+    if (updatesBeingPrepared.has(userId)) {
+      res.status(409).json({ error: "An update request is already being prepared — it will appear in a moment", code: "update_preparing" });
       return;
     }
-    const userId = userIdFrom(req);
-    const emails = parseEmails(req.body?.emails);
-    const orderIds = parseIds(req.body?.order_ids || req.body?.orderIds);
-    const orderStatus = Array.isArray(req.body?.order_status)
-      ? req.body.order_status.map((item: unknown) => String(item || "").trim()).filter(Boolean)
-      : [];
-    const csvRows = parseCsvRows(req.body?.csv_rows || req.body?.csvRows);
-    const source = String(req.body?.source || "") === "cancel" ? "cancel" : "manual";
+    updatesBeingPrepared.add(userId);
+    held = userId;
+    const plan = await planUpdate(userId, body);
     // Queued on the worker (services/orderUpdateQueue.ts): one job per account.
-    const request = await createUpdateRequest(
-      userId,
-      { emails, orderIds, orderStatus, csvRows, selectionMethod: String(req.body?.selection_method || "") },
-      { source, by: String(req.body?.by || "").trim() }
-    );
+    const request = await createUpdateRequest(userId, plan.input, { source: body.source, by: body.by, params: plan.params, parentId: body.parentId });
     res.json({
       message: "Order update queued on the worker",
-      platform,
-      selection_method: req.body?.selection_method || "default",
+      platform: body.platform,
+      selection_method: plan.selection,
       tasks_created: request.counts.units,
       accounts: request.counts.accounts,
       windows: request.windows,
       request_id: request.id,
+      params: plan.params,
       timestamp: Math.floor(Date.now() / 1000),
     });
   } catch (err) {
-    res.status(400).json({ error: err instanceof Error ? err.message : "Could not start update" });
+    sendError(res, err, "Could not start update");
+  } finally {
+    if (held) updatesBeingPrepared.delete(held);
   }
 });
 
@@ -278,13 +326,22 @@ orderFetchRouter.post("/invoices/download", async (req, res) => {
       return;
     }
     // Record it as an `invoices` run so the Sync panel / running indicator shows it.
-    await startRun(userId, "invoices", { trigger: "user", by: String(req.body?.by || "").trim(), total: orderIds.length, message: `Downloading ${orderIds.length} invoice(s)…` });
+    await startRun(userId, "invoices", {
+      trigger: "user",
+      by: String(req.body?.by || "").trim(),
+      total: orderIds.length,
+      message: `Downloading ${orderIds.length} invoice(s)…`,
+      meta: { request: "invoice_fetch", platform: "FLIPKART", inline: true, params: { order_ids_count: orderIds.length, force } },
+    });
     try {
       const results = await downloadInvoicesByOrderId({ userId, orderIds, force, concurrency: 6 });
       const summary = results.reduce<Record<string, number>>((a, r) => ((a[r.status] = (a[r.status] || 0) + 1), a), {});
       const success = results.filter((r) => r.status === "downloaded" || r.status === "already").length;
       const failed = results.filter((r) => r.status === "failed").length;
-      await finishRun(userId, "invoices", { status: "completed", total: results.length, processed: results.length, success, failed, cancelled: 0, message: `Downloaded ${summary.downloaded || 0}, already ${summary.already || 0}, failed ${failed}` });
+      // The ledger row counts every order that did not get its invoice and names each one; the answer below is unchanged.
+      const notDone = results.filter((r) => r.status !== "downloaded" && r.status !== "already");
+      const failedItems = notDone.map((r) => ({ key: r.orderId, reason: r.status === "unknown_order" ? "Order not found on this account" : r.status === "no_session" ? "Account is not logged in" : r.error || "failed" }));
+      await finishRun(userId, "invoices", { status: "completed", total: results.length, processed: results.length, success, failed: notDone.length, cancelled: 0, failedItems, message: `Downloaded ${summary.downloaded || 0}, already ${summary.already || 0}, failed ${failed}${notDone.length > failed ? `, not found or not logged in ${notDone.length - failed}` : ""}` });
       res.json({ results, summary, total: results.length });
     } catch (err) {
       await finishRun(userId, "invoices", { status: "failed", total: orderIds.length, processed: 0, success: 0, failed: orderIds.length, cancelled: 0, message: err instanceof Error ? err.message : "download failed" });
@@ -303,6 +360,103 @@ orderFetchRouter.post("/invoices/sweep", async (req, res) => {
     res.json({ message: "Invoice sweep queued" });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Could not start the invoice sweep" });
+  }
+});
+
+/**
+ * Download Order Invoices as a batch — the reference's "Invoice fetch".
+ * Body: { platform, order_ids: string[] | "id id,id", force?, by? } — up to
+ * 2000 distinct order ids. Answers 202 at once with the request; the worker
+ * downloads on the order-invoice-batch queue (services/invoiceRequests.ts).
+ * Every order is downloaded again, stored or not. `force` skips the one
+ * check there is: without it an order another open request already holds is
+ * left to that request.
+ */
+orderFetchRouter.post("/invoice/trigger", async (req, res) => {
+  try {
+    assertFlipkart(req.body?.platform);
+    const result = await createInvoiceRequest(userIdFrom(req), { orderIds: req.body?.order_ids ?? req.body?.orderIds, force: req.body?.force === true, by: String(req.body?.by || "").trim() });
+    // `message` is the request's own sentence when it has one ("None of these orders is in Order Units").
+    res.status(202).json({ selection_method: "order_ids", ...result, message: result.message || "Invoice fetch queued", timestamp: Math.floor(Date.now() / 1000) });
+  } catch (err) {
+    sendError(res, err, "Could not queue the invoice fetch");
+  }
+});
+
+orderFetchRouter.get("/invoice/requests", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  res.json({ requests: await listInvoiceRequests(userId, Number(req.query.limit) || 20) });
+});
+
+/** One request with its per-order tasks. */
+orderFetchRouter.get("/invoice/requests/:id", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  const row = await getInvoiceRequest(userId, req.params.id);
+  if (!row) {
+    res.status(404).json({ error: "Invoice request not found" });
+    return;
+  }
+  res.json(row);
+});
+
+/** Stop: queued orders become cancelled, an order being downloaded finishes. Body: { by? }. */
+orderFetchRouter.post("/invoice/requests/:id/stop", async (req, res) => {
+  try {
+    const row = await stopInvoiceRequest(userIdFrom(req), req.params.id, String(req.body?.by || "").trim());
+    if (!row) {
+      res.status(404).json({ error: "Invoice request not found" });
+      return;
+    }
+    res.json(row);
+  } catch (err) {
+    sendError(res, err, "Could not stop the invoice fetch", 500);
+  }
+});
+
+/**
+ * Apply Company Coupons — the reference's "Coupon apply". Body:
+ * { coupon_links: "url url" | string[], email_ids? | emails?, by? }. No emails
+ * = every logged-in Flipkart account. Answers 202 with the request; the
+ * worker opens each link with each account's session on the
+ * order-coupon-apply queue and records what Flipkart answered
+ * (services/couponRequests.ts — activation itself is unverified).
+ */
+orderFetchRouter.post("/company-coupon/trigger", async (req, res) => {
+  try {
+    assertFlipkart(req.body?.platform);
+    const result = await createCouponRequest(userIdFrom(req), { links: req.body?.coupon_links, emails: req.body?.email_ids ?? req.body?.emails, by: String(req.body?.by || "").trim() });
+    res.status(202).json({ ...result, message: result.message || "Coupon apply queued", timestamp: Math.floor(Date.now() / 1000) });
+  } catch (err) {
+    sendError(res, err, "Could not queue the coupon apply");
+  }
+});
+
+orderFetchRouter.get("/company-coupon/requests", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  res.json({ requests: await listCouponRequests(userId, Number(req.query.limit) || 20) });
+});
+
+/** One request with a page of its per-account tasks: ?status=&limit= (≤500, default 200)&skip=. */
+orderFetchRouter.get("/company-coupon/requests/:id", async (req, res) => {
+  const userId = String(req.query.userId || "").trim() || workspaceUserId();
+  const row = await getCouponRequest(userId, req.params.id, { status: String(req.query.status || "").trim() || undefined, limit: Number(req.query.limit) || undefined, skip: Number(req.query.skip) || undefined });
+  if (!row) {
+    res.status(404).json({ error: "Coupon request not found" });
+    return;
+  }
+  res.json(row);
+});
+
+orderFetchRouter.post("/company-coupon/requests/:id/stop", async (req, res) => {
+  try {
+    const row = await stopCouponRequest(userIdFrom(req), req.params.id, String(req.body?.by || "").trim());
+    if (!row) {
+      res.status(404).json({ error: "Coupon request not found" });
+      return;
+    }
+    res.json(row);
+  } catch (err) {
+    sendError(res, err, "Could not stop the coupon apply", 500);
   }
 });
 

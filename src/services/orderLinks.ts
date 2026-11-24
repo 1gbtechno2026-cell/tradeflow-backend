@@ -37,6 +37,28 @@ export async function checkoutOrderIdsFor(userId: string, email: string): Promis
   return [...seen.values()];
 }
 
+/** The same for many accounts in one query: lower-cased e-mail → its order ids. Accounts that placed nothing are absent. */
+export async function checkoutOrderIdsForMany(userId: string, emails: string[]): Promise<Map<string, PlacedOrderRef[]>> {
+  const out = new Map<string, PlacedOrderRef[]>();
+  const wanted = [...new Set(emails.map((e) => String(e || "").toLowerCase()).filter(Boolean))];
+  if (!wanted.length) return out;
+  const rows = await CheckoutJob.find({ userId, email: { $in: wanted }, "result.flipkartOrderId": { $regex: /^OD\d{12,}/ } })
+    .select("email result.flipkartOrderId completedAt createdAt")
+    .lean();
+  const seen = new Set<string>();
+  for (const r of rows) {
+    const email = String(r.email || "").toLowerCase();
+    const orderId = String(r.result?.flipkartOrderId || "").toUpperCase();
+    if (!email || !orderId || seen.has(`${email} ${orderId}`)) continue;
+    seen.add(`${email} ${orderId}`);
+    const list = out.get(email);
+    const ref = { orderId, placedAt: r.completedAt || r.createdAt || null, jobId: String(r._id) };
+    if (list) list.push(ref);
+    else out.set(email, [ref]);
+  }
+  return out;
+}
+
 export interface OrderCardFields {
   card_name: string;
   parent_card_number: string;

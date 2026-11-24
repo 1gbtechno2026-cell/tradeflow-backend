@@ -23,6 +23,37 @@ export function terminalStatusFilter() {
 }
 
 /**
+ * What the reference refreshes when an update names no status — its own list,
+ * in its order (measured: `params.statuses_to_update` of a default update
+ * request). Here the same selection is "every unit that is not finished"
+ * (terminalStatusFilter) plus Returned; the list is what that stands for and
+ * is recorded on the request, so its summary can print it.
+ */
+export const DEFAULT_UPDATE_STATUSES = [
+  "Out for delivery",
+  "Shipped",
+  "Order Pending",
+  "Returned",
+  "Approved",
+  "Purchased",
+  "Ready to ship",
+  "Dispatched",
+  "Cancellation requested",
+  "Payment not received",
+  "Return started",
+];
+
+/**
+ * The Update button's selection when no status is named: every unit that is
+ * not finished, and — as on the reference — units stored as Returned.
+ * TERMINAL_RE itself is left alone: it also decides what a fetch enriches and
+ * which OTPs are kept, and Returned stays finished there.
+ */
+export function inProgressUpdateFilter() {
+  return { $or: [...terminalStatusFilter().$or, { status_key: /^returned$/i }] };
+}
+
+/**
  * The lifecycle stage behind a status key, whichever source wrote it. The
  * order API says "Approved" / "Ready to ship" / "Dispatched"; the page scraper
  * says "Order Confirmed" / "Shipped". A change of *stage* is what the update

@@ -1,6 +1,6 @@
 import { connectDb } from "./db.js";
 import { config } from "./config.js";
-import { CANCEL_QUEUE, createCancelWorker, createCheckoutWorker, createInvoiceWorker, createRescheduleWorker, createSyncWorker, createUpdateWorker, getInvoiceQueue, getSyncQueue, HTTP_QUEUE, INVOICE_QUEUE, LEGACY_QUEUE, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
+import { CANCEL_QUEUE, COUPON_QUEUE, createCancelWorker, createCheckoutWorker, createCouponWorker, createInvoiceBatchWorker, createInvoiceWorker, createRescheduleWorker, createSyncWorker, createUpdateWorker, getInvoiceQueue, getSyncQueue, HTTP_QUEUE, INVOICE_BATCH_QUEUE, INVOICE_QUEUE, LEGACY_QUEUE, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
 import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
@@ -10,6 +10,9 @@ import { rescheduleConcurrency, runRescheduleJob, startRescheduleReaper } from "
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
 import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob, startUpdateReaper } from "./services/orderUpdateQueue.js";
 import { runTrackedInvoiceSweep, INVOICE_SCHEDULE_ENABLED, INVOICE_SWEEP_MS } from "./services/invoiceSweep.js";
+import { INVOICE_BATCH_CONCURRENCY, runInvoiceBatchJob, startInvoiceRequestReaper } from "./services/invoiceRequests.js";
+import { COUPON_CONCURRENCY, runCouponJob, startCouponRequestReaper } from "./services/couponRequests.js";
+import { startWorkerHeartbeat } from "./services/requestCommon.js";
 import { describeError, isTransientError, throttledWarn } from "./lib/resilience.js";
 
 /**
@@ -17,7 +20,10 @@ import { describeError, isTransientError, throttledWarn } from "./lib/resilience
  * deployment (AWS: the checkout workers run checkout,cancel; one small
  * tradeflow-sync service runs sync — no Chrome, HTTP only):
  *
- *   WORKER_ROLES=checkout,cancel,sync,update,reschedule   default: all five (local dev)
+ *   WORKER_ROLES=checkout,cancel,sync,update,reschedule,invoice,invoice-batch,coupon
+ *                                               default: all of them (local dev)
+ *   INVOICE_BATCH_CONCURRENCY=12                "Download Order Invoices" batches: accounts at once
+ *   COUPON_CONCURRENCY=4                        "Apply Company Coupons": accounts at once
  *   SYNC_CONCURRENCY=4                          order syncs at once (default 4)
  *   SYNC_SWEEP_MS=600000                        outbox sweep period (default 10 min)
  *   UPDATE_CONCURRENCY=3                        Update Order Units: accounts at once
@@ -48,11 +54,11 @@ function classesFromEnv(): JobClass[] {
   return picked.length ? picked : [...JOB_CLASSES];
 }
 
-type Role = "checkout" | "cancel" | "sync" | "update" | "reschedule" | "invoice";
+type Role = "checkout" | "cancel" | "sync" | "update" | "reschedule" | "invoice" | "invoice-batch" | "coupon";
 
 function rolesFromEnv(): Set<Role> {
   const raw = String(process.env.WORKER_ROLES || "").trim();
-  const all: Role[] = ["checkout", "cancel", "sync", "update", "reschedule", "invoice"];
+  const all: Role[] = ["checkout", "cancel", "sync", "update", "reschedule", "invoice", "invoice-batch", "coupon"];
   if (!raw) return new Set(all);
   const picked = raw.split(",").map((s) => s.trim()).filter((r): r is Role => (all as string[]).includes(r));
   return new Set(picked.length ? picked : all);
@@ -238,6 +244,39 @@ async function main() {
       await getInvoiceQueue().upsertJobScheduler("order-invoice-sweep", { every: INVOICE_SWEEP_MS }, { name: "sweep", data: { sweep: "scheduled" }, opts: { attempts: 1 } });
     }
     names.push([INVOICE_QUEUE, 1]);
+  }
+
+  // Invoice batches ("Download Order Invoices" by order id): one job per account of a request,
+  // on a queue of their own (see queue.ts). The heartbeat tells the API a worker that knows
+  // this queue is up; without it the API fails a waiting request with "restart the worker".
+  if (roles.has("invoice-batch")) {
+    const batchWorker = createInvoiceBatchWorker(INVOICE_BATCH_CONCURRENCY, async (job) => {
+      console.log(`[worker] PICKED ${INVOICE_BATCH_QUEUE} request=${job.data.requestId} account=${job.data.accountId}`);
+      await runInvoiceBatchJob(job);
+    });
+    batchWorker.on("failed", (job, err) => {
+      if (err.name !== "DelayedError") console.error(`[worker] FAILED ${INVOICE_BATCH_QUEUE} job=${job?.id}:`, err.message);
+    });
+    batchWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${INVOICE_BATCH_QUEUE}):`, err.message));
+    startWorkerHeartbeat(INVOICE_BATCH_QUEUE);
+    // Requests a dead worker left half-done get their account jobs back; finished orders are not redone.
+    startInvoiceRequestReaper();
+    names.push([INVOICE_BATCH_QUEUE, INVOICE_BATCH_CONCURRENCY]);
+  }
+
+  // Company coupons: one job per account of a request; each coupon link opened with the account's session over HTTP.
+  if (roles.has("coupon")) {
+    const couponWorker = createCouponWorker(COUPON_CONCURRENCY, async (job, token) => {
+      console.log(`[worker] PICKED ${COUPON_QUEUE} request=${job.data.requestId} email=${job.data.email}`);
+      await runCouponJob(job, token);
+    });
+    couponWorker.on("failed", (job, err) => {
+      if (err.name !== "DelayedError") console.error(`[worker] FAILED ${COUPON_QUEUE} job=${job?.id}:`, err.message);
+    });
+    couponWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${COUPON_QUEUE}):`, err.message));
+    startWorkerHeartbeat(COUPON_QUEUE);
+    startCouponRequestReaper();
+    names.push([COUPON_QUEUE, COUPON_CONCURRENCY]);
   }
 
   if (!names.length) {

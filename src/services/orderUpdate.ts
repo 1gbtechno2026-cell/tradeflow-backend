@@ -14,7 +14,7 @@ import {
   restoreFlipkartSession,
   sleep,
 } from "./browser.js";
-import { terminalStatusFilter } from "./orderLifecycle.js";
+import { inProgressUpdateFilter, terminalStatusFilter } from "./orderLifecycle.js";
 import { assertIdleForUpdate, markUpdateRunning } from "./orderSyncLock.js";
 import {
   apiScrapeAndSave,
@@ -60,8 +60,17 @@ export interface UpdateTriggerInput {
   emails?: string[];
   orderIds?: string[];
   orderStatus?: string[];
+  /** Statuses that are a condition on the unit, not a status_key (the reference's detailed cancellations — services/startRequests.ts); ORed with orderStatus. */
+  statusConditions?: Array<Record<string, unknown>>;
   csvRows?: Array<{ email?: string; order_id?: string }>;
   selectionMethod?: string;
+  /**
+   * With no status named: also take units stored as Returned. The reference's
+   * default set counts Returned as in progress (a returned unit still moves to
+   * Refunded), so the Update button's selections ask for it; the worker's own
+   * 6 h / 2 h schedules do not and keep the rule they always had.
+   */
+  withReturned?: boolean;
 }
 
 export type UpdateTarget = {
@@ -141,16 +150,36 @@ export async function stopOrderUpdate(userId: string) {
   await closeLiveBrowsers(userId);
 }
 
-async function loggedInAccount(userId: string, email: string) {
-  const row = await PlatformId.findOne({
-    userId,
-    email: email.toLowerCase(),
-    status: "logged_in",
-    sessionSavedAt: { $ne: null },
-  }).sort({ sessionSavedAt: -1 });
-  const cookies = cookiesFor(row);
-  if (!row || !cookies.length) return null;
-  return { id: row._id as Types.ObjectId, email: row.email, cookies };
+/** Accounts looked up per query: a saved session is ~19 KB of cookies. */
+const ACCOUNT_LOOKUP_BATCH = 200;
+
+/**
+ * The logged-in Platform ID with a usable saved session for each of these
+ * e-mails, keyed by lower-cased e-mail — the newest saved session where an
+ * e-mail has several rows; an e-mail whose newest row has no cookies is left
+ * out. One query per 200 e-mails: looked up per unit, a 1,400-unit update
+ * spent 93 s here before its trigger could answer.
+ */
+async function loggedInAccounts(userId: string, emails: Iterable<string | null | undefined>): Promise<Map<string, OrderAccount>> {
+  const wanted = [...new Set([...emails].map((e) => String(e || "").toLowerCase()).filter(Boolean))];
+  type SessionRow = { _id: unknown; email: string; sessionSavedAt?: Date | null; sessionCookies?: unknown[]; sessionState?: { cookies?: unknown[] } };
+  const newest = new Map<string, SessionRow>();
+  for (let at = 0; at < wanted.length; at += ACCOUNT_LOOKUP_BATCH) {
+    const rows = await PlatformId.find({ userId, email: { $in: wanted.slice(at, at + ACCOUNT_LOOKUP_BATCH) }, status: "logged_in", sessionSavedAt: { $ne: null } })
+      .select("email sessionSavedAt sessionCookies sessionState.cookies")
+      .lean();
+    for (const row of rows) {
+      const key = String(row.email || "").toLowerCase();
+      const held = newest.get(key);
+      if (!held || new Date(row.sessionSavedAt || 0).getTime() > new Date(held.sessionSavedAt || 0).getTime()) newest.set(key, row as SessionRow);
+    }
+  }
+  const out = new Map<string, OrderAccount>();
+  for (const [key, row] of newest) {
+    const cookies = cookiesFor(row);
+    if (cookies.length) out.set(key, { id: row._id as Types.ObjectId, email: row.email, cookies });
+  }
+  return out;
 }
 
 function cardFromDoc(row: {
@@ -188,13 +217,23 @@ export async function resolveTargets(userId: string, input: UpdateTriggerInput):
   };
 
   if (csvRows.length) {
-    for (const row of csvRows) {
-      const email = String(row.email || "").toLowerCase();
-      const orderId = parseOrderId(row.order_id || "") || String(row.order_id || "").toUpperCase();
-      if (!email || !orderId) continue;
-      const account = await loggedInAccount(userId, email);
+    const pairs = csvRows
+      .map((row) => ({ email: String(row.email || "").toLowerCase(), orderId: parseOrderId(row.order_id || "") || String(row.order_id || "").toUpperCase() }))
+      .filter((p) => p.email && p.orderId);
+    const accounts = await loggedInAccounts(userId, pairs.map((p) => p.email));
+    // Every listed order in one read, then matched to its own e-mail — a pair names the account as well as the order.
+    const saved = pairs.length ? await Order.find({ userId, order_id: { $in: [...new Set(pairs.map((p) => p.orderId))] } }).lean() : [];
+    const unitsOf = new Map<string, typeof saved>();
+    for (const unit of saved) {
+      const key = `${unit.platform_email} ${unit.order_id}`;
+      const list = unitsOf.get(key);
+      if (list) list.push(unit);
+      else unitsOf.set(key, [unit]);
+    }
+    for (const { email, orderId } of pairs) {
+      const account = accounts.get(email);
       if (!account) continue;
-      const units = await Order.find({ userId, platform_email: email, order_id: orderId }).lean();
+      const units = unitsOf.get(`${email} ${orderId}`) || [];
       if (units.length) {
         for (const unit of units) {
           const card = cardFromDoc(unit);
@@ -222,15 +261,17 @@ export async function resolveTargets(userId: string, input: UpdateTriggerInput):
       list.push(unit);
       byOrder.set(unit.order_id, list);
     }
+    const accounts = await loggedInAccounts(userId, [...indexRows.map((i) => i.platform_email), ...units.map((u) => u.platform_email)]);
+    const savedUnitIds = new Set(units.map((u) => u.unit_id));
     for (const idx of indexRows) {
-      if (units.some((u) => u.unit_id === idx.unit_id)) continue;
-      const account = await loggedInAccount(userId, idx.platform_email);
+      if (savedUnitIds.has(idx.unit_id)) continue;
+      const account = accounts.get(String(idx.platform_email || "").toLowerCase());
       if (!account) continue;
       const card = cardFromDoc(idx);
       if (card) push(account, card);
     }
     for (const unit of units) {
-      const account = await loggedInAccount(userId, unit.platform_email);
+      const account = accounts.get(String(unit.platform_email || "").toLowerCase());
       if (!account) continue;
       const card = cardFromDoc(unit);
       if (card) push(account, card);
@@ -240,12 +281,16 @@ export async function resolveTargets(userId: string, input: UpdateTriggerInput):
 
   const query: Record<string, unknown> = { userId };
   if (emails.length) query.platform_email = { $in: emails };
-  if (statuses.length) query.status_key = { $in: statuses };
-  else Object.assign(query, terminalStatusFilter());
+  const conditions = input.statusConditions || [];
+  if (conditions.length) query.$or = [...(statuses.length ? [{ status_key: { $in: statuses } }] : []), ...conditions];
+  else if (statuses.length) query.status_key = { $in: statuses };
+  else Object.assign(query, input.withReturned ? inProgressUpdateFilter() : terminalStatusFilter());
 
-  const units = await Order.find(query).lean();
+  // Only what a target is made of: a status like Delivered matches thousands of units.
+  const units = await Order.find(query).select("platform_email order_id item_id unit_id order_url").lean();
+  const accounts = await loggedInAccounts(userId, units.map((u) => u.platform_email));
   for (const unit of units) {
-    const account = await loggedInAccount(userId, unit.platform_email);
+    const account = accounts.get(String(unit.platform_email || "").toLowerCase());
     if (!account) continue;
     const card = cardFromDoc(unit);
     if (card) push(account, card);

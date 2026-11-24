@@ -23,7 +23,7 @@ import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSyn
 import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { finishRun, startRun } from "./orderJobRuns.js";
-import { cardFieldsFor, checkoutOrderIdsFor } from "./orderLinks.js";
+import { cardFieldsFor, checkoutOrderIdsForMany, type PlacedOrderRef } from "./orderLinks.js";
 import { captureInvoicesForAccount, type InvoiceMode } from "./invoiceCapture.js";
 import type { APIRequestContext } from "playwright";
 
@@ -1182,8 +1182,10 @@ export async function saveMappedUnit(
   const lastFetch = new Date();
   const existing = await Order.findOne({ userId, unit_id: mapped.unit_id }).select("id").lean();
   const seq = existing?.id || (await nextSeq("order_fetch"));
+  // api_extra (fsn = the product id, listing_id, seller_id, prices) is kept on the unit: the
+  // dashboard's Product ID / Listing ID filters and the Order Details rows read it. It was
+  // dropped here until 2026-11-24, so only units saved from then on carry it.
   const { api_extra, ...fields } = mapped;
-  void api_extra;
   await Order.updateOne(
     { userId, unit_id: mapped.unit_id },
     {
@@ -1194,6 +1196,7 @@ export async function saveMappedUnit(
         platform_email: account.email,
         platform: "FLIPKART",
         ...fields,
+        ...(api_extra ? { api_extra } : {}),
         is_bae_order: false,
         is_invoice_downloaded: false,
         invoice_path: "",
@@ -1558,6 +1561,12 @@ async function wipeFlipkartLocalSession(page: Page) {
 
 export async function stopOrderFetch(userId: string) {
   const job = state(userId);
+  // Asked while the account list is still being planned or prepared: the preparation reads this between
+  // two batches of accounts and gives up (beginOrderFetch), so the fetcher is free again within a second.
+  if (preparing.has(userId) || reserved.has(userId)) stopWhilePreparing.add(userId);
+  // The run going now is the one stopped — its own ending reads this, not the flag a later start resets.
+  const token = runTokens.get(userId);
+  if (token) stoppedRuns.add(token);
   job.cancelled = true;
   job.running = false;
   job.phase = "";
@@ -1573,7 +1582,87 @@ export async function stopAllOrderFetch() {
   }
 }
 
-export async function startOrderFetch(userId: string, emails: string[], sinceDate: Date, opts: { invoices?: InvoiceMode; trigger?: "user" | "system-cron"; by?: string } = {}) {
+export interface OrderFetchStartOptions {
+  invoices?: InvoiceMode;
+  trigger?: "user" | "system-cron";
+  by?: string;
+  /** A ledger row made ahead of the run (orderJobRuns.createQueuedRun): the run adopts it instead of writing a new one. */
+  runId?: string;
+  /** What was asked (services/startRequests.ts planFetch), kept on the ledger row from start to finish. */
+  params?: Record<string, unknown>;
+  /** Called once when the run has ended and its ledger row is closed — stopped runs included. */
+  onFinished?: (info: { runId: string; cancelled: boolean; emails: string[] }) => void | Promise<void>;
+  /** The caller holds the workspace's fetch slot (reserveOrderFetch) — the start is its own, not a second one. */
+  reserved?: boolean;
+}
+
+/** Workspaces whose fetch is between "asked" and "running": the saved units of every account are read first, a batch of accounts at a time. */
+const preparing = new Set<string>();
+const stopWhilePreparing = new Set<string>();
+/** Workspaces whose trigger has been accepted and is still working out who to fetch — before `preparing` is set. */
+const reserved = new Set<string>();
+/** One token per run, so a run that was stopped knows it at its end even when another fetch has started since. */
+const runTokens = new Map<string, object>();
+const stoppedRuns = new WeakSet<object>();
+
+/** A stop (Force kill) arrived while the account list was still being prepared: nothing was started. */
+export class OrderFetchStoppedError extends Error {
+  constructor() {
+    super("Stopped while the account list was being prepared — nothing was fetched");
+  }
+}
+
+export function isOrderFetchPreparing(userId: string) {
+  return preparing.has(userId) || reserved.has(userId);
+}
+
+/**
+ * Take the workspace's one fetch slot ahead of the start. The trigger route
+ * spends a second or two working out who to fetch before startOrderFetch sets
+ * `preparing`; without the slot two triggers in that window were both answered
+ * with a request id. Throws when a fetch is running, preparing or reserved.
+ * The returned function gives the slot back (safe to call twice) — call it
+ * once startOrderFetch has been called, or when the trigger fails before that.
+ */
+export function reserveOrderFetch(userId: string): () => void {
+  if (state(userId).running || preparing.has(userId) || reserved.has(userId)) throw new Error("Order fetch is already running");
+  reserved.add(userId);
+  return () => {
+    reserved.delete(userId);
+    // A stop asked while the trigger was planning and never reached a start has nothing left to stop.
+    if (!preparing.has(userId)) stopWhilePreparing.delete(userId);
+  };
+}
+
+/**
+ * Start a fetch. Resolves once the run is going, with its ledger run id. A
+ * second start while the first is still preparing its account list is refused
+ * like a start during a run. A stop asked in that window ends the preparation
+ * between two batches of accounts (OrderFetchStoppedError — nothing started);
+ * one that arrives after the last batch stops the run as soon as it begins.
+ */
+export async function startOrderFetch(userId: string, emails: string[], sinceDate: Date, opts: OrderFetchStartOptions = {}): Promise<{ runId: string }> {
+  if (preparing.has(userId) || (reserved.has(userId) && !opts.reserved)) throw new Error("Order fetch is already running");
+  preparing.add(userId);
+  // A stop asked while the caller held the slot is for this start; any older one is not.
+  if (!opts.reserved) stopWhilePreparing.delete(userId);
+  try {
+    const started = await beginOrderFetch(userId, emails, sinceDate, opts);
+    if (stopWhilePreparing.has(userId)) {
+      preparing.delete(userId);
+      await stopOrderFetch(userId);
+    }
+    return started;
+  } finally {
+    preparing.delete(userId);
+    stopWhilePreparing.delete(userId);
+  }
+}
+
+/** Accounts read per round of the preparation: one query each for the Platform IDs, their saved units and their checkout order ids. */
+const PREPARE_BATCH = 100;
+
+async function beginOrderFetch(userId: string, emails: string[], sinceDate: Date, opts: OrderFetchStartOptions): Promise<{ runId: string }> {
   assertIdleForFetch(userId);
   const job = state(userId);
   if (job.running) throw new Error("Order fetch is already running");
@@ -1584,49 +1673,71 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
 
   const queue: QueueAccount[] = [];
   const skipped: string[] = [];
-  for (const email of unique) {
-    const row = await PlatformId.findOne({
-      userId,
-      email,
-      status: "logged_in",
-      sessionSavedAt: { $ne: null },
-    }).sort({ sessionSavedAt: -1 });
-    const cookies = cookiesFor(row);
-    if (!row || !cookies.length) {
-      skipped.push(email);
-      continue;
+  // A batch of accounts per round instead of three queries per account: 21,251 accounts took about
+  // 40 minutes one by one. The stop flag is read between rounds, so Force kill frees the fetcher at once.
+  for (let at = 0; at < unique.length; at += PREPARE_BATCH) {
+    if (stopWhilePreparing.has(userId)) throw new OrderFetchStoppedError();
+    const batch = unique.slice(at, at + PREPARE_BATCH);
+    // Newest saved session first, as the one-account lookup sorted: the first row seen for an e-mail is the one used.
+    const rows = await PlatformId.find({ userId, email: { $in: batch }, status: "logged_in", sessionSavedAt: { $ne: null } }).sort({ sessionSavedAt: -1 });
+    const rowOf = new Map<string, (typeof rows)[number]>();
+    for (const r of rows) {
+      const key = String(r.email || "").toLowerCase();
+      if (!rowOf.has(key)) rowOf.set(key, r);
     }
-    const existingRows = await Order.find({ userId, platformAccountId: row._id }).lean();
-    const existing = new Map<string, ExistingUnit>();
-    for (const saved of existingRows) {
-      const unit = savedUnit(saved);
-      if (!unit) continue;
-      existing.set(unit.unitId, unit);
+    const usable = batch.map((email) => rowOf.get(email)).filter((r): r is (typeof rows)[number] => Boolean(r && cookiesFor(r).length));
+    const savedRows = usable.length
+      ? await Order.find({ userId, platformAccountId: { $in: usable.map((r) => r._id) } })
+          .select("platformAccountId order_id orderId item_id unit_id order_url orderUrl order_date")
+          .lean()
+      : [];
+    const savedOf = new Map<string, typeof savedRows>();
+    for (const saved of savedRows) {
+      const key = String(saved.platformAccountId);
+      const list = savedOf.get(key);
+      if (list) list.push(saved);
+      else savedOf.set(key, [saved]);
     }
-    const extraLinks = (row as { orderLinks?: string[] }).orderLinks || [];
-    for (const link of extraLinks) {
-      const orderId = parseOrderId(link);
-      if (!orderId) continue;
-      const itemId = parseQueryParam(link, "item_id");
-      const unitId = fallbackUnitId(orderId, itemId, parseQueryParam(link, "unit_id"));
-      if (existing.has(unitId)) continue;
-      existing.set(unitId, {
-        orderId,
-        itemId,
-        unitId,
-        orderUrl: link.startsWith("http") ? link : orderDetailsUrl(orderId, itemId, unitId),
-      });
+    const placedOf = await checkoutOrderIdsForMany(userId, usable.map((r) => r.email)).catch(() => new Map<string, PlacedOrderRef[]>());
+    for (const email of batch) {
+      const row = rowOf.get(email);
+      const cookies = cookiesFor(row || null);
+      if (!row || !cookies.length) {
+        skipped.push(email);
+        continue;
+      }
+      const existing = new Map<string, ExistingUnit>();
+      for (const saved of savedOf.get(String(row._id)) || []) {
+        const unit = savedUnit(saved);
+        if (!unit) continue;
+        existing.set(unit.unitId, unit);
+      }
+      const extraLinks = (row as { orderLinks?: string[] }).orderLinks || [];
+      for (const link of extraLinks) {
+        const orderId = parseOrderId(link);
+        if (!orderId) continue;
+        const itemId = parseQueryParam(link, "item_id");
+        const unitId = fallbackUnitId(orderId, itemId, parseQueryParam(link, "unit_id"));
+        if (existing.has(unitId)) continue;
+        existing.set(unitId, {
+          orderId,
+          itemId,
+          unitId,
+          orderUrl: link.startsWith("http") ? link : orderDetailsUrl(orderId, itemId, unitId),
+        });
+      }
+      // Orders OUR checkout placed are known by id even when Flipkart's list hides
+      // them (payment never confirmed, cancelled before confirmation): seed them
+      // so enrichment opens them directly, the way BoB does from its own records.
+      for (const ref of placedOf.get(String(row.email || "").toLowerCase()) || []) {
+        const unitId = fallbackUnitId(ref.orderId);
+        if (existing.has(unitId)) continue;
+        existing.set(unitId, { orderId: ref.orderId, itemId: "", unitId, orderUrl: orderDetailsUrl(ref.orderId), orderDate: ref.placedAt });
+      }
+      queue.push({ id: row._id, email: row.email, cookies, existing: [...existing.values()] });
     }
-    // Orders OUR checkout placed are known by id even when Flipkart's list hides
-    // them (payment never confirmed, cancelled before confirmation): seed them
-    // so enrichment opens them directly, the way BoB does from its own records.
-    for (const ref of await checkoutOrderIdsFor(userId, row.email).catch(() => [])) {
-      const unitId = fallbackUnitId(ref.orderId);
-      if (existing.has(unitId)) continue;
-      existing.set(unitId, { orderId: ref.orderId, itemId: "", unitId, orderUrl: orderDetailsUrl(ref.orderId), orderDate: ref.placedAt });
-    }
-    queue.push({ id: row._id, email: row.email, cookies, existing: [...existing.values()] });
   }
+  if (stopWhilePreparing.has(userId)) throw new OrderFetchStoppedError();
 
   if (!queue.length) {
     throw new Error(`None of the ${unique.length} email(s) are logged in. Login them in platform id first.`);
@@ -1664,14 +1775,34 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
   if (job.invoices !== "off") log(userId, "info", `Invoices: ${job.invoices === "new" ? "units enriched in this run" : "every delivered unit without a PDF"} → S3 (after enrichment, Chrome per unit)`);
   log(userId, "info", `Fetch mode: ${resolved.mode} (from ${resolved.source === "ui" ? "the dashboard switch" : "ORDER_FETCH_MODE in .env"})`);
   // The panel's ledger row (services/orderJobRuns.ts): survives a restart, feeds "Sync Order Units From Platform".
-  await startRun(userId, "fetch", {
-    trigger: opts.trigger || "user",
-    by: opts.by || "",
-    total: queue.length,
-    message: `Fetch from ${job.sinceLabel} · ${queue.length} email(s) · ${windows} window(s) · ${resolved.mode}`,
-    meta: { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows, mode: resolved.mode, invoices: job.invoices },
-    failedItems: skipped.map((email) => ({ key: email, reason: "not logged in — skipped" })),
-  }).catch(() => undefined);
+  // What was asked stays on the row to the end (finishRun replaces meta, so the finish passes it again),
+  // with the machine and process running it — a row left open by a process that is gone is closed at boot.
+  const fetchedEmails = queue.map((q) => q.email);
+  const runMeta = {
+    since: sinceDate.toISOString(),
+    emails: fetchedEmails.slice(0, 500),
+    emails_count: fetchedEmails.length,
+    skipped_not_logged_in: skipped.length,
+    windows,
+    mode: resolved.mode,
+    invoices: job.invoices,
+    platform: "FLIPKART",
+    params: opts.params || {},
+    host: os.hostname().split(".")[0] || "host",
+    pid: process.pid,
+  };
+  const runId =
+    (await startRun(userId, "fetch", {
+      runId: opts.runId,
+      trigger: opts.trigger || "user",
+      by: opts.by || "",
+      total: queue.length,
+      message: `Fetch from ${job.sinceLabel} · ${queue.length} email(s) · ${windows} window(s) · ${resolved.mode}`,
+      meta: runMeta,
+      failedItems: skipped.map((email) => ({ key: email, reason: "not logged in — skipped" })),
+    }).catch(() => undefined)) || "";
+  const runToken = {};
+  runTokens.set(userId, runToken);
   beginTrace(userId, "fetch", { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows, mode: job.mode, modeSource: resolved.source });
   log(
     userId,
@@ -1694,18 +1825,24 @@ export async function startOrderFetch(userId: string, emails: string[], sinceDat
     const known = Math.max(0, (rep.idsDiscovered || 0) - (rep.idsNew || 0));
     const total = Math.max(rep.idsDiscovered || 0, rep.enrichQueued || rep.idsOpened || 0);
     const processed = job.cancelled ? known + (rep.idsOpened || 0) : total;
+    const cancelled = job.cancelled || stoppedRuns.has(runToken);
     void finishRun(userId, "fetch", {
-      status: job.cancelled ? "stopped" : "completed",
+      status: cancelled ? "stopped" : "completed",
       total,
       processed,
       success: known + (rep.idsScraped || 0) + (rep.idsSkippedOld || 0),
       failed: rep.idsFailed || 0,
-      cancelled: job.cancelled ? Math.max(0, total - processed) : 0,
+      cancelled: cancelled ? Math.max(0, total - processed) : 0,
       failedItems: failedAccounts.get(userId) || [],
       message: `${rep.accountsDone}/${rep.accountsQueued} email(s) · ${rep.idsDiscovered} unit IDs found, ${rep.idsNew} new, ${rep.idsScraped} saved, ${rep.idsFailed} failed, ${rep.idsSkippedOld} older than ${job.sinceLabel}`,
-      meta: { report: rep },
-    }).catch(() => undefined);
+      meta: { ...runMeta, report: rep },
+    })
+      .catch(() => undefined)
+      // After the row is closed: what follows the fetch (the update of run_update_after_fetch) reads and writes it.
+      .then(() => opts.onFinished?.({ runId, cancelled, emails: fetchedEmails }))
+      .catch((err) => console.warn(`[orders-fetch] after-fetch step failed: ${err instanceof Error ? err.message : err}`));
   });
+  return { runId };
 }
 
 async function clickShowMoreOrders(page: Page) {

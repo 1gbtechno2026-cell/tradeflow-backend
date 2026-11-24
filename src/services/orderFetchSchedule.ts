@@ -4,8 +4,10 @@ import { config } from "../config.js";
 import { OrderJobRun } from "../models/OrderJobRun.js";
 import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
 import { PlatformId } from "../models/PlatformId.js";
-import { getOrderFetchJob, startOrderFetch } from "./orderFetch.js";
+import { getOrderFetchJob, isOrderFetchPreparing, startOrderFetch } from "./orderFetch.js";
 import { workspaceUserId } from "./sessionStore.js";
+// startRequests reads this module's look-back and account list; both sides only call each other inside functions.
+import { queueUpdateAfterFetch } from "./startRequests.js";
 
 /**
  * The scheduled Fetch — the reference tool's "system-cron" row.
@@ -16,7 +18,8 @@ import { workspaceUserId } from "./sessionStore.js";
  * trigger "system-cron" on the panel row and the ledger. It uses the same
  * startOrderFetch the button uses, so the dashboard's mode switch, windows
  * and invoice step apply unchanged; a tick is skipped while a fetch is
- * already running.
+ * already running. When the run ends an update of the in-progress units is
+ * queued, as on the reference ("Follows a nightly fetch").
  *
  *   FETCH_SCHEDULE=0            off (development)
  *   FETCH_SCHEDULE="0 5 * * *"  cron expression, CRON_TIMEZONE or Asia/Kolkata
@@ -83,7 +86,7 @@ export async function scheduledFetchCount(userId: string): Promise<number> {
  * what it started, or why it did not.
  */
 export async function runScheduledFetch(userId: string, by = "schedule"): Promise<{ started: boolean; message: string; emails?: number; sinceDays?: number; invoices?: "missing" | "off" }> {
-  if (getOrderFetchJob(userId).running) {
+  if (getOrderFetchJob(userId).running || isOrderFetchPreparing(userId)) {
     const message = "skipped — a fetch is already running";
     lastTick = { at: new Date(), outcome: message };
     console.log(`[fetch-schedule] ${message}`);
@@ -101,7 +104,30 @@ export async function runScheduledFetch(userId: string, by = "schedule"): Promis
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
   since.setHours(0, 0, 0, 0);
   try {
-    await startOrderFetch(userId, emails, since, { invoices, trigger: "system-cron", by });
+    await startOrderFetch(userId, emails, since, {
+      invoices,
+      trigger: "system-cron",
+      by,
+      // What this run was asked for, in the keys the Fetch button records (services/startRequests.ts planFetch).
+      params: {
+        platform: "FLIPKART",
+        selection_method: "all_accounts",
+        email_ids_count: 0,
+        accounts_count: emails.length,
+        logged_in_count: emails.length,
+        fetch_orders_after_date: since.toLocaleDateString("en-CA"),
+        fetch_orders_after_date_source: "lookback",
+        force_fetch: false,
+        enable_login: false,
+        run_update_after_fetch: true,
+        invoices,
+      },
+      // The reference's chain: when the nightly fetch ends, an update of the in-progress units is queued
+      // (skipped when the fetch was stopped or an update request is already open — startRequests.queueUpdateAfterFetch).
+      onFinished: async (info) => {
+        await queueUpdateAfterFetch(userId, { runId: info.runId, emails: info.emails, selection: "all_accounts", cancelled: info.cancelled, by, trigger: "system-cron" });
+      },
+    });
     const message = `started — ${emails.length} logged-in Platform ID(s), orders since ${since.toISOString().slice(0, 10)} (${days} d), invoices ${invoices === "missing" ? "on (all missing)" : "off"}`;
     lastTick = { at: new Date(), outcome: message };
     console.log(`[fetch-schedule] ${message}`);

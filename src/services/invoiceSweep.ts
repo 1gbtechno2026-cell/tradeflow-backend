@@ -111,7 +111,12 @@ export async function runTrackedInvoiceSweep(
   const open = await OrderJobRun.findOne({ userId, type: "invoices", status: "running" }).select("_id").lean();
   if (open) return { skipped: true, reason: "an invoice run is already in progress" };
 
-  await startRun(userId, "invoices", { trigger: input.trigger || "system-cron", by: input.by || "schedule", message: "Invoice sweep running…" });
+  await startRun(userId, "invoices", {
+    trigger: input.trigger || "system-cron",
+    by: input.by || "schedule",
+    message: "Invoice sweep running…",
+    meta: { request: "invoice_fetch", platform: "FLIPKART", sweep: true, params: { force: false, cap_per_phase: config.invoiceMaxPerRun } },
+  });
   try {
     const result = await runInvoiceSweep(userId, {
       log: (lvl, m) => {

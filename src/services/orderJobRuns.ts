@@ -1,5 +1,6 @@
 import { Types } from "mongoose";
 import { CancelRequest } from "../models/CancelRequest.js";
+import { OrderCouponRequest } from "../models/OrderCouponRequest.js";
 import { RescheduleRequest } from "../models/RescheduleRequest.js";
 import { OrderJobRun, type IOrderJobRun, type JobRunStatus, type JobRunTrigger, type JobRunType } from "../models/OrderJobRun.js";
 import { OrderUpdateRequest } from "../models/OrderUpdateRequest.js";
@@ -44,6 +45,8 @@ export interface PanelRow {
   extras: Array<{ label: string; value: number }>;
   failedItems: Array<{ key: string; reason: string }>;
   refId: string;
+  /** Coupons row: the request behind it (refId) is still open, so POST /company-coupon/requests/<refId>/stop closes it — also when the row reads Failed because its worker stopped. */
+  stoppable?: boolean;
 }
 
 const TITLES: Record<JobRunType, { title: string; description: string }> = {
@@ -90,7 +93,78 @@ function rowFromRun(r: IOrderJobRun): PanelRow {
 
 const active = new Map<string, Types.ObjectId>(); // `${userId}:${type}` → run _id
 
-export async function startRun(userId: string, type: JobRunType, input: { trigger?: JobRunTrigger; by?: string; total?: number; message?: string; meta?: Record<string, unknown>; failedItems?: Array<{ key: string; reason: string }> }) {
+/**
+ * A row for a run that has been asked for and not started yet — the fetch
+ * trigger answers with its id while a large account list is still being
+ * prepared. startRun({ runId }) turns it into the running row.
+ */
+export async function createQueuedRun(userId: string, type: JobRunType, input: { trigger?: JobRunTrigger; by?: string; total?: number; message?: string; meta?: Record<string, unknown> }) {
+  const run = await OrderJobRun.create({
+    userId: new Types.ObjectId(userId),
+    type,
+    trigger: input.trigger || "user",
+    by: input.by || "",
+    status: "queued",
+    total: input.total || 0,
+    startedAt: null,
+    message: input.message || "",
+    meta: input.meta || {},
+  });
+  return String(run._id);
+}
+
+/** Close a row by id with a reason — a queued run that could not start. Only rows still open are touched. */
+export async function failRunById(runId: string, message: string) {
+  if (!Types.ObjectId.isValid(runId)) return;
+  await OrderJobRun.updateOne({ _id: runId, status: { $in: ["queued", "running"] } }, { $set: { status: "failed", finishedAt: new Date(), message } }).catch(() => undefined);
+}
+
+/** Close a row by id as stopped — a queued run that was stopped before it started. Only rows still open are touched. */
+export async function stopRunById(runId: string, message: string) {
+  if (!Types.ObjectId.isValid(runId)) return;
+  await OrderJobRun.updateOne({ _id: runId, status: { $in: ["queued", "running"] } }, { $set: { status: "stopped", finishedAt: new Date(), message } }).catch(() => undefined);
+}
+
+/**
+ * The fetch runs inside the API process, so a fetch row still queued or
+ * running when the API boots belongs to a process that is gone (a restart, a
+ * tsx reload). Only rows that name this machine and another process id are
+ * closed — rows written before 2026-11-24 carry neither and are left alone.
+ */
+export async function closeInterruptedFetchRuns(host: string, pid: number): Promise<number> {
+  const res = await OrderJobRun.updateMany(
+    { type: "fetch", status: { $in: ["queued", "running"] }, "meta.host": host, "meta.pid": { $exists: true, $ne: pid } },
+    { $set: { status: "failed", finishedAt: new Date(), message: "The API restarted while this fetch was running — start it again" } }
+  );
+  return res.modifiedCount || 0;
+}
+
+export async function startRun(userId: string, type: JobRunType, input: { trigger?: JobRunTrigger; by?: string; total?: number; message?: string; meta?: Record<string, unknown>; failedItems?: Array<{ key: string; reason: string }>; runId?: string }) {
+  // A row created ahead of the run (createQueuedRun) becomes the running row; its id was already handed out.
+  if (input.runId && Types.ObjectId.isValid(input.runId)) {
+    const adopted = await OrderJobRun.findOneAndUpdate(
+      { _id: input.runId, userId, type, status: "queued" },
+      {
+        $set: {
+          status: "running",
+          trigger: input.trigger || "user",
+          by: input.by || "",
+          total: input.total || 0,
+          startedAt: new Date(),
+          message: input.message || "",
+          meta: input.meta || {},
+          failedItems: (input.failedItems || []).slice(0, FAILED_KEEP),
+        },
+      },
+      { new: true }
+    )
+      .select("_id")
+      .lean();
+    if (adopted) {
+      active.set(`${userId}:${type}`, adopted._id as Types.ObjectId);
+      return String(adopted._id);
+    }
+  }
   const run = await OrderJobRun.create({
     userId: new Types.ObjectId(userId),
     type,
@@ -330,8 +404,16 @@ async function ledgerRow(userId: string, type: JobRunType): Promise<PanelRow> {
   return run ? rowFromRun(run as IOrderJobRun) : idleRow(type);
 }
 
+/** The coupons row, with `stoppable` while its request is open: a request whose worker died keeps its status and only its ledger row is parked. */
+async function couponsRow(userId: string): Promise<PanelRow> {
+  const row = await ledgerRow(userId, "coupons");
+  if (!Types.ObjectId.isValid(row.refId)) return row;
+  const open = await OrderCouponRequest.exists({ _id: row.refId, userId, status: { $in: ["queued", "in_progress"] } }).catch(() => null);
+  return { ...row, stoppable: Boolean(open) };
+}
+
 export async function syncPanel(userId: string): Promise<{ rows: PanelRow[]; at: Date }> {
-  const [fetch, update, cancel, coupons, reschedule] = await Promise.all([fetchRow(userId), updateRow(userId), cancelRow(userId), ledgerRow(userId, "coupons"), rescheduleRow(userId)]);
+  const [fetch, update, cancel, coupons, reschedule] = await Promise.all([fetchRow(userId), updateRow(userId), cancelRow(userId), couponsRow(userId), rescheduleRow(userId)]);
   // The invoices row is the dashboard's (its Invoice documents); a placeholder keeps the order stable.
   return { rows: [fetch, update, idleRow("invoices"), coupons, reschedule, cancel], at: new Date() };
 }

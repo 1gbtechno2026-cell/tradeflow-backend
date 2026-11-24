@@ -36,12 +36,63 @@ export interface OrderDownloadResult {
   error?: string;
 }
 
-interface Target {
+export interface InvoiceTarget {
   userId: string;
   accountId: string;
+  /** The owning Platform ID's email, as the order's units carry it. */
+  email: string;
   orderId: string;
   unitIds: string[];
   rowIds: unknown[];
+}
+
+/** Resolve order → owning account, collecting every unit row of the order. Orders not in Order Units are absent from the map. */
+export async function resolveInvoiceTargets(userId: string, orderIds: string[]): Promise<Map<string, InvoiceTarget>> {
+  const byOrder = new Map<string, InvoiceTarget>();
+  if (!orderIds.length) return byOrder;
+  const rows = await Order.find({ userId, order_id: { $in: orderIds } })
+    .select("order_id unit_id platformAccountId platform_email userId")
+    .lean();
+  for (const r of rows) {
+    const orderId = String(r.order_id);
+    let t = byOrder.get(orderId);
+    if (!t) {
+      t = { userId: String(r.userId), accountId: String(r.platformAccountId), email: String(r.platform_email || ""), orderId, unitIds: [], rowIds: [] };
+      byOrder.set(orderId, t);
+    }
+    t.unitIds.push(String(r.unit_id));
+    t.rowIds.push(r._id);
+  }
+  return byOrder;
+}
+
+/**
+ * One order, always downloaded: the bundle over the order API (zip-aware) →
+ * S3 raw/<user>/<order>.pdf → the `invoices` row → every unit of the order
+ * stamped. Throws what the download or the store threw. The by-order-id
+ * download below and the invoice batch (services/invoiceRequests.ts) both
+ * store an order through this.
+ */
+export async function downloadAndStoreInvoice(ctx: APIRequestContext, t: InvoiceTarget): Promise<{ key: string; size: number; parts: string[] }> {
+  const key = rawInvoiceKey(t.userId, t.orderId);
+  const pdfs = await downloadInvoiceViaApi(ctx, t.orderId);
+  const bundle = await mergeInvoiceBundle(pdfs);
+  const put = await putInvoice(key, bundle.pdf);
+  await registerInvoice({
+    userId: t.userId,
+    platformAccountId: t.accountId,
+    orderId: t.orderId,
+    key,
+    etag: put.etag,
+    size: put.size,
+    parts: bundle.parts,
+    unitIds: t.unitIds,
+  });
+  await Order.updateMany(
+    { _id: { $in: t.rowIds } },
+    { $set: { invoice_s3_key: key, invoice_downloaded_at: new Date(), invoice_size: put.size, is_invoice_downloaded: true, invoice_parts: bundle.parts } }
+  );
+  return { key, size: put.size, parts: bundle.parts.map((p) => p.type) };
 }
 
 /** Split a textarea / array of order IDs into a clean, de-duplicated list. */
@@ -70,30 +121,17 @@ export async function downloadInvoicesByOrderId(opts: {
   if (!want.length) return [];
 
   // Resolve order → owning account, collecting every unit row of the order.
-  const rows = await Order.find({ userId: opts.userId, order_id: { $in: want } })
-    .select("order_id unit_id platformAccountId userId")
-    .lean();
-  const byOrder = new Map<string, Target>();
-  for (const r of rows) {
-    const orderId = String(r.order_id);
-    let t = byOrder.get(orderId);
-    if (!t) {
-      t = { userId: String(r.userId), accountId: String(r.platformAccountId), orderId, unitIds: [], rowIds: [] };
-      byOrder.set(orderId, t);
-    }
-    t.unitIds.push(String(r.unit_id));
-    t.rowIds.push(r._id);
-  }
+  const byOrder = await resolveInvoiceTargets(opts.userId, want);
 
   // Group by account so each session is opened once.
-  const byAccount = new Map<string, Target[]>();
+  const byAccount = new Map<string, InvoiceTarget[]>();
   for (const t of byOrder.values()) {
     const list = byAccount.get(t.accountId) || [];
     list.push(t);
     byAccount.set(t.accountId, list);
   }
 
-  const processAccount = async (accountId: string, targets: Target[]) => {
+  const processAccount = async (accountId: string, targets: InvoiceTarget[]) => {
     const acc = await PlatformId.findById(accountId).lean();
     const cookies = cookiesFor(acc as Parameters<typeof cookiesFor>[0]);
     if (!cookies.length) {
@@ -117,25 +155,9 @@ export async function downloadInvoicesByOrderId(opts: {
             results.set(t.orderId, { orderId: t.orderId, status: "already", units: t.unitIds.length });
             continue;
           }
-          const pdfs = await downloadInvoiceViaApi(ctx, t.orderId);
-          const bundle = await mergeInvoiceBundle(pdfs);
-          const put = await putInvoice(key, bundle.pdf);
-          await registerInvoice({
-            userId: t.userId,
-            platformAccountId: t.accountId,
-            orderId: t.orderId,
-            key,
-            etag: put.etag,
-            size: put.size,
-            parts: bundle.parts,
-            unitIds: t.unitIds,
-          });
-          await Order.updateMany(
-            { _id: { $in: t.rowIds } },
-            { $set: { invoice_s3_key: key, invoice_downloaded_at: new Date(), invoice_size: put.size, is_invoice_downloaded: true, invoice_parts: bundle.parts } }
-          );
-          results.set(t.orderId, { orderId: t.orderId, status: "downloaded", units: t.unitIds.length, parts: bundle.parts.map((p) => p.type), sizeKb: Math.round(put.size / 1024) });
-          log("info", `${t.orderId}: invoice ${opts.force ? "re-" : ""}downloaded (${bundle.parts.map((p) => p.type).join(", ")})`);
+          const stored = await downloadAndStoreInvoice(ctx, t);
+          results.set(t.orderId, { orderId: t.orderId, status: "downloaded", units: t.unitIds.length, parts: stored.parts, sizeKb: Math.round(stored.size / 1024) });
+          log("info", `${t.orderId}: invoice ${opts.force ? "re-" : ""}downloaded (${stored.parts.join(", ")})`);
         } catch (err) {
           results.set(t.orderId, { orderId: t.orderId, status: "failed", units: t.unitIds.length, error: (err as Error).message.split("\n")[0].slice(0, 160) });
           log("warn", `${t.orderId}: invoice failed (${(err as Error).message.split("\n")[0].slice(0, 120)})`);

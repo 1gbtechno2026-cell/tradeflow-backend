@@ -73,7 +73,7 @@ async function refusesAsync(fn: () => Promise<unknown>, message: string | RegExp
 const many = (n: number, make: (i: number) => string) => Array.from({ length: n }, (_, i) => make(i));
 
 async function main() {
-  await mongoose.connect(config.mongoUri, { serverSelectionTimeoutMS: 15_000 });
+  await mongoose.connect(config.mongoUri, { autoIndex: false, autoCreate: false, serverSelectionTimeoutMS: 15_000 });
   const userId = config.userId;
   assert.ok(userId, "TRADE_FLOW_USER_ID is not set");
 

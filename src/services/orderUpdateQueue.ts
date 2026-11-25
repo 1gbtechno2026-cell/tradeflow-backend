@@ -19,6 +19,7 @@ import { resolveTargets, type UpdateTriggerInput } from "./orderUpdate.js";
 import { recordUnitChanges, snapshotUnit } from "./orderUnitEvents.js";
 import { NO_SAVED_COOKIES, resolveLoggedInSession } from "./sessionStore.js";
 import { noteDeliveredOrder, queueInvoicesAfterUpdate } from "./requestChains.js";
+import { noteLateDocumentsAfterRead } from "./invoiceRefetch.js";
 import { clockStamp, clockTime, releaseLease, renewLease, slotStamp, supersededBy, supersededText, type ScheduleClaim, type ScheduleRunner, type ScheduleRunResult } from "./scheduleClock.js";
 import { retireLegacySchedulers } from "./scheduleSettings.js";
 // startRequests makes its requests through this module; both sides only call each other inside functions.
@@ -795,6 +796,8 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           // — the dashboard's alerts read those.
           const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
           if (changes.stageChanged && stageOf(after?.status_key) === "delivered") await noteDeliveredOrder(requestId, u.orderId);
+          // Late credit notes (data-quality SO-5): an invoiced unit that ended or was refunded → a re-download is noted on its bundle. Never fails the unit.
+          await noteLateDocumentsAfterRead(userId, u.unitId, { before: before?.status_key ?? null, after: after?.status_key }, `update ${requestId}`);
           await bumpAccount(requestId, me, { done: 1, ...(changes.stageChanged ? { statusChanged: 1 } : {}), ...(changes.otpNew ? { otpNew: 1 } : {}) });
           read += 1;
           taskLog.mark(requestId, taskKey, { status: "success" });
@@ -867,6 +870,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
             const after = await snapshotUnit(userId, u.unitId);
             const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
             if (changes.stageChanged && stageOf(after?.status_key) === "delivered") await noteDeliveredOrder(requestId, u.orderId);
+            await noteLateDocumentsAfterRead(userId, u.unitId, { before: before?.status_key ?? null, after: after?.status_key }, `update ${requestId}`);
             if (changes.otpNew || changes.stageChanged) {
               await bumpAccount(requestId, me, { ...(changes.stageChanged ? { statusChanged: 1 } : {}), ...(changes.otpNew ? { otpNew: 1 } : {}) });
             }

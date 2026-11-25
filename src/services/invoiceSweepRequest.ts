@@ -36,7 +36,8 @@ import { openRequestTasksQuietly, syncRequestTasksQuietly } from "./syncTaskLog.
  * takes whatever is still missing — as the sweep always did.
  */
 
-export type SweepPhase = "capture" | "recapture";
+/** "refetch" = the late re-downloads of data-quality SO-5 (services/invoiceRefetch.ts); its count is on the request only when it had orders. */
+export type SweepPhase = "capture" | "recapture" | "refetch";
 
 export interface SweepRecorderDeps {
   resolveOrders: (userId: string, orderIds: string[]) => Promise<Map<string, InvoiceTarget>>;
@@ -62,7 +63,8 @@ export function recordSweepAsRequest(userId: string, input: { source: "system-cr
   let stopped = false;
   let poll: NodeJS.Timeout | null = null;
   const known = new Set<string>();
-  const counted: Record<SweepPhase, number> = { capture: 0, recapture: 0 };
+  const counted: Record<SweepPhase, number> = { capture: 0, recapture: 0, refetch: 0 };
+  const refetchCount = () => (counted.refetch ? { refetch_count: counted.refetch } : {});
   const quiet = (what: string) => (err: unknown) => console.warn(`[invoice-sweep] request ${requestId.slice(-8) || "—"}: ${what} not recorded — ${err instanceof Error ? err.message.split("\n")[0] : err}`);
 
   const taskOf = (orderId: string, targets: Map<string, InvoiceTarget>): IInvoiceTask => {
@@ -87,7 +89,7 @@ export function recordSweepAsRequest(userId: string, input: { source: "system-cr
           createdBy: input.by,
           status: "in_progress",
           message: "",
-          params: { order_ids_count: tasks.length, force: false, sweep: true, capture_count: counted.capture, recapture_count: counted.recapture, cap_per_phase: input.capPerPhase },
+          params: { order_ids_count: tasks.length, force: false, sweep: true, capture_count: counted.capture, recapture_count: counted.recapture, ...refetchCount(), cap_per_phase: input.capPerPhase },
           tasks,
           counts: countsOf(tasks.map((t) => t.status)),
           queue: INVOICE_QUEUE,
@@ -117,7 +119,7 @@ export function recordSweepAsRequest(userId: string, input: { source: "system-cr
       // A later phase of the same run: its orders join the request — while it is still open.
       const res = await col().updateOne(
         { _id: new Types.ObjectId(requestId), status: "in_progress" },
-        { $push: { tasks: { $each: tasks } }, $inc: { "counts.total": tasks.length, "counts.queued": tasks.length, "params.order_ids_count": tasks.length }, $set: { "params.capture_count": counted.capture, "params.recapture_count": counted.recapture, updatedAt: now } } as Record<string, unknown>
+        { $push: { tasks: { $each: tasks } }, $inc: { "counts.total": tasks.length, "counts.queued": tasks.length, "params.order_ids_count": tasks.length }, $set: { "params.capture_count": counted.capture, "params.recapture_count": counted.recapture, ...(counted.refetch ? { "params.refetch_count": counted.refetch } : {}), updatedAt: now } } as Record<string, unknown>
       );
       if (res.modifiedCount) await syncRequestTasksQuietly("invoices", requestId);
     } catch (err) {

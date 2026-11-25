@@ -3,15 +3,9 @@ import { Order } from "../models/Order.js";
 import { PlatformId } from "../models/PlatformId.js";
 import { cookiesFor } from "./orderFetch.js";
 import { openOrderApiSession } from "./orderApi.js";
-import {
-  downloadInvoiceViaApi,
-  mergeInvoiceBundle,
-  putInvoice,
-  registerInvoice,
-  rawInvoiceKey,
-  invoiceExists,
-  invoiceStoreEnabled,
-} from "./invoiceCapture.js";
+import { downloadInvoiceAnswerViaApi, rawInvoiceKey, invoiceExists, invoiceStoreEnabled } from "./invoiceCapture.js";
+import { isInvoiceStoreError, storeInvoiceDownload } from "./invoiceOriginals.js";
+import type { InvoiceDownloadPath } from "../models/InvoiceDownload.js";
 
 /**
  * On-demand invoice download by order ID — the "Download Order Invoices" modal.
@@ -34,6 +28,10 @@ export interface OrderDownloadResult {
   parts?: string[];
   sizeKb?: number;
   error?: string;
+  /** The files equal the processed bundle's originals: nothing re-uploaded (skipIfUnchanged only). */
+  unchanged?: boolean;
+  /** failed only: Flipkart answered, and storing it failed on our side (S3 / Mongo / the merge) — not the order's fault. */
+  ours?: boolean;
 }
 
 export interface InvoiceTarget {
@@ -66,33 +64,41 @@ export async function resolveInvoiceTargets(userId: string, orderIds: string[]):
   return byOrder;
 }
 
+/** How a download is stored: which path made it (invoice_downloads.path), the request it belongs to, and whether an unchanged download may skip the raw PUT. */
+export interface StoreOptions {
+  path?: InvoiceDownloadPath;
+  requestId?: string;
+  /** The sweep's re-capture and the refetch phase only: files equal to the processed row's originals → no raw PUT, no Lambda run. */
+  skipIfUnchanged?: boolean;
+}
+
 /**
- * One order, always downloaded: the bundle over the order API (zip-aware) →
- * S3 raw/<user>/<order>.pdf → the `invoices` row → every unit of the order
- * stamped. Throws what the download or the store threw. The by-order-id
+ * One order, always downloaded: Flipkart's answer over the order API
+ * (zip-aware) → the one store helper (invoiceOriginals.ts storeInvoiceDownload:
+ * Flipkart's files to orig/, the invoice_downloads record, the merged PDF to
+ * S3 raw/<user>/<order>.pdf, the `invoices` row, every unit of the order
+ * stamped). Throws what the download or the store threw. The by-order-id
  * download below and the invoice batch (services/invoiceRequests.ts) both
  * store an order through this.
  */
-export async function downloadAndStoreInvoice(ctx: APIRequestContext, t: InvoiceTarget): Promise<{ key: string; size: number; parts: string[] }> {
-  const key = rawInvoiceKey(t.userId, t.orderId);
-  const pdfs = await downloadInvoiceViaApi(ctx, t.orderId);
-  const bundle = await mergeInvoiceBundle(pdfs);
-  const put = await putInvoice(key, bundle.pdf);
-  await registerInvoice({
+export async function downloadAndStoreInvoice(
+  ctx: APIRequestContext,
+  t: InvoiceTarget,
+  opts: StoreOptions = {}
+): Promise<{ key: string; size: number; parts: string[]; unchanged: boolean; downloadId: string; originals: { new: number; existing: number; failed: number } }> {
+  const answer = await downloadInvoiceAnswerViaApi(ctx, t.orderId);
+  const stored = await storeInvoiceDownload({
     userId: t.userId,
-    platformAccountId: t.accountId,
+    accountId: t.accountId,
     orderId: t.orderId,
-    key,
-    etag: put.etag,
-    size: put.size,
-    parts: bundle.parts,
+    answer,
     unitIds: t.unitIds,
+    unitRowIds: t.rowIds,
+    path: opts.path || "by-order-id",
+    requestId: opts.requestId,
+    skipIfUnchanged: opts.skipIfUnchanged,
   });
-  await Order.updateMany(
-    { _id: { $in: t.rowIds } },
-    { $set: { invoice_s3_key: key, invoice_downloaded_at: new Date(), invoice_size: put.size, is_invoice_downloaded: true, invoice_parts: bundle.parts } }
-  );
-  return { key, size: put.size, parts: bundle.parts.map((p) => p.type) };
+  return { key: stored.key, size: stored.size, parts: stored.parts.map((p) => p.type), unchanged: stored.unchanged, downloadId: stored.downloadId, originals: stored.originals };
 }
 
 /** Split a textarea / array of order IDs into a clean, de-duplicated list. */
@@ -106,6 +112,11 @@ export async function downloadInvoicesByOrderId(opts: {
   orderIds: string[];
   force: boolean;
   concurrency?: number;
+  /** invoice_downloads.path of every download of this run (default "by-order-id": the modal). */
+  path?: InvoiceDownloadPath;
+  requestId?: string;
+  /** See StoreOptions — the sweep's re-capture and the refetch phase only. */
+  skipIfUnchanged?: boolean;
   cancelled?: () => boolean;
   log?: (level: "info" | "warn", msg: string) => void;
   /**
@@ -172,11 +183,11 @@ export async function downloadInvoicesByOrderId(opts: {
             await answered({ orderId: t.orderId, status: "already", units: t.unitIds.length });
             continue;
           }
-          const stored = await downloadAndStoreInvoice(ctx, t);
-          await answered({ orderId: t.orderId, status: "downloaded", units: t.unitIds.length, parts: stored.parts, sizeKb: Math.round(stored.size / 1024) });
-          log("info", `${t.orderId}: invoice ${opts.force ? "re-" : ""}downloaded (${stored.parts.join(", ")})`);
+          const stored = await downloadAndStoreInvoice(ctx, t, { path: opts.path, requestId: opts.requestId, skipIfUnchanged: opts.skipIfUnchanged });
+          await answered({ orderId: t.orderId, status: "downloaded", units: t.unitIds.length, parts: stored.parts, sizeKb: Math.round(stored.size / 1024), ...(stored.unchanged ? { unchanged: true } : {}) });
+          log("info", `${t.orderId}: invoice ${opts.force ? "re-" : ""}downloaded (${stored.parts.join(", ")})${stored.unchanged ? " — the same files as the processed bundle, nothing re-uploaded" : ""}`);
         } catch (err) {
-          await answered({ orderId: t.orderId, status: "failed", units: t.unitIds.length, error: (err as Error).message.split("\n")[0].slice(0, 160) });
+          await answered({ orderId: t.orderId, status: "failed", units: t.unitIds.length, error: (err as Error).message.split("\n")[0].slice(0, 160), ...(isInvoiceStoreError(err) ? { ours: true } : {}) });
           log("warn", `${t.orderId}: invoice failed (${(err as Error).message.split("\n")[0].slice(0, 120)})`);
         }
         await new Promise((r) => setTimeout(r, 250));

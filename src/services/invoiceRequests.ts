@@ -8,7 +8,8 @@ import { PlatformId } from "../models/PlatformId.js";
 import { getInvoiceBatchQueue, INVOICE_BATCH_QUEUE, type InvoiceBatchJobData } from "../queue.js";
 import { sleep } from "./browser.js";
 import { invoiceStoreEnabled } from "./invoiceCapture.js";
-import { downloadAndStoreInvoice, resolveInvoiceTargets, type InvoiceTarget } from "./invoiceOnDemand.js";
+import { downloadAndStoreInvoice, resolveInvoiceTargets, type InvoiceTarget, type StoreOptions } from "./invoiceOnDemand.js";
+import { isInvoiceStoreError } from "./invoiceOriginals.js";
 import { openOrderApiSession } from "./orderApi.js";
 import { cookiesFor } from "./orderFetch.js";
 import { markSessionEligibleForRelogin } from "./sessionEligibility.js";
@@ -93,8 +94,8 @@ export interface InvoiceBatchDeps {
   resolveOrders: (userId: string, orderIds: string[]) => Promise<Map<string, InvoiceTarget>>;
   /** The account's order-API session, or null when it has no usable saved session. */
   openSession: (accountId: string) => Promise<APIRequestContext | null>;
-  /** One order: download → store → register → stamp. Throws on any failure. */
-  download: (ctx: APIRequestContext, target: InvoiceTarget) => Promise<{ size: number; parts: string[] }>;
+  /** One order: download → store (Flipkart's files, the download's record, the merged PDF) → register → stamp. Throws on any failure. */
+  download: (ctx: APIRequestContext, target: InvoiceTarget, opts?: StoreOptions) => Promise<{ size: number; parts: string[] }>;
   storeReady: () => boolean;
   ledger: LedgerModel;
   queueName: string;
@@ -534,10 +535,12 @@ export async function runInvoiceBatchJob(job: Job<InvoiceBatchJobData>, override
         continue;
       }
       try {
-        const stored = await deps.download(ctx, target);
+        // A batch always re-uploads (it means "extract again"): no skipIfUnchanged.
+        const stored = await deps.download(ctx, target, { path: "batch", requestId });
         await finishTask(id, t.i, "in_progress", { status: "success" }, { parts: stored.parts, sizeKb: Math.round(stored.size / 1024) });
       } catch (err) {
-        const why = classifyPlatformError(err);
+        // Storing what Flipkart sent failed (S3 / Mongo): ours — never a Flipkart class, whatever network code it carries.
+        const why = isInvoiceStoreError(err) ? classified("internal_error", err instanceof Error ? err.message : String(err)) : classifyPlatformError(err);
         await finishTask(id, t.i, "in_progress", { status: "failed", ...why });
         if (why.errorClass === "not_logged_in") {
           sessionDead = classified("not_logged_in", `session refused on ${t.orderId}`);

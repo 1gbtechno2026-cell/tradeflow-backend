@@ -3,8 +3,8 @@
  *
  * Picks the first N (default 100) distinct DELIVERED orders that have no
  * invoice yet, grouped by account, and — with --run — downloads each bundle
- * over Flipkart's order API (the proven path: downloadInvoiceViaApi → merge →
- * putInvoice → registerInvoice → stamp the order's units), then lets the
+ * over Flipkart's order API (the proven path: downloadInvoiceAnswerViaApi → the one
+ * store helper: originals, invoice_downloads, merge, raw PUT, register, units), then lets the
  * existing S3→SQS→Lambda pipeline extract. API-only: if the API cannot deliver
  * a bundle, it is recorded as "needs page" and skipped (no Chrome here).
  *
@@ -22,15 +22,8 @@ import { Order } from "../models/Order.js";
 import { PlatformId } from "../models/PlatformId.js";
 import { cookiesFor } from "../services/orderFetch.js";
 import { openOrderApiSession } from "../services/orderApi.js";
-import {
-  downloadInvoiceViaApi,
-  mergeInvoiceBundle,
-  putInvoice,
-  registerInvoice,
-  rawInvoiceKey,
-  invoiceExists,
-  invoiceStoreEnabled,
-} from "../services/invoiceCapture.js";
+import { downloadInvoiceAnswerViaApi, rawInvoiceKey, invoiceExists, invoiceStoreEnabled } from "../services/invoiceCapture.js";
+import { storeInvoiceDownload } from "../services/invoiceOriginals.js";
 
 const args = new Set(process.argv.slice(2));
 const RUN = args.has("--run");
@@ -151,23 +144,9 @@ async function main() {
           await Order.updateMany({ _id: { $in: p.rowIds } }, { $set: { invoice_s3_key: key, is_invoice_downloaded: true } });
           continue;
         }
-        const pdfs = await downloadInvoiceViaApi(ctx, p.orderId); // API only (unzips multi-invoice bundles)
-        const bundle = await mergeInvoiceBundle(pdfs);
-        const put = await putInvoice(key, bundle.pdf);
-        await registerInvoice({
-          userId: p.userId,
-          platformAccountId: p.accountId,
-          orderId: p.orderId,
-          key,
-          etag: put.etag,
-          size: put.size,
-          parts: bundle.parts,
-          unitIds: p.unitIds,
-        });
-        await Order.updateMany(
-          { _id: { $in: p.rowIds } },
-          { $set: { invoice_s3_key: key, invoice_downloaded_at: new Date(), invoice_size: put.size, is_invoice_downloaded: true, invoice_parts: bundle.parts } }
-        );
+        // API only (unzips multi-invoice bundles); stored through the one store helper every download path uses.
+        const answer = await downloadInvoiceAnswerViaApi(ctx, p.orderId);
+        const bundle = await storeInvoiceDownload({ userId: p.userId, accountId: p.accountId, orderId: p.orderId, answer, unitIds: p.unitIds, unitRowIds: p.rowIds, path: "by-order-id" });
         for (const part of bundle.parts) partCount[part.type] = (partCount[part.type] || 0) + 1;
         stat.stored++;
         if (stat.stored % 50 === 0) console.log(`  …${stat.stored} stored (${Math.round((Date.now() - t0) / 1000)}s)`);

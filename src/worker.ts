@@ -1,6 +1,6 @@
 import { connectDb } from "./db.js";
 import { config } from "./config.js";
-import { CANCEL_QUEUE, COUPON_QUEUE, createCancelWorker, createCheckoutWorker, createCouponWorker, createInvoiceBatchWorker, createInvoiceWorker, createRescheduleWorker, createSyncWorker, createUpdateWorker, getInvoiceQueue, getSyncQueue, HTTP_QUEUE, INVOICE_BATCH_QUEUE, INVOICE_QUEUE, LEGACY_QUEUE, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
+import { CANCEL_QUEUE, COUPON_QUEUE, createCancelWorker, createCheckoutWorker, createCouponWorker, createInvoiceBatchWorker, createInvoiceWorker, createRescheduleWorker, createSyncWorker, createUpdateWorker, getSyncQueue, HTTP_QUEUE, INVOICE_BATCH_QUEUE, INVOICE_QUEUE, LEGACY_QUEUE, queueNameFor, RESCHEDULE_QUEUE, SYNC_QUEUE, UPDATE_QUEUE } from "./queue.js";
 import { isJobClass, JOB_CLASSES, type JobClass } from "./services/jobClass.js";
 import { runCheckoutJob } from "./services/checkoutRunner.js";
 import { claimProxyForWorker } from "./services/proxyPool.js";
@@ -8,13 +8,15 @@ import { currentProxyMode } from "./services/proxyMode.js";
 import { resolveCancelSpeed, runCancelJob, startCancelReaper } from "./services/orderCancel.js";
 import { rescheduleConcurrency, runRescheduleJob, startRescheduleReaper } from "./services/orderReschedule.js";
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
-import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob, startUpdateReaper } from "./services/orderUpdateQueue.js";
-import { runTrackedInvoiceSweep, INVOICE_SCHEDULE_ENABLED, INVOICE_SWEEP_MS } from "./services/invoiceSweep.js";
+import { resolveUpdateWindows, retireUpdateSchedulers, runOrderUpdateJob, startUpdateReaper, updateSweepRunner } from "./services/orderUpdateQueue.js";
+import { invoiceSweepRunner, runSweepJob, type SweepJobData } from "./services/invoiceSweep.js";
 import { closeInterruptedSweepRequests } from "./services/invoiceSweepRequest.js";
 import { CHAIN_AFTER_ORDER, CHAIN_DELIVERED_CHECK, CHAIN_INVOICE_SWEEP } from "./services/requestChains.js";
 import { INVOICE_BATCH_CONCURRENCY, runInvoiceBatchJob, startInvoiceRequestReaper } from "./services/invoiceRequests.js";
 import { COUPON_CONCURRENCY, runCouponJob, startCouponRequestReaper } from "./services/couponRequests.js";
 import { startWorkerHeartbeat } from "./services/requestCommon.js";
+import { startScheduleClock, type ScheduleClock } from "./services/scheduleClock.js";
+import { eligibleHere, retireLegacySchedulers, seedSchedules, seedSchedulesAtStart, servedBy } from "./services/scheduleSettings.js";
 import { describeError, isTransientError, throttledWarn } from "./lib/resilience.js";
 
 /**
@@ -30,8 +32,18 @@ import { describeError, isTransientError, throttledWarn } from "./lib/resilience
  *   SYNC_SWEEP_MS=600000                        outbox sweep period (default 10 min)
  *   UPDATE_CONCURRENCY=3                        Update Order Units: accounts at once
  *                                               (the dashboard's update windows win)
- *   UPDATE_SWEEP_MS / UPDATE_OFD_SWEEP_MS       every active unit (6 h) / Out for
- *                                               delivery (2 h); UPDATE_SCHEDULE=0 off
+ *
+ * The three sweeps — every active unit (6 h), out for delivery (2 h), invoices
+ * (3 h) — run on the schedule clock every machine shares, not on a scheduler
+ * in this machine's Redis (services/scheduleClock.ts). A worker with the
+ * `update` role serves the two update clocks, one with `invoice` the invoice
+ * clock. Whether a sweep runs is its switch in Settings → Scheduled fetch;
+ * this machine's .env only says whether it MAY be the one that runs it:
+ *
+ *   UPDATE_SCHEDULE=0     this machine never runs the two update sweeps
+ *   INVOICE_SCHEDULE=0    this machine never runs the invoice sweep
+ *   (UPDATE_SWEEP_MS, UPDATE_OFD_SWEEP_MS, INVOICE_SWEEP_MS, CRON_TIMEZONE were
+ *    read once, by the first seed of the clocks; changing them now does nothing)
  *
  * Which classes this process serves, and how many jobs of each at once.
  *
@@ -93,6 +105,9 @@ process.on("uncaughtException", (err) => {
 
 async function main() {
   await connectDb();
+  // The schedules' switches and clocks: written once per workspace, by whichever of the API and the worker starts
+  // first; nothing that exists is touched (services/scheduleSettings.ts).
+  await seedSchedulesAtStart(config.userId);
 
   // Egress. In worker-lease mode a process binds one proxy for its life and,
   // in `required` mode, must not take a job without one. In session-lease
@@ -205,13 +220,23 @@ async function main() {
     names.push([SYNC_QUEUE, syncConcurrency]);
   }
 
-  // Update Order Units: one job per account, plus the two schedules.
+  // The shared schedule clock of this process, started once every role is set up (below). A leftover job of an old
+  // per-machine scheduler only makes it look: the clock runs a fixed time when one is due and free, never twice.
+  let scheduleClock: ScheduleClock | null = null;
+  const clockLook = async () => {
+    await scheduleClock?.pollOnce();
+  };
+
+  // Update Order Units: one job per account. Its two sweeps run on the shared clock.
   if (roles.has("update")) {
+    // The BullMQ schedulers this queue had before the shared clock leave this machine's Redis, with their next jobs —
+    // before the worker below can take one.
+    await retireUpdateSchedulers();
     const initial = await resolveUpdateWindows(config.userId).catch(() => null);
     let windows = initial?.windows || 3;
     const updateWorker = createUpdateWorker(windows, async (job, token) => {
       if (job.name !== "sweep") console.log(`[worker] PICKED ${UPDATE_QUEUE} request=${job.data.requestId} email=${job.data.email}`);
-      await runOrderUpdateJob(job, token);
+      await runOrderUpdateJob(job, token, { clockLook });
     });
     updateWorker.on("failed", (job, err) => {
       if (err.name === "DelayedError") return;
@@ -227,18 +252,20 @@ async function main() {
       }
     };
     setInterval(() => void followUpdate(), 10_000).unref();
-    await ensureUpdateSchedules();
     startUpdateReaper();
     startWorkerHeartbeat(UPDATE_QUEUE);
     names.push([UPDATE_QUEUE, windows]);
   }
 
   // Invoice capture: the time-settled sweep (services/invoiceSweep.ts). One job
-  // at a time (the sweep pools accounts itself) plus the periodic schedule.
+  // at a time (the sweep pools accounts itself); the shared clock queues the
+  // scheduled ones, the "Invoices" button the manual ones.
   if (roles.has("invoice")) {
+    // The old per-machine scheduler of the sweep leaves this machine's Redis, with its next job.
+    await retireLegacySchedulers(["invoice_sweep"]);
     const invoiceWorker = createInvoiceWorker(1, async (job) => {
       if (job.name === "sweep") {
-        const out = await runTrackedInvoiceSweep(config.userId, { trigger: job.data.sweep === "manual" ? "user" : "system-cron", by: job.data.by });
+        const out = await runSweepJob(config.userId, job.data as SweepJobData, { clockLook });
         if (out.skipped) console.log(`[worker] ${INVOICE_QUEUE} sweep skipped — ${out.reason}`);
       }
     });
@@ -251,9 +278,6 @@ async function main() {
     // machine left open is closed now — a sweep cannot be resumed.
     startWorkerHeartbeat(INVOICE_QUEUE);
     await closeInterruptedSweepRequests().catch((err) => console.warn("[worker] could not close interrupted sweep requests:", err instanceof Error ? err.message : err));
-    if (INVOICE_SCHEDULE_ENABLED) {
-      await getInvoiceQueue().upsertJobScheduler("order-invoice-sweep", { every: INVOICE_SWEEP_MS }, { name: "sweep", data: { sweep: "scheduled" }, opts: { attempts: 1 } });
-    }
     names.push([INVOICE_QUEUE, 1]);
   }
 
@@ -293,6 +317,29 @@ async function main() {
   if (!names.length) {
     console.error("[worker] WORKER_ROLES selected nothing to run");
     process.exit(2);
+  }
+
+  // The sweeps, on the schedule clock every machine shares (services/scheduleClock.ts). This process serves the
+  // clocks of its roles — it writes its presence, records "switched off" and "missed", renews the leases of this
+  // machine — and RUNS a fixed time only for the schedules this machine's .env lets it (eligibleHere), when the
+  // switch in Settings is on and no other machine has the time. The first time it serves a clock it starts with the
+  // next fixed time: nothing sweeps because a worker was restarted.
+  const serves = servedBy("worker", roles);
+  if (serves.length && config.userId) {
+    try {
+      scheduleClock = startScheduleClock({
+        role: "worker",
+        userId: config.userId,
+        serves,
+        names: serves.filter((n) => eligibleHere(n)),
+        runners: { update_active: updateSweepRunner("active"), update_ofd: updateSweepRunner("ofd"), invoice_sweep: invoiceSweepRunner() },
+        seed: () => seedSchedules(config.userId),
+      });
+    } catch (err) {
+      console.warn(`[worker] the schedule clock could not start — no sweep runs from this worker: ${err instanceof Error ? err.message.split("\n")[0] : err}`);
+    }
+  } else if (serves.length) {
+    console.log("[worker] TRADE_FLOW_USER_ID is not set — no schedule clock, no sweeps");
   }
   // The requests nobody presses (services/requestChains.ts): each reacts only to work this process did.
   console.log(

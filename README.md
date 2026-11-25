@@ -42,6 +42,20 @@ process from the terminal that started it. The same trap applies to the workers,
 since `npm run worker` here and the dashboard's verify worker are both `tsx`
 processes.
 
+## Schedules
+
+The nightly fetch, the two update sweeps and the invoice sweep each have one clock in the database and one switch in
+the dashboard (Settings → Scheduled fetch), shared by every machine on that database; one machine runs a time and
+another takes over when it is away. In `.env`, `UPDATE_SCHEDULE=0`, `INVOICE_SCHEDULE=0` and `FETCH_SCHEDULE=0` only
+mean "this machine never runs it" — they switch nothing on or off. See [docs/schedules.md](docs/schedules.md).
+
+```bash
+npm run schedules:seed -- --check   # what the first start would write here; reads only
+npm run test:schedule-lease         # the clock and the lease
+npm run test:schedule-sweep         # the sweeps under the lease
+npm run test:fetch-schedule         # the nightly fetch under the lease
+```
+
 ## Integration endpoint
 
 Post your Smart Bulk Order payload as-is:

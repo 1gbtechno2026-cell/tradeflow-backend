@@ -38,7 +38,11 @@
     "request-log:backfill": "tsx src/scripts/requestLogBackfill.ts",
     "test:dead-session": "tsx src/scripts/deadSessionCheck.ts",
     "test:dead-session-flows": "tsx src/scripts/deadSessionFlowsCheck.ts",
-    "test:dead-session-checkout": "tsx src/scripts/deadSessionCheckoutCheck.ts"
+    "test:dead-session-checkout": "tsx src/scripts/deadSessionCheckoutCheck.ts",
+    "test:schedule-lease": "tsx src/scripts/scheduleLeaseCheck.ts",
+    "test:schedule-sweep": "tsx src/scripts/scheduleSweepCheck.ts",
+    "test:fetch-schedule": "tsx src/scripts/fetchScheduleCheck.ts",
+    "schedules:seed": "tsx src/scripts/scheduleSeed.ts"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.1156.0",

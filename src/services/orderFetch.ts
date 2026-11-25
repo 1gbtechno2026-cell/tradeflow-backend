@@ -1649,7 +1649,11 @@ async function wipeFlipkartLocalSession(page: Page) {
   await sleep(400);
 }
 
-export async function stopOrderFetch(userId: string) {
+/**
+ * `reason`: why, when it is not a person's Force kill — the schedule clock stops a nightly fetch another machine has
+ * taken over ("Superseded — Mac-2 took over the nightly fetch at 05:16"). It is the line the fetch's log ends on.
+ */
+export async function stopOrderFetch(userId: string, reason = "") {
   const job = state(userId);
   // Asked while the account list is still being planned or prepared: the preparation reads this between
   // two batches of accounts and gives up (beginOrderFetch), so the fetcher is free again within a second.
@@ -1662,7 +1666,7 @@ export async function stopOrderFetch(userId: string) {
   job.phase = "";
   job.currentEmail = null;
   markFetchRunning(userId, false);
-  log(userId, "warn", "Force kill: stopping order fetch and killing Chrome");
+  log(userId, "warn", reason ? `${reason}: stopping order fetch and killing Chrome` : "Force kill: stopping order fetch and killing Chrome");
   await closeLiveBrowsers(userId);
 }
 

@@ -1,6 +1,7 @@
 import { Types, type Model } from "mongoose";
 import { REQUEST_STATUSES, REQUEST_TASK_STATUSES, type RequestCounts, type RequestStatus, type RequestTaskStatus } from "../models/OrderInvoiceRequest.js";
 import { SYNC_TASK_KEEP_MS, SYNC_TASK_KINDS, SYNC_TASK_TYPE_OF, type IOrderSyncTask, type SyncTaskKind } from "../models/OrderSyncTask.js";
+import { isScheduleName, SCHEDULE_LABELS } from "../models/ScheduleLease.js";
 import { ABORTED_WHILE_RUNNING, CANCELLED_BEFORE_START, ERROR_CLASSES, finishedCount, RequestInputError, TIMED_OUT, type ErrorClass } from "./requestCommon.js";
 import { loadFacts, logCounts, logDefaults, sameCounts, syncRequestTasks, UPDATE_STOP_GRACE_MS, type LogDeps, type RequestFacts } from "./syncTaskLog.js";
 
@@ -279,11 +280,22 @@ function sweepRun(f: RequestFacts): boolean {
 }
 
 /**
+ * A request the shared schedule clock started (services/scheduleClock.ts): the schedule, the fixed time it took
+ * (India time) and the machine it ran on — "Update all active units · 2026-11-25 18:15 · ran on Mac". A second start
+ * of the same time (the nightly fetch only) says so.
+ */
+function scheduleLine(p: Record<string, unknown>): string {
+  const name = String(p.schedule_name || "");
+  return [isScheduleName(name) ? SCHEDULE_LABELS[name] : name, String(p.schedule_slot || ""), p.ran_on ? `ran on ${String(p.ran_on)}` : "", Number(p.attempt) > 1 ? `start ${Number(p.attempt)}` : ""].filter(Boolean).join(" · ");
+}
+
+/**
  * SETTINGS of the Details modal: each recorded parameter under the
  * reference's label ("Selected by", "Statuses", "Force (skip in-progress
  * check)", "Queued after nightly fetch", "After", "Emails", "Orders",
- * "Units"). Empty when nothing was recorded — the modal then says "No
- * settings were recorded for this request."
+ * "Units"), and ours: "Schedule" on a request the schedule clock started.
+ * Empty when nothing was recorded — the modal then says "No settings were
+ * recorded for this request."
  */
 export function settingsOf(f: RequestFacts, parent?: RequestFacts): SettingLine[] {
   const p = f.params;
@@ -337,6 +349,7 @@ export function settingsOf(f: RequestFacts, parent?: RequestFacts): SettingLine[
       if (num(p.rejected_count)) add("Refused before queueing", num(p.rejected_count));
       break;
   }
+  if (p.schedule_name) add("Schedule", scheduleLine(p));
   if (f.retryOf) {
     add("Retry of", f.retryOf);
     const retried = list(p.retry_statuses);

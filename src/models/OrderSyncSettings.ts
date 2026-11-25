@@ -1,4 +1,16 @@
 import mongoose, { Schema, Types } from "mongoose";
+import type { ScheduleName } from "./ScheduleLease.js";
+
+/**
+ * One schedule's switch (Settings → Scheduled fetch), shared by every machine on this database. `on` null or the
+ * path missing = never set: nothing runs until the seed or a person sets it (services/scheduleSettings.ts).
+ */
+export interface IScheduleSwitch {
+  on: boolean | null;
+  /** A username, or "seed:<host>" for the value Trade Flow wrote at its first start. */
+  changedBy: string;
+  changedAt: Date | null;
+}
 
 /**
  * Per-workspace switches for order fetch / update that an operator flips in
@@ -36,9 +48,14 @@ export interface IOrderSyncSettings {
   scheduledInvoices: boolean | null;
   scheduledInvoicesChangedBy: string;
   scheduledInvoicesChangedAt: Date | null;
+  /** The four schedules' switches: schedules.fetch, .update_active, .update_ofd, .invoice_sweep. The .env only says whether a machine MAY run one. */
+  schedules?: Partial<Record<ScheduleName, IScheduleSwitch>>;
   createdAt: Date;
   updatedAt: Date;
 }
+
+// No default on the four paths: a row made by any other setting's upsert must not look as if its switches had been set.
+const ScheduleSwitchSchema = new Schema<IScheduleSwitch>({ on: { type: Boolean, default: null }, changedBy: { type: String, default: "" }, changedAt: { type: Date, default: null } }, { _id: false });
 
 const OrderSyncSettingsSchema = new Schema<IOrderSyncSettings>(
   {
@@ -67,6 +84,12 @@ const OrderSyncSettingsSchema = new Schema<IOrderSyncSettings>(
     checkoutChangedAt: { type: Date, default: null },
     scheduledInvoicesChangedBy: { type: String, default: "" },
     scheduledInvoicesChangedAt: { type: Date, default: null },
+    schedules: {
+      fetch: { type: ScheduleSwitchSchema, default: undefined },
+      update_active: { type: ScheduleSwitchSchema, default: undefined },
+      update_ofd: { type: ScheduleSwitchSchema, default: undefined },
+      invoice_sweep: { type: ScheduleSwitchSchema, default: undefined },
+    },
   },
   { timestamps: true, collection: "order_sync_settings" }
 );

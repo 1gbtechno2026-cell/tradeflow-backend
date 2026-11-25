@@ -1,4 +1,4 @@
-import { DelayedError, type Job } from "bullmq";
+import { DelayedError, type Job, type Queue } from "bullmq";
 import { Types, type Model } from "mongoose";
 import type { APIRequestContext, Browser, BrowserContext, Page } from "playwright";
 import { config } from "../config.js";
@@ -6,7 +6,8 @@ import { isDestroyedContext } from "../lib/evalOnPage.js";
 import { Order } from "../models/Order.js";
 import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
 import { demoteCircuitFor, forgetDemoteCircuit, markSessionEligibleForRelogin, SessionDeadError } from "./sessionEligibility.js";
-import { OrderUpdateRequest, type IOrderUpdateRequest, type IUpdateAccount, type UpdateSource } from "../models/OrderUpdateRequest.js";
+import { OrderUpdateRequest, type IOrderUpdateRequest, type IUpdateAccount, type IUpdateSchedule, type UpdateSource } from "../models/OrderUpdateRequest.js";
+import { isScheduleName, SCHEDULE_LABELS, type ScheduleName } from "../models/ScheduleLease.js";
 import { getUpdateQueue, type UpdateJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
 import { blockFlipkartLogout, closeBrowser, confirmLoginLanding, flipkartLoginUrl, launchStealthContext, restoreFlipkartSession, sleep } from "./browser.js";
@@ -16,8 +17,12 @@ import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { DEFAULT_UPDATE_STATUSES, stageOf } from "./orderLifecycle.js";
 import { resolveTargets, type UpdateTriggerInput } from "./orderUpdate.js";
 import { recordUnitChanges, snapshotUnit } from "./orderUnitEvents.js";
-import { NO_SAVED_COOKIES, resolveLoggedInSession, workspaceUserId } from "./sessionStore.js";
+import { NO_SAVED_COOKIES, resolveLoggedInSession } from "./sessionStore.js";
 import { noteDeliveredOrder, queueInvoicesAfterUpdate } from "./requestChains.js";
+import { clockStamp, clockTime, releaseLease, renewLease, slotStamp, supersededBy, supersededText, type ScheduleClaim, type ScheduleRunner, type ScheduleRunResult } from "./scheduleClock.js";
+import { retireLegacySchedulers } from "./scheduleSettings.js";
+// startRequests makes its requests through this module; both sides only call each other inside functions.
+import { STATUS_ALIASES, statusSelection, storedStatusKeys } from "./startRequests.js";
 import { closeUpdateAccountRows, openRequestTasksQuietly, syncRequestTasksQuietly, taskLog, updateTaskKey } from "./syncTaskLog.js";
 
 /**
@@ -31,10 +36,19 @@ import { closeUpdateAccountRows, openRequestTasksQuietly, syncRequestTasksQuietl
  *                         Flipkart through the order API, or the page when the
  *                         API refuses the session or a unit — exactly what the
  *                         in-API update did, with progress on the request doc
- *   runUpdateSweep        (worker, scheduler tick) every 6 h all active units,
- *                         every 2 h the units Out for delivery — skipped while
- *                         a sweep of that kind is still open
+ *   runUpdateSweep        (worker, the shared schedule clock) a fixed time of
+ *                         "every active unit" (every 6 h) or of the
+ *                         out-for-delivery recheck (every 2 h) that this
+ *                         machine took: one request made under that lease —
+ *                         skipped while a sweep of that kind this machine
+ *                         made is still open
  *   legacyStatusView      the shape the dashboard's status panel already polls
+ *
+ * The schedules (services/scheduleClock.ts): the two sweeps run on the one
+ * clock every machine shares, not on a BullMQ scheduler per machine. A sweep's
+ * request carries `schedule { name, slotAt, token }`; its end gives the lease
+ * back, and an account job of a sweep another machine has taken over since
+ * ends before it calls Flipkart.
  *
  * Why the worker: the run survives an API restart, shares the per-account
  * lock with checkout / cancel / sync, and scales with the update windows
@@ -48,14 +62,43 @@ const LOG_KEEP = 300;
 /** Update reaper: how often it sweeps, and how long an open request must be quiet to count as stranded. */
 const UPDATE_REAP_EVERY_MS = 60 * 1000;
 const UPDATE_REAP_STALE_MS = 5 * 60 * 1000;
-/** Active-unit sweep / Out-for-delivery recheck periods (ms). */
+/**
+ * Active-unit sweep / Out-for-delivery recheck periods (ms) as this machine's .env has them. The periods in use are
+ * the clocks' (order_schedule_leases, written once by the first seed from these values); here they are only what
+ * GET /update/settings answers for a workspace that has no clock yet.
+ */
 export const UPDATE_SWEEP_MS = Math.max(15 * 60 * 1000, Number(process.env.UPDATE_SWEEP_MS) || 6 * 60 * 60 * 1000);
 export const UPDATE_OFD_SWEEP_MS = Math.max(15 * 60 * 1000, Number(process.env.UPDATE_OFD_SWEEP_MS) || 2 * 60 * 60 * 1000);
-export const UPDATE_SCHEDULE_ENABLED = String(process.env.UPDATE_SCHEDULE ?? "1") !== "0";
-/** Statuses the 2-hour recheck covers: the last mile, where the OTP and the delivery land. */
+/** The statuses the 2-hour recheck covers, as the reference names them: the last mile, where the OTP and the delivery land. */
 export const OFD_STATUSES = ["Out for delivery", "Dispatched"];
-/** A unit can only carry a delivery OTP while it is in one of these stages. */
+/** Those two as the page scraper writes them, wherever they stand in a status. */
 const OFD_RE = /out for delivery|dispatched/i;
+
+/**
+ * Every spelling those statuses are stored under, lower-cased. The page scraper wrote "Out for delivery"; the order
+ * API — what nearly every unit is read through since 2026-10 — writes "ofd". Which spellings are one status is kept
+ * in ONE place, STATUS_ALIASES (startRequests.ts, what the Update button's status filter reads), so the recheck's
+ * selection and the OTP pass below cannot fall behind it again.
+ */
+export function ofdStatusSpellings(): Set<string> {
+  return new Set(OFD_STATUSES.flatMap((label) => STATUS_ALIASES[label.toLowerCase()] || [label]).map((s) => s.toLowerCase()));
+}
+
+/** Is a unit in the last mile — the only stage it can carry a delivery OTP in? */
+export function isOutForDelivery(statusKey: string | null | undefined): boolean {
+  const key = String(statusKey || "").trim();
+  return Boolean(key) && (OFD_RE.test(key) || ofdStatusSpellings().has(key.toLowerCase()));
+}
+
+/**
+ * The status_key values the out-for-delivery recheck selects in this workspace: the labels resolved exactly as a
+ * status filter of the Update button is (STATUS_ALIASES, then the workspace's own spelling of each key).
+ */
+export async function ofdStatusKeys(userId: string): Promise<string[]> {
+  const keys = statusSelection(OFD_STATUSES, await storedStatusKeys(userId)).keys;
+  // Never empty: an update that names no status takes every active unit.
+  return keys.length ? keys : [...OFD_STATUSES];
+}
 /**
  * HTTP "windows" = accounts refreshed in parallel. In API mode each window is a
  * light HTTP context (tens of MB), so the cap is high; Chrome is separately gated
@@ -130,7 +173,17 @@ export interface PreparedUpdateUnit {
 export async function createUpdateRequest(
   userId: string,
   input: UpdateTriggerInput,
-  opts: { source?: UpdateSource; by?: string; params?: Record<string, unknown>; parentId?: string; units?: PreparedUpdateUnit[] } = {}
+  opts: {
+    source?: UpdateSource;
+    by?: string;
+    params?: Record<string, unknown>;
+    parentId?: string;
+    units?: PreparedUpdateUnit[];
+    /** A sweep of the shared clock: the fixed time and the lease claim it is made under (runUpdateSweep). */
+    schedule?: IUpdateSchedule;
+    /** The queue its account jobs go on — this machine's update queue unless a check passes its own. */
+    queue?: Queue<UpdateJobData>;
+  } = {}
 ) {
   const resolved = opts.units ? null : await resolveTargets(userId, input);
   const targets = opts.units
@@ -172,17 +225,24 @@ export async function createUpdateRequest(
     params: opts.params || {},
     parentId: String(opts.parentId || "").trim(),
     systemId: config.systemId,
+    ...(opts.schedule ? { schedule: opts.schedule } : {}),
     createdBy: String(opts.by || "").trim(),
     status: "queued",
     mode: mode.mode,
     windows: speed.windows,
     accounts: [...byAccount.values()],
-    logs: [{ time: new Date(), level: "info", message: `Update ${taken.size} unit(s) across ${byAccount.size} account(s) · ${speed.windows} window(s) · ${mode.mode === "api" ? "API mode (Chrome only on fallback)" : "Chrome"} · ${opts.source || "manual"}` }],
+    logs: [
+      {
+        time: new Date(),
+        level: "info",
+        message: `Update ${taken.size} unit(s) across ${byAccount.size} account(s) · ${speed.windows} window(s) · ${mode.mode === "api" ? "API mode (Chrome only on fallback)" : "Chrome"} · ${opts.source || "manual"}${opts.schedule && isScheduleName(opts.schedule.name) ? ` · ${SCHEDULE_LABELS[opts.schedule.name]}, the ${clockTime(opts.schedule.slotAt)} time, on ${config.hostId}` : ""}`,
+      },
+    ],
   });
   const requestId = String(request._id);
   // The task log: a row per unit, queued — written before a job can take one (services/syncTaskLog.ts).
   await openRequestTasksQuietly("update", request.toObject());
-  await getUpdateQueue().addBulk([...byAccount.keys()].map((email) => ({ name: "update", data: { requestId, email }, opts: { jobId: `${requestId}-${email}` } })));
+  await (opts.queue || getUpdateQueue()).addBulk([...byAccount.keys()].map((email) => ({ name: "update", data: { requestId, email }, opts: { jobId: `${requestId}-${email}` } })));
   console.log(`[orders-update] request ${requestId}: ${taken.size} unit(s) on ${byAccount.size} account(s) queued (${opts.source || "manual"})`);
   return publicUpdateRequest(request.toObject());
 }
@@ -236,6 +296,40 @@ export async function cancelUpdateRequest(userId: string, requestId?: string) {
   await pushLog(row._id, "warn", `Stopped by request — ${removed} account(s) removed from the queue; accounts already running finish their current unit`);
   await syncRequestTasksQuietly("update", String(row._id));
   return { id: String(row._id), removed };
+}
+
+/**
+ * A sweep of the shared clock that another machine has taken over since this
+ * one made it (this machine slept, or lost its network, in the middle of it):
+ * what has not started ends cancelled with who took over — "Superseded — Mac-2
+ * took over the update of all active units at 18:15" — and leaves the queue;
+ * an account being read finishes the unit in hand, as after a Stop (its job
+ * reads the request before the next unit). The request itself reads cancelled.
+ * False when it had already ended.
+ */
+export async function supersedeUpdateRequest(requestId: string, message: string, queue: Queue<UpdateJobData> = getUpdateQueue()): Promise<boolean> {
+  if (!Types.ObjectId.isValid(requestId)) return false;
+  const open = { $in: ["queued", "running"] };
+  const row = await OrderUpdateRequest.findOne({ _id: requestId, status: open }).select("accounts.email accounts.status").lean();
+  if (!row) return false;
+  const now = new Date();
+  const res = await OrderUpdateRequest.updateOne(
+    { _id: requestId, status: open },
+    { $set: { status: "cancelled", finishedAt: now, "accounts.$[a].status": "cancelled", "accounts.$[a].finishedAt": now, "accounts.$[a].message": message } },
+    { arrayFilters: [{ "a.status": "queued" }] }
+  );
+  // Another job of the same request got here first: it has said so and cleared the queue.
+  if (!res.modifiedCount) return false;
+  const waiting = row.accounts.filter((a) => a.status === "queued");
+  let removed = 0;
+  for (const acc of waiting) {
+    const job = await queue.getJob(`${requestId}-${acc.email}`).catch(() => null);
+    // The job that noticed is one of these and cannot be removed while it runs: it ends by itself.
+    if (job && (await job.remove().then(() => true, () => false))) removed++;
+  }
+  await pushLog(requestId, "warn", `${message} — ${waiting.length} account(s) that had not started are left to that machine (${removed} job(s) removed from the queue); an account being read finishes its current unit`);
+  await syncRequestTasksQuietly("update", requestId);
+  return true;
 }
 
 export async function getUpdateRequest(userId: string, requestId: string) {
@@ -426,12 +520,31 @@ async function settleRequest(requestId: Types.ObjectId | string, stopped = false
     if (row) {
       const pub = publicUpdateRequest(row);
       await pushLog(requestId, "info", `Update finished. ok ${pub.counts.done}, failed ${pub.counts.failed}, status changed ${pub.counts.statusChanged}, new OTP ${pub.counts.otpNew}`);
+      // A sweep of the shared clock: its lease is given back with how it went (the tick "finished — ok 926, failed 3").
+      await releaseSweepLease(row, `ok ${pub.counts.done}, failed ${pub.counts.failed}${pub.counts.statusChanged ? `, status changed ${pub.counts.statusChanged}` : ""}${pub.counts.otpNew ? `, new OTP ${pub.counts.otpNew}` : ""}`);
     }
     // The request has ended: its task rows are brought in line with it once, whole.
     await syncRequestTasksQuietly("update", String(requestId));
     // The reference's "Delivered check": one invoice fetch for the orders this update saw arrive at Delivered.
     await queueInvoicesAfterUpdate(String(requestId)).catch((err) => console.warn(`[chain] invoice fetch after update ${String(requestId).slice(-8)} failed: ${err instanceof Error ? err.message.split("\n")[0] : err}`));
   }
+}
+
+/**
+ * The request of a clock's sweep has ended: the lease it was made under is
+ * released, with the sentence of its last tick. Nothing happens when the lease
+ * is no longer this claim's (another machine took over; the clock had already
+ * released a request that Stop or Force clear closed). A release the database
+ * refuses is not lost: the clock's next look sees the closed request and
+ * releases it itself.
+ */
+async function releaseSweepLease(row: { _id: unknown; userId: unknown; schedule?: IUpdateSchedule | null }, reason: string): Promise<void> {
+  const s = row.schedule;
+  if (!s?.token || !isScheduleName(s.name)) return;
+  const id = String(row._id);
+  await releaseLease({ userId: String(row.userId), name: s.name, token: s.token }, { outcome: "finished", reason, runRef: { kind: "update", id } }).catch((err) =>
+    console.warn(`[orders-update] request ${id.slice(-8)}: its ${s.name} lease was not released (${err instanceof Error ? err.message.split("\n")[0] : err}) — the clock's next look releases it`)
+  );
 }
 
 /** My Orders: where the update's Chrome checks that the account is logged in before it opens any order. */
@@ -450,9 +563,27 @@ export interface UpdateJobDeps {
   /** Flipkart's order API (API mode): the session, and one unit's read. */
   openApi: typeof openOrderApiSession;
   apiRead: typeof apiScrapeAndSave;
+  /** One unit read from its order page, on the account's tab: the page fallback, and the OTP pass of out-for-delivery units. */
+  pageRead: typeof scrapeAndSave;
+  /** This machine's update queue. */
+  queue: () => Queue<UpdateJobData>;
+  /**
+   * A leftover job of the per-machine scheduler this queue had before the
+   * shared clock has arrived: the worker makes its schedule clock look (it
+   * runs a fixed time only when one is due and free). Nothing by default.
+   */
+  clockLook: () => Promise<void>;
 }
 
-const updateJobDefaults: UpdateJobDeps = { launch: launchStealthContext, lock: lockAccount, openApi: openOrderApiSession, apiRead: apiScrapeAndSave };
+const updateJobDefaults: UpdateJobDeps = {
+  launch: launchStealthContext,
+  lock: lockAccount,
+  openApi: openOrderApiSession,
+  apiRead: apiScrapeAndSave,
+  pageRead: scrapeAndSave,
+  queue: getUpdateQueue,
+  clockLook: async () => undefined,
+};
 
 /**
  * One account of an update request.
@@ -465,13 +596,24 @@ const updateJobDefaults: UpdateJobDeps = { launch: launchStealthContext, lock: l
  * Not logged in), its units end failed with one sentence and the account
  * stops. If it had read units already, nothing is handed off: only the page
  * work left is skipped.
+ *
+ * A sweep of the shared clock (the request carries `schedule`): when another
+ * machine has taken that schedule over since — this one slept in the middle
+ * of its sweep — the account, and with it everything the request had left,
+ * ends "Superseded — …" before the account is locked, its session looked up
+ * or Flipkart called.
  */
 export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string | undefined, overrides: Partial<UpdateJobDeps> = {}): Promise<void> {
+  const deps: UpdateJobDeps = { ...updateJobDefaults, ...overrides };
   if (job.name === "sweep") {
-    await runUpdateSweep(job.data.sweep === "ofd" ? "ofd" : "active");
+    // A job of the per-machine BullMQ scheduler this queue had before the shared clock: one that was already waiting
+    // when the worker moved over, or whose scheduler could not be removed then. It never runs a sweep by itself — the
+    // scheduler is removed again and the clock looks, which runs a fixed time only when it is due and free.
+    console.log(`[orders-update] a leftover ${job.data.sweep === "ofd" ? "out-for-delivery" : "active-units"} scheduler job — no sweep is run from it, the shared clock decides`);
+    await retireUpdateSchedulers(deps.queue());
+    await deps.clockLook();
     return;
   }
-  const deps: UpdateJobDeps = { ...updateJobDefaults, ...overrides };
   const { requestId, email } = job.data;
   const request = await OrderUpdateRequest.findById(requestId).lean();
   if (!request || request.status === "cancelled") return;
@@ -480,6 +622,21 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
   if (!account) return;
   const stale = account.status === "running" && (!account.startedAt || Date.now() - new Date(account.startedAt).getTime() > STALE_ACCOUNT_MS);
   if (account.status !== "queued" && !stale) return;
+
+  // One read of the lease, and only for a clock's sweep: has another machine taken this schedule since the request
+  // was made? Then this is work left over on a machine that was away, and the other machine is doing it.
+  const sweep = request.schedule;
+  if (sweep?.token && isScheduleName(sweep.name)) {
+    const taker = await supersededBy(String(request.userId), { name: sweep.name, token: sweep.token });
+    if (taker) {
+      const message = supersededText(sweep.name, taker, taker.at);
+      await supersedeUpdateRequest(requestId, message, deps.queue());
+      // An account an earlier worker left "running" was not waiting: closed the same way, here.
+      if (account.status !== "queued") await setAccount(requestId, me, { status: "cancelled", finishedAt: new Date(), message });
+      await closeUpdateAccountRows(requestId, me, { status: "cancelled", message });
+      return;
+    }
+  }
 
   const unlock = await deps.lock(me, `update:${requestId}:${config.workerId}`);
   if (!unlock) {
@@ -620,17 +777,17 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
                 // "— page" alone is no failure yet (the page may read it); "— page skipped" is this unit's failure.
                 await log("warn", `${u.orderId}/${u.unitId}: API read failed (${apiErr instanceof Error ? apiErr.message.slice(0, 140) : apiErr}) — ${pageDead ? "page skipped" : "page"}`);
               }
-              result = await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
+              result = await deps.pageRead(await openPage(), userId, acct, card, { applyCalendar: false });
               usedPage = true;
             }
           } else {
-            result = await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
+            result = await deps.pageRead(await openPage(), userId, acct, card, { applyCalendar: false });
             usedPage = true;
           }
           const after = await snapshotUnit(userId, u.unitId);
-          // Read over HTTP, out for delivery, still no OTP → the OTP is page-only here.
-          // Defer to Phase 2 rather than opening Chrome mid-loop.
-          if (!usedPage && after && OFD_RE.test(after.status_key || "") && !after.delivery_otp) {
+          // Read over HTTP, out for delivery (under either spelling: the API stores "ofd"), still no OTP → the OTP is
+          // page-only here. Defer to Phase 2 rather than opening Chrome mid-loop.
+          if (!usedPage && after && isOutForDelivery(after.status_key) && !after.delivery_otp) {
             needsScrape.push(u);
           }
           // Stage changes (not a vocabulary swap between the API's "Approved" and the page's
@@ -695,7 +852,8 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
       // Only OFD units the API couldn't give an OTP for. One browser (gated), each
       // unit already counted as `done` in Phase 1, so here we pick up only the OTP
       // (and any stage move the page reveals) without re-counting. Not on a page
-      // that is already dead.
+      // that is already dead. A unit whose page shows no OTP either (cash on
+      // delivery often has none) is simply left as the API read it: no failure.
       if (needsScrape.length && !pageDead) {
         await log("info", `${needsScrape.length} out-for-delivery unit(s) without an API OTP — scraping those for OTP`);
         for (let k = 0; k < needsScrape.length; k++) {
@@ -705,7 +863,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           const card = { orderId: u.orderId, itemId: u.itemId, unitId: u.unitId, orderUrl: u.orderUrl, amount: "" };
           try {
             const before = await snapshotUnit(userId, u.unitId);
-            await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
+            await deps.pageRead(await openPage(), userId, acct, card, { applyCalendar: false });
             const after = await snapshotUnit(userId, u.unitId);
             const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
             if (changes.stageChanged && stageOf(after?.status_key) === "delivered") await noteDeliveredOrder(requestId, u.orderId);
@@ -768,47 +926,116 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
 
 // ── schedules ───────────────────────────────────────────────────────────────
 
+/** "the 25 Nov 12:15 request 1a2b3c4d" needs both: a request by the last 8 characters of its id, as Batch requests shows it. */
+const shortRequest = (id: unknown) => String(id).slice(-8);
+
 /**
- * One tick of a schedule. The workspace is single (TRADE_FLOW_USER_ID); a tick
- * is skipped while an earlier request of the same source is still open, so a
- * slow night never stacks sweeps on top of each other.
+ * One fixed time of a sweep, taken by this machine's schedule clock (`claim`,
+ * services/scheduleClock.ts) — "active": every active unit, every 6 h; "ofd":
+ * the units out for delivery, every 2 h. Makes ONE update request, under the
+ * claim: the request carries `schedule { name, slotAt, token }`, its params
+ * say which schedule, which time and which machine, and the lease follows it
+ * until it ends (settleRequest gives the lease back).
+ *
+ * What it answers is the time's tick:
+ *   { runRef }   the request was made — "ran on Mac — 926 unit(s) on 402 account(s)"
+ *   { done }     no unit to refresh — "ran on Mac — nothing to refresh"
+ *   { skipped }  an earlier request of this kind that THIS machine made is
+ *                still open (the update after a nightly fetch counts: it is a
+ *                "schedule" request too), or the lease went to another machine
+ *                before the request could be made
+ *   throws       anything else — "failed — could not start: …"
+ * A request of the same kind another machine left open does not hold it up:
+ * this time could only be taken because that machine's lease had run out. It
+ * is named in the tick and left to that machine, whose own jobs end it as
+ * superseded when it comes back.
  */
-export async function runUpdateSweep(kind: "active" | "ofd"): Promise<void> {
-  const userId = workspaceUserId();
+export async function runUpdateSweep(kind: "active" | "ofd", claim: ScheduleClaim, overrides: { queue?: Queue<UpdateJobData> } = {}): Promise<ScheduleRunResult> {
+  const userId = claim.userId;
+  const name: ScheduleName = kind === "ofd" ? "update_ofd" : "update_active";
   const source: UpdateSource = kind === "ofd" ? "ofd" : "schedule";
-  const open = await OrderUpdateRequest.findOne({ userId, source, status: { $in: ["queued", "running"] } }).select("_id createdAt").lean();
-  if (open) {
-    console.log(`[orders-update] ${kind} sweep skipped — request ${String(open._id)} from ${open.createdAt?.toISOString()} still open`);
-    return;
+  const open = await OrderUpdateRequest.find({ userId, source, status: { $in: ["queued", "running"] } })
+    .select("_id createdAt systemId params.ran_on")
+    .sort({ createdAt: 1 })
+    .lean();
+  const mine = open.find((r) => (r.systemId || "") === config.systemId);
+  if (mine) {
+    console.log(`[orders-update] ${kind} sweep skipped — request ${String(mine._id)} from ${mine.createdAt?.toISOString()} still open`);
+    return { skipped: true, reason: `request ${shortRequest(mine._id)} from ${clockStamp(mine.createdAt)} is still open on this machine` };
   }
+  // The claim once more, now that the reads are done: a machine that fell asleep between taking the time and this
+  // line must not start a sweep another machine has taken over meanwhile.
+  if (!(await renewLease(claim))) {
+    console.log(`[orders-update] ${kind} sweep skipped — the lease went to another machine before the request was made`);
+    return { skipped: true, reason: "the lease went to another machine before the sweep started" };
+  }
+  const left = open.map((r) => `${String((r.params as { ran_on?: unknown } | undefined)?.ran_on || r.systemId || "another machine")}'s request ${shortRequest(r._id)} from ${clockStamp(r.createdAt)} is still open and is left to that machine`);
+  const withLeft = (text: string) => [text, ...left].join(" · ");
   try {
-    const input: UpdateTriggerInput = kind === "ofd" ? { orderStatus: OFD_STATUSES, selectionMethod: "schedule_ofd" } : { selectionMethod: "schedule_active" };
+    const keys = kind === "ofd" ? await ofdStatusKeys(userId) : [];
+    const input: UpdateTriggerInput = kind === "ofd" ? { orderStatus: keys, selectionMethod: "schedule_ofd" } : { selectionMethod: "schedule_active" };
     const req = await createUpdateRequest(userId, input, {
       source,
       by: "schedule",
-      // "All active" names no status: it records the in-progress list it stands for — the schedule's own rule, which leaves Returned out.
-      params: { platform: "FLIPKART", selection_method: input.selectionMethod, force: false, statuses_to_update: input.orderStatus || DEFAULT_UPDATE_STATUSES.filter((s) => s !== "Returned"), status_keys: input.orderStatus || [], email_ids_count: 0, order_ids_count: 0, order_email_pairs_count: 0 },
+      params: {
+        platform: "FLIPKART",
+        selection_method: input.selectionMethod,
+        force: false,
+        // "All active" names no status: it records the in-progress list it stands for — the schedule's own rule, which
+        // leaves Returned out. The recheck records its two labels, and the keys they are stored under here.
+        statuses_to_update: kind === "ofd" ? [...OFD_STATUSES] : DEFAULT_UPDATE_STATUSES.filter((s) => s !== "Returned"),
+        status_keys: keys,
+        email_ids_count: 0,
+        order_ids_count: 0,
+        order_email_pairs_count: 0,
+        // Which schedule, which fixed time (India time) and which machine: Batch requests shows them as "Schedule".
+        schedule_name: name,
+        schedule_slot: slotStamp(claim.slotAt),
+        ran_on: config.hostId,
+        attempt: claim.attempt,
+      },
+      schedule: { name, slotAt: claim.slotAt, token: claim.token },
+      queue: overrides.queue,
     });
-    console.log(`[orders-update] ${kind} sweep → request ${req.id}: ${req.counts.units} unit(s) on ${req.counts.accounts} account(s)`);
+    console.log(`[orders-update] ${kind} sweep (${clockTime(claim.slotAt)}) → request ${req.id}: ${req.counts.units} unit(s) on ${req.counts.accounts} account(s)`);
+    return { runRef: { kind: "update", id: req.id }, reason: withLeft(`${req.counts.units} unit(s) on ${req.counts.accounts} account(s)`) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (/No active order units/.test(msg)) console.log(`[orders-update] ${kind} sweep: nothing to refresh`);
-    else console.warn(`[orders-update] ${kind} sweep failed: ${msg}`);
+    if (/No active order units/.test(msg)) {
+      console.log(`[orders-update] ${kind} sweep (${clockTime(claim.slotAt)}): nothing to refresh`);
+      return { done: true, reason: withLeft(kind === "ofd" ? "nothing out for delivery" : "nothing to refresh") };
+    }
+    console.warn(`[orders-update] ${kind} sweep failed: ${msg}`);
+    throw err;
   }
 }
 
-/** Idempotent: one schedule each in Redis however many workers run. */
-export async function ensureUpdateSchedules(): Promise<void> {
-  const queue = getUpdateQueue();
-  if (!UPDATE_SCHEDULE_ENABLED) {
-    await queue.removeJobScheduler("order-update-active").catch(() => undefined);
-    await queue.removeJobScheduler("order-update-ofd").catch(() => undefined);
-    console.log("[orders-update] schedules disabled (UPDATE_SCHEDULE=0)");
-    return;
-  }
-  await queue.upsertJobScheduler("order-update-active", { every: UPDATE_SWEEP_MS }, { name: "sweep", data: { requestId: "", email: "", sweep: "active" }, opts: { attempts: 1 } });
-  await queue.upsertJobScheduler("order-update-ofd", { every: UPDATE_OFD_SWEEP_MS }, { name: "sweep", data: { requestId: "", email: "", sweep: "ofd" }, opts: { attempts: 1 } });
-  console.log(`[orders-update] schedules: all active units every ${Math.round(UPDATE_SWEEP_MS / 60000)} min, Out for delivery every ${Math.round(UPDATE_OFD_SWEEP_MS / 60000)} min`);
+/**
+ * A sweep as the worker's schedule clock runs it. `supersede`: another machine
+ * took the schedule over while this one was away — the request this machine
+ * made for it stops (supersedeUpdateRequest). A request the clock no longer
+ * knows of (the worker was restarted since) is caught by its own account jobs.
+ */
+export function updateSweepRunner(kind: "active" | "ofd", overrides: { queue?: Queue<UpdateJobData> } = {}): ScheduleRunner {
+  return {
+    run: (claim) => runUpdateSweep(kind, claim, overrides),
+    supersede: async (info) => {
+      if (info.runRef?.kind !== "update") return;
+      await supersedeUpdateRequest(info.runRef.id, supersededText(info.name, info.by, info.at), overrides.queue);
+    },
+  };
+}
+
+/**
+ * (worker, update role, at start) The two BullMQ job schedulers this queue had
+ * before the shared clock — order-update-active and order-update-ofd — leave
+ * this machine's Redis, each with its next delayed job. Always: whether a
+ * sweep runs is the switch in Settings, and whether this machine may run it
+ * its .env (services/scheduleSettings.ts); neither is this queue's business
+ * any more.
+ */
+export async function retireUpdateSchedulers(queue?: Queue<UpdateJobData>): Promise<string[]> {
+  return retireLegacySchedulers(["update_active", "update_ofd"], queue ? { update: () => queue, invoice: () => queue } : undefined);
 }
 
 // ── update reaper ─────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import mongoose, { Schema, type Types } from "mongoose";
+import type { ScheduleName } from "./ScheduleLease.js";
 
 /**
  * One "Update Order Units" run: who asked (a person, the 6-hour schedule, the
@@ -52,6 +53,24 @@ export interface IUpdateLog {
   message: string;
 }
 
+/**
+ * The fixed time of a schedule this request is the work of (services/scheduleClock.ts).
+ * Only a sweep the shared clock started carries it: the update after a nightly fetch, a
+ * retry and everything a person starts do not.
+ */
+export interface IUpdateSchedule {
+  /** update_active (every active unit) or update_ofd (the out-for-delivery recheck). */
+  name: ScheduleName;
+  /** The fixed time that was taken. */
+  slotAt: Date | null;
+  /**
+   * The lease claim the sweep was started under: what gives the lease back when the request ends, and what an
+   * account job compares with the lease before it calls Flipkart — a sweep another machine has taken over since
+   * ends there. Never sent to the dashboard.
+   */
+  token: string;
+}
+
 export interface IOrderUpdateRequest {
   userId: Types.ObjectId;
   source: UpdateSource;
@@ -75,6 +94,8 @@ export interface IOrderUpdateRequest {
    * check" (services/requestChains.ts).
    */
   deliveredOrderIds: string[];
+  /** Set on a sweep of the shared clock only (IUpdateSchedule); missing on every other request. */
+  schedule?: IUpdateSchedule | null;
   createdBy: string;
   status: "queued" | "running" | "done" | "cancelled";
   mode: "scrape" | "api";
@@ -125,6 +146,15 @@ const LogSchema = new Schema<IUpdateLog>(
   { _id: false }
 );
 
+const UpdateScheduleSchema = new Schema<IUpdateSchedule>(
+  {
+    name: { type: String, required: true },
+    slotAt: { type: Date, default: null },
+    token: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
 const OrderUpdateRequestSchema = new Schema<IOrderUpdateRequest>(
   {
     userId: { type: Schema.Types.ObjectId, required: true, index: true },
@@ -134,6 +164,8 @@ const OrderUpdateRequestSchema = new Schema<IOrderUpdateRequest>(
     parentId: { type: String, default: "" },
     systemId: { type: String, default: "" },
     deliveredOrderIds: { type: [String], default: [] },
+    // No default: a request that is not a clock's sweep has no such path at all.
+    schedule: { type: UpdateScheduleSchema, default: undefined },
     createdBy: { type: String, default: "" },
     status: { type: String, enum: ["queued", "running", "done", "cancelled"], default: "queued" },
     mode: { type: String, enum: ["scrape", "api"], default: "api" },

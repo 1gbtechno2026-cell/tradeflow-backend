@@ -5,7 +5,8 @@ import { connectDb, dbState } from "./db.js";
 import { jobsRouter } from "./routes/jobs.js";
 import { testRouter } from "./routes/test.js";
 import { orderFetchRouter } from "./routes/orderFetch.js";
-import { startFetchSchedule } from "./services/orderFetchSchedule.js";
+import { startFetchScheduleClock } from "./services/orderFetchSchedule.js";
+import { seedSchedulesAtStart } from "./services/scheduleSettings.js";
 import { closeInterruptedFetchRuns } from "./services/orderJobRuns.js";
 import { startInvoiceRequestWatchdog } from "./services/invoiceRequests.js";
 import { startCouponRequestWatchdog } from "./services/couponRequests.js";
@@ -109,13 +110,18 @@ async function main() {
     console.log(`[trade-flow] ${stamp()} API listening on http://0.0.0.0:${config.port}`);
     console.log(`[trade-flow] Submit Order should show: --> POST /api/jobs`);
   });
-  // Scheduled Fetch (FETCH_SCHEDULE); off unless set.
-  startFetchSchedule();
-  startQueueMetrics();
-  // A fetch lives in this process: a fetch row an earlier process of this machine left open is closed.
-  void closeInterruptedFetchRuns(hostName(), process.pid)
+  // The schedules' switches and clocks (Settings → Scheduled fetch): what this workspace does not have yet is written
+  // once, here or at the worker's start, whichever comes first — a switch somebody set is never touched.
+  await seedSchedulesAtStart(config.userId);
+  // A fetch lives in this process: a fetch row an earlier process of this machine left open is closed — before the
+  // clock below looks, so a nightly fetch that died with that process reads "failed" and may be started once more.
+  await closeInterruptedFetchRuns(hostName(), process.pid)
     .then((n) => n && console.log(`[trade-flow] closed ${n} fetch run(s) an earlier API process left open`))
     .catch(() => undefined);
+  // The nightly fetch, on the shared schedule clock (services/scheduleClock.ts): this process serves it whether or
+  // not this machine may run it (FETCH_SCHEDULE in the .env only says that) — whether it runs is the switch in Settings.
+  startFetchScheduleClock();
+  startQueueMetrics();
   // Invoice and coupon batches run on the worker's own queues; a request no worker takes
   // (one started before those queues existed) is failed with "restart the worker".
   startInvoiceRequestWatchdog();

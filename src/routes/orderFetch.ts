@@ -1,5 +1,5 @@
 import { downloadInvoicesByOrderId, parseOrderIds } from "../services/invoiceOnDemand.js";
-import { getInvoiceQueue } from "../queue.js";
+import { queueManualSweep } from "../services/invoiceSweep.js";
 import { Router, type Response } from "express";
 import { config } from "../config.js";
 import { workspaceUserId } from "../services/sessionStore.js";
@@ -16,6 +16,8 @@ import { abortRescheduleRequest, getRescheduleRequest, listRescheduleRequests, p
 import { proxyModeStatus, setProxyMode } from "../services/proxyMode.js";
 import { finishRun, listRuns, startRun, syncPanel } from "../services/orderJobRuns.js";
 import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays, setScheduledInvoices } from "../services/orderFetchSchedule.js";
+import { changeSchedule, eligibleHere, scheduleOverview, scheduleStatuses } from "../services/scheduleSettings.js";
+import { Types } from "mongoose";
 import { liveProbes } from "../services/requestLogLive.js";
 import { retryBatch, stopBatch } from "../services/syncActions.js";
 import { batchIssues, getBatch, listBatches, listTasks } from "../services/syncBatches.js";
@@ -30,7 +32,6 @@ import {
   resolveUpdateWindows,
   setUpdateWindows,
   UPDATE_OFD_SWEEP_MS,
-  UPDATE_SCHEDULE_ENABLED,
   UPDATE_SWEEP_MS,
   WINDOW_LIMITS,
 } from "../services/orderUpdateQueue.js";
@@ -197,13 +198,53 @@ orderFetchRouter.put("/fetch/schedule", async (req, res) => {
   }
 });
 
-/** Run the scheduled fetch now (same selection and look-back; the row shows system-cron). Body: { by? } */
+/**
+ * Run the scheduled fetch now (same selection and look-back; the row shows system-cron). Body: { by? }
+ * It takes the nightly fetch's lease by hand, so it works whatever the switch says and on a machine the schedule never
+ * uses. 202 { started: true, message, emails, sinceDays, invoices, runId }. 409 { started: false, message, error }
+ * when nothing was started: a fetch is already running here or on another machine, no logged-in Platform ID, it could
+ * not start — or another machine holds the lease (`code: "held_elsewhere"`, `holder`): "The nightly fetch is running
+ * on <host> since <time>". `error` repeats `message`: it is the key the dashboard's proxy reads on a refusal.
+ */
 orderFetchRouter.post("/fetch/schedule/run", async (req, res) => {
   try {
     const out = await runScheduledFetch(userIdFrom(req), String(req.body?.by || "").trim() || "run now");
-    res.status(out.started ? 202 : 409).json(out);
+    res.status(out.started ? 202 : 409).json(out.started ? out : { ...out, error: out.message });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : "Could not run the scheduled fetch" });
+  }
+});
+
+/**
+ * The four schedules — nightly fetch, update of all active units, out-for-delivery recheck, invoice sweep:
+ *   GET /schedules → { timezone, now, here: { systemId, host, eligible }, machines: [{ id, systemId, role, host,
+ *       serves, eligible, seenAt, up }], schedules: [{ name, label, role, on, source, changedBy, changedAt,
+ *       eligibleHere, clock, nextAt, overdue, armedAt, lease, lastRun, lastTick, ticks (newest 20), servedOn,
+ *       runnableOn, legacy, state, note }] }
+ * `on` is the switch in the database, shared by every machine; a machine's .env only says whether it MAY run a
+ * schedule (`here.eligible`, each machine's `eligible`). `state` / `note` say where a schedule stands in one word and
+ * one sentence. Built by services/scheduleSettings.ts.
+ */
+orderFetchRouter.get("/schedules", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim() || workspaceUserId();
+    res.json(await scheduleOverview(userId));
+  } catch (err) {
+    sendError(res, err, "Could not read the schedules", 500);
+  }
+});
+
+/**
+ * Switch a schedule on or off, and/or choose the machine that runs it when it is awake. Body:
+ *   { on?: boolean, preferSystemId?: string ("" = no preference), by? }
+ * A switch changes the next time; a run in progress finishes. 400 for a name that is not a schedule, an `on` that is
+ * not true / false, or nothing to save — before anything is written. Answers what GET /schedules answers.
+ */
+orderFetchRouter.put("/schedules/:name", async (req, res) => {
+  try {
+    res.json(await changeSchedule(userIdFrom(req), req.params.name, req.body));
+  } catch (err) {
+    sendError(res, err, "Could not save the schedule");
   }
 });
 
@@ -387,12 +428,20 @@ orderFetchRouter.post("/invoices/download", async (req, res) => {
   }
 });
 
-/** Start the time-settled invoice sweep (the "Invoices" button). Enqueues one job; the worker runs it and the Sync panel shows it. */
+/**
+ * Start the time-settled invoice sweep ("Capture newly delivered now"). Body: { by? }. Enqueues one job; the worker
+ * runs it and the Sync panel shows it. It takes the invoice sweep's lease by hand, so it works whatever the switch
+ * says. 409 { error, code: "held_elsewhere", holder } while another machine holds the lease: "The invoice sweep is
+ * running on <host> since <time>". While this machine is sweeping, the job waits behind that sweep, as it always did.
+ */
 orderFetchRouter.post("/invoices/sweep", async (req, res) => {
   try {
-    const by = String(req.body?.by || "").trim();
-    await getInvoiceQueue().add("sweep", { sweep: "manual", by }, { attempts: 1 });
-    res.json({ message: "Invoice sweep queued" });
+    const out = await queueManualSweep(userIdFrom(req), String(req.body?.by || "").trim());
+    if (!out.ok) {
+      res.status(out.status).json({ error: out.message, code: out.code, holder: out.holder });
+      return;
+    }
+    res.json({ message: out.message });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Could not start the invoice sweep" });
   }
@@ -539,11 +588,37 @@ orderFetchRouter.post("/update/requests/:id/abort", async (req, res) => {
   }
 });
 
-/** Update speed and schedules. PUT body: { windows, by? } — applies to the next job, no restart. */
+/**
+ * Update speed and schedules. PUT body: { windows, by? } — applies to the next job, no restart.
+ * `schedule.enabled` is the "Update all active units" switch and `ofdEnabled` the out-for-delivery one (GET /schedules
+ * has both in full); the periods and next times are the clocks', and `eligibleHere` says whether this machine's .env
+ * lets it run them.
+ * It answers 200 whenever the speed card can be drawn, as it did before the clock: for a userId that is not a workspace
+ * id, or when the schedule read fails, the schedule part reads off with the .env periods and no next times.
+ */
 orderFetchRouter.get("/update/settings", async (req, res) => {
   const userId = String(req.query.userId || "").trim() || workspaceUserId();
-  const speed = await resolveUpdateWindows(userId);
-  res.json({ ...speed, limits: WINDOW_LIMITS, schedule: { enabled: UPDATE_SCHEDULE_ENABLED, activeEveryMs: UPDATE_SWEEP_MS, ofdEveryMs: UPDATE_OFD_SWEEP_MS } });
+  const [speed, sched] = await Promise.all([
+    resolveUpdateWindows(userId),
+    Types.ObjectId.isValid(userId) ? scheduleStatuses(userId, ["update_active", "update_ofd"]).catch(() => null) : Promise.resolve(null),
+  ]);
+  const everyMs = (name: "update_active" | "update_ofd", fallback: number) => {
+    const clock = sched?.[name].clock;
+    return clock?.kind === "every" ? clock.everyMin * 60_000 : fallback;
+  };
+  res.json({
+    ...speed,
+    limits: WINDOW_LIMITS,
+    schedule: {
+      enabled: sched?.update_active.on ?? false,
+      ofdEnabled: sched?.update_ofd.on ?? false,
+      activeEveryMs: everyMs("update_active", UPDATE_SWEEP_MS),
+      ofdEveryMs: everyMs("update_ofd", UPDATE_OFD_SWEEP_MS),
+      activeNextAt: sched?.update_active.nextAt ?? null,
+      ofdNextAt: sched?.update_ofd.nextAt ?? null,
+      eligibleHere: sched?.update_active.eligibleHere ?? eligibleHere("update_active"),
+    },
+  });
 });
 
 orderFetchRouter.put("/update/settings", async (req, res) => {

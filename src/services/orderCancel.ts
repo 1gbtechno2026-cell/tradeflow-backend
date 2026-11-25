@@ -618,13 +618,16 @@ export function startCancelReaper() {
  * getCancelRequest (one request) when a row is opened.
  */
 export async function listCancelRequests(userId: string, limit = 20) {
+  // An aggregate's stages are not cast by Mongoose: the stored userId is an ObjectId, so a string here matches nothing.
+  if (!Types.ObjectId.isValid(userId)) return [];
+  const workspace = new Types.ObjectId(userId);
   const n = (status: string, field = "units") => ({ $size: { $filter: { input: { $ifNull: [`$${field}`, []] }, as: "x", cond: { $eq: ["$$x.status", status] } } } });
   const rows = await CancelRequest.aggregate<{
     _id: unknown; type: string; dryRun?: boolean; urgent?: boolean; createdBy?: string; retryOf?: string; status: string; createdAt?: Date; finishedAt?: Date | null;
     total: number; queued: number; running: number; cancelled: number; notCancellable: number; failed: number; dryRunUnits: number; rejected: number;
     ordersTotal: number; ordersQueued: number; ordersRunning: number; ordersRead: number; ordersFailed: number;
   }>([
-    { $match: { userId } },
+    { $match: { userId: workspace } },
     { $sort: { createdAt: -1 } },
     { $limit: Math.min(100, Math.max(1, limit)) },
     {

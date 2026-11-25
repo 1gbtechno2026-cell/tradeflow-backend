@@ -11,7 +11,11 @@
  * whole of services/invoiceRequests.ts. What is stubbed: order → account
  * (invented accounts), the session (a bare HTTP context), and the download —
  * it asks a local fake Flipkart that plays 200 PDF / 404 / 429 / 500 / 401 /
- * an HTML page, and stores nothing. The ledger is written to a throwaway
+ * an HTML page, and stores nothing — it records the store options the batch
+ * passes (path "batch", the request's id, never skipIfUnchanged) in the task's
+ * parts, and plays a store failure of our own (S3, ECONNRESET) for *-S3 orders.
+ * Mongo is connected with autoIndex / autoCreate off (no index of a model this
+ * check imports is built on Atlas from here). The ledger is written to a throwaway
  * collection with the real schema, dropped at the end.
  *
  *   npm run test:invoice-batch
@@ -40,7 +44,8 @@ import {
 } from "../services/invoiceRequests.js";
 import type { InvoiceTarget } from "../services/invoiceOnDemand.js";
 import { OrderApiError } from "../services/orderApi.js";
-import { clearWorkerHeartbeat, emptyCounts, RequestInputError, startWorkerHeartbeat, WORKER_NOT_PICKED_UP, workerAlive } from "../services/requestCommon.js";
+import { markStoreError } from "../services/invoiceOriginals.js";
+import { clearWorkerHeartbeat, emptyCounts, ERROR_CLASSES, RequestInputError, startWorkerHeartbeat, WORKER_NOT_PICKED_UP, workerAlive } from "../services/requestCommon.js";
 import { OrderSyncTask } from "../models/OrderSyncTask.js";
 import { logCounts } from "../services/syncTaskLog.js";
 
@@ -73,12 +78,15 @@ function stubs(queueName: string, ledgerCollection: string, origin: string): Par
     },
     openSession: async (accountId) => (accountId === "verify-acct-nosession" ? null : playwrightRequest.newContext()),
     // The real download's own checks (invoiceCapture.downloadInvoiceViaApi), against the fake; nothing is stored.
-    download: async (ctx, target) => {
+    download: async (ctx, target, opts) => {
       const res = await ctx.get(`${origin}/api/1/self-serve/invoice/download/${target.orderId}`, { timeout: 20_000 });
       if (!res.ok()) throw new OrderApiError(`invoice download for ${target.orderId} answered HTTP ${res.status()}`, res.status(), "");
       const body = await res.body();
       if (body.subarray(0, 4).toString("latin1") !== "%PDF") throw new Error(`invoice download for ${target.orderId} is neither PDF nor zip (${res.headers()["content-type"] || "?"}, ${body.length} bytes)`);
-      return { size: body.length, parts: ["product"] };
+      // The store failed on our side after Flipkart answered (what storeInvoiceDownload marks): a network code in it.
+      if (target.orderId.endsWith("-S3")) throw markStoreError(new Error(`raw PUT raw/${target.orderId}.pdf: write ECONNRESET`));
+      // What the batch asked the store to do, read back from the task (sub-step 12: path, request id, no skip).
+      return { size: body.length, parts: ["product", `store:${opts?.path ?? "-"}:${opts?.requestId ?? "-"}:${opts?.skipIfUnchanged === undefined ? "-" : String(opts.skipIfUnchanged)}`] };
     },
   };
 }
@@ -87,7 +95,7 @@ function stubs(queueName: string, ledgerCollection: string, origin: string): Par
 
 async function workerMain() {
   const queueName = String(process.env.VERIFY_QUEUE);
-  await mongoose.connect(config.mongoUri, { serverSelectionTimeoutMS: 15_000 });
+  await mongoose.connect(config.mongoUri, { autoIndex: false, autoCreate: false, serverSelectionTimeoutMS: 15_000 });
   const deps = stubs(queueName, String(process.env.VERIFY_LEDGER), String(process.env.VERIFY_ORIGIN));
   const worker = createInvoiceBatchWorker(Number(process.env.VERIFY_CONCURRENCY) || 4, (job) => runInvoiceBatchJob(job, deps), { queueName, lockDuration: 4000, stalledInterval: 2000 });
   worker.on("failed", (job, err) => console.log(`job ${job?.id} failed: ${err.message}`));
@@ -128,7 +136,7 @@ async function driverMain() {
   const queueName = `verify-invoice-batch-${tag}`;
   const ledgerCollection = `order_job_runs_verify_${tag}`;
   const userId = String(new Types.ObjectId()); // a workspace that does not exist
-  await mongoose.connect(config.mongoUri, { serverSelectionTimeoutMS: 15_000 });
+  await mongoose.connect(config.mongoUri, { autoIndex: false, autoCreate: false, serverSelectionTimeoutMS: 15_000 });
 
   // The fake Flipkart: the invoice download, answering by the order id's suffix.
   const hits = new Map<string, number>();
@@ -291,7 +299,7 @@ async function driverMain() {
       "ODV-A2-1-OK", "ODV-A2-2-NA", "ODV-A2-3-OK", "ODV-A2-4-OK",
       "ODV-A3-1-OK", "ODV-A3-2-DOWN", "ODV-A3-3-HTML", "ODV-A3-4-OK",
       "ODV-A4-1-OK", "ODV-A4-2-DEAD", "ODV-A4-3-OK", "ODV-A4-4-OK",
-      "ODV-A5-1-RL", "ODV-A5-2-OK",
+      "ODV-A5-1-RL", "ODV-A5-2-OK", "ODV-A5-3-S3",
       "ODV-NOSESSION-1-OK", "ODV-NOSESSION-2-OK",
       "ODX-NOT-OURS-1", "ODX-NOT-OURS-2",
     ];
@@ -326,6 +334,8 @@ async function driverMain() {
         "ODV-A4-4-OK": ["failed", "not_logged_in", "Account is not logged in"],
         "ODV-A5-1-RL": ["failed", "rate_limited", "Platform is limiting requests; try again later"],
         "ODV-A5-2-OK": ["success", "", ""],
+        // A failure of our own storage carrying ECONNRESET: ours (internal_error), never "Platform did not respond".
+        "ODV-A5-3-S3": ["failed", "internal_error", ERROR_CLASSES.internal_error],
         "ODV-NOSESSION-1-OK": ["failed", "not_logged_in", "Account is not logged in"],
         "ODV-NOSESSION-2-OK": ["failed", "not_logged_in", "Account is not logged in"],
         "ODX-NOT-OURS-1": ["failed", "order_not_found", "Order not found on this account"],
@@ -336,16 +346,16 @@ async function driverMain() {
         assert.ok(t.finishedAt instanceof Date, `${orderId} has no finish time`);
       }
       const ok = taskOf(done, "ODV-A1-1-OK");
-      assert.deepEqual(ok.parts, ["product"]);
+      assert.deepEqual(ok.parts, ["product", `store:batch:${b.request_id}:-`], "the batch stores with path 'batch', its request id and no skipIfUnchanged");
       assert.ok(ok.startedAt instanceof Date && ok.finishedAt! >= ok.startedAt);
       assert.equal(taskOf(done, "ODV-A2-2-NA").detail, "invoice download for ODV-A2-2-NA answered HTTP 404");
       assert.match(taskOf(done, "ODV-A3-3-HTML").detail, /neither PDF nor zip \(text\/html/);
     });
-    await check("the counts match the tasks: 11 downloaded, 11 failed, nothing left", () => {
-      assert.deepEqual({ ...done.counts }, { total: 22, queued: 0, in_progress: 0, success: 11, failed: 11, cancelled: 0, aborted: 0, timed_out: 0 });
+    await check("the counts match the tasks: 11 downloaded, 12 failed, nothing left", () => {
+      assert.deepEqual({ ...done.counts }, { total: 23, queued: 0, in_progress: 0, success: 11, failed: 12, cancelled: 0, aborted: 0, timed_out: 0 });
       const byStatus: Record<string, number> = {};
       for (const t of done.tasks) byStatus[t.status] = (byStatus[t.status] || 0) + 1;
-      assert.deepEqual(byStatus, { success: 11, failed: 11 });
+      assert.deepEqual(byStatus, { success: 11, failed: 12 });
       assert.ok(done.startedAt instanceof Date && done.finishedAt instanceof Date && done.finishedAt >= done.startedAt);
       assert.ok(done.workerHost);
     });
@@ -361,10 +371,10 @@ async function driverMain() {
         const row = await ledgerOf(b.request_id);
         return row.status === "running" ? null : row;
       }, 5000);
-      assert.deepEqual({ status: l.status, total: l.total, processed: l.processed, success: l.success, failed: l.failed, cancelled: l.cancelled }, { status: "completed", total: 22, processed: 22, success: 11, failed: 11, cancelled: 0 });
+      assert.deepEqual({ status: l.status, total: l.total, processed: l.processed, success: l.success, failed: l.failed, cancelled: l.cancelled }, { status: "completed", total: 23, processed: 23, success: 11, failed: 12, cancelled: 0 });
       assert.ok(l.startedAt instanceof Date && l.finishedAt instanceof Date);
       assert.ok(l.avgMsPerItem > 0);
-      assert.equal(l.failedItems.length, 11);
+      assert.equal(l.failedItems.length, 12);
       assert.ok(l.failedItems.some((f) => f.key === "ODV-A2-2-NA · a2@verify.invalid" && f.reason === "Nothing available yet"));
       assert.equal(await sweepWouldSkip(), false, "a finished batch must not hold the sweep");
     });
@@ -375,7 +385,7 @@ async function driverMain() {
         ["avg_seconds_per_task", "can_cancel", "counts", "created_at", "duration_seconds", "eta_seconds", "finished_at", "finished_count", "host", "message", "params", "parent_id", "platform", "progress_percent", "request_id", "retry_of", "source", "stalled", "stalled_message", "started_at", "status", "task_type", "tasks", "triggered_by", "worker_alive", "worker_host"].sort()
       );
       assert.deepEqual([pub.worker_alive, pub.stalled, pub.stalled_message], [null, false, ""], "a finished request is never stalled");
-      assert.deepEqual({ status: pub.status, finished_count: pub.finished_count, progress_percent: pub.progress_percent, can_cancel: pub.can_cancel, eta_seconds: pub.eta_seconds }, { status: "completed", finished_count: 22, progress_percent: 100, can_cancel: false, eta_seconds: null });
+      assert.deepEqual({ status: pub.status, finished_count: pub.finished_count, progress_percent: pub.progress_percent, can_cancel: pub.can_cancel, eta_seconds: pub.eta_seconds }, { status: "completed", finished_count: 23, progress_percent: 100, can_cancel: false, eta_seconds: null });
       const t = pub.tasks!.find((x) => x.order_id === "ODV-A2-2-NA")!;
       assert.deepEqual({ status: t.status, error: t.error, error_code: t.error_code, email: t.email, task_type: t.task_type, platform: t.platform, source: t.source, triggered_by: t.triggered_by }, { status: "failed", error: "Nothing available yet", error_code: "nothing_available", email: "a2@verify.invalid", task_type: "invoice_fetch", platform: "FLIPKART", source: "user", triggered_by: "verify" });
       const list = await listInvoiceRequests(userId, 50);

@@ -1162,6 +1162,28 @@ function listDateSafe(card: ListCard) {
   return parseListCardDate(card.status || card.text || "");
 }
 
+// ---- What a unit save may overwrite ------------------------------------------
+//
+// A save by fetch or update writes what Flipkart shows NOW, and Flipkart stops
+// showing some things: the delivery OTP once the unit is delivered or
+// cancelled, the refund lines on most answers. A blank there means "not
+// shown", not "gone". Other fields are not Flipkart's at all: the invoice
+// pipeline writes the IMEI, and the capture and the pipeline write the
+// downloaded flag. Saving blanks over them reset the flag on 2,439 units with
+// a stored bundle, the IMEI on 2,435 and the OTP on 1,354 (2026-11-25).
+
+/** Unit fields a save fills but never blanks: a null or '' leaves the stored value, any other value replaces it. */
+export const KEEP_WHEN_BLANK = ["delivery_otp", "refund_status", "refund_amount", "refund_msg"] as const;
+
+/** A save writes these only when it creates the unit. After that the invoice pipeline (IMEI, flag) and the capture (flag) own them. */
+export const UNIT_INSERT_DEFAULTS = Object.freeze({ is_invoice_downloaded: false, invoice_path: "", imei: null });
+
+/** The save's fields without a blank (null, undefined or '') for a KEEP_WHEN_BLANK key. Pure; the input is not changed. */
+export function unitSetFor<T extends object>(fields: T): Partial<T> {
+  const keep = KEEP_WHEN_BLANK as readonly string[];
+  return Object.fromEntries(Object.entries(fields).filter(([key, value]) => !(keep.includes(key) && (value == null || value === "")))) as Partial<T>;
+}
+
 // ---- API mode ---------------------------------------------------------------------
 //
 // ORDER_FETCH_MODE=api reads Flipkart's own order APIs (services/orderApi.ts)
@@ -1216,12 +1238,10 @@ export async function saveMappedUnit(
         id: seq,
         platform_email: account.email,
         platform: "FLIPKART",
-        ...fields,
+        ...unitSetFor(fields),
         ...(api_extra ? { api_extra } : {}),
         is_bae_order: false,
-        is_invoice_downloaded: false,
-        invoice_path: "",
-        imei: null,
+        // Our own checkout job's card and payment columns, written as they come: a COD job's blank card columns included.
         ...(await cardFieldsFor(userId, account.email, mapped.order_id).catch(() => ({}))),
         fetch_source: "api",
         is_logged_in: true,
@@ -1229,8 +1249,9 @@ export async function saveMappedUnit(
         ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
         last_error: "",
       },
-      // Set by the cancel worker when the dashboard cancelled this unit; a later Update must not clear it.
-      $setOnInsert: { cancelled_from_bae: false },
+      // cancelled_from_bae is set by the cancel worker when the dashboard cancelled this unit; a later Update must not clear
+      // it. The IMEI and the invoice flag / path belong to the invoice pipeline and the capture.
+      $setOnInsert: { cancelled_from_bae: false, ...UNIT_INSERT_DEFAULTS },
     },
     { upsert: true }
   );
@@ -2251,8 +2272,8 @@ export async function scrapeAndSave(
       )
     ) || null;
 
+  // What this save reports back. It never writes them on a stored unit: they are the invoice pipeline's and the capture's.
   let imei: string | null = null;
-  const invoicePath = "";
   const invoiceDownloaded = false;
   // Invoice download is disabled on Trade Flow fetch — scrape order data only.
   // if (delivered && !cancelled && !failed) { downloadDeliveredInvoice(...) }
@@ -2321,53 +2342,54 @@ export async function scrapeAndSave(
         id: seq,
         platform_email: account.email,
         platform: "FLIPKART",
-        order_id: card.orderId,
-        item_id: savedItemId,
-        order_url: page.url() || card.orderUrl || orderDetailsUrl(card.orderId, savedItemId, unitKey),
-        order_date: orderDate,
-        product_name: productName,
-        seller_name: String(pageData.sellerName || ""),
-        unit_id: unitKey,
-        quantity: 1,
-        total_amount: totalAmount,
-        unit_amount: unitAmount,
-        delivery_date: deliveryDate,
-        actual_delivery_date: actualDelivery,
-        ewb_number: String(pageData.ewbNumber || ""),
-        delivery_message: String(pageData.deliveryMessage || statusLabel),
-        status_key: statusKey,
-        status_label: statusLabel,
-        status_reason: statusReason,
-        business_name: String(pageData.gstSellerName || pageData.billingName || ""),
-        business_gst_no: String(pageData.gstNumber || ""),
-        tracking_id: trackingId,
-        delivery_otp: cancelled || failed ? null : String(pageData.deliveryOtp || "") || null,
-        tracking,
-        last_tracking_step: lastTrackingStep(tracking),
-        billing_phone_number: String(pageData.billingPhone || "") || null,
-        billing_address_name: String(pageData.billingName || "") || null,
-        billing_address_pincode: String(pageData.pincode || "") || null,
-        shipping_address: pageShippingAddress,
-        shipping_address_hash: addressHash(pageShippingAddress),
-        is_invoice_downloaded: invoiceDownloaded,
-        invoice_path: invoicePath,
-        supercoin_amount_applied: Number(pageData.supercoin) || 0,
-        is_bae_order: false,
-        cash_on_delivery: Boolean(pageData.cashOnDelivery),
-        refund_status: tracking.some((row) => /refund/i.test(row.status)) || /refund/i.test(String(pageData.pageText || ""))
-          ? "refund"
-          : null,
-        refund_amount: refundAmount,
-        refund_msg: /refund/i.test(String(pageData.pageText || ""))
-          ? (String(pageData.pageText || "").match(/Total refund[^.!]{0,80}/i) || [null])[0]
-          : null,
-        cancelled_date: cancelledAt ? new Date(cancelledAt) : cancelled ? orderDate : null,
-        cancelled_by_user: /as per your request|cancelled by you|you cancelled/i.test(
-          `${trackingText} ${pageData.pageText || ""}`
-        ),
-        order_status_pre_cancellation: cancelled ? (confirmed?.status || "Order Confirmed") : null,
-        imei,
-        shipment_partner_name: String(courier[1] || "").replace(/\s+/g, " ").trim(),
+        // What the page shows. A blank OTP or refund line leaves the stored one (unitSetFor).
+        ...unitSetFor({
+          order_id: card.orderId,
+          item_id: savedItemId,
+          order_url: page.url() || card.orderUrl || orderDetailsUrl(card.orderId, savedItemId, unitKey),
+          order_date: orderDate,
+          product_name: productName,
+          seller_name: String(pageData.sellerName || ""),
+          unit_id: unitKey,
+          quantity: 1,
+          total_amount: totalAmount,
+          unit_amount: unitAmount,
+          delivery_date: deliveryDate,
+          actual_delivery_date: actualDelivery,
+          ewb_number: String(pageData.ewbNumber || ""),
+          delivery_message: String(pageData.deliveryMessage || statusLabel),
+          status_key: statusKey,
+          status_label: statusLabel,
+          status_reason: statusReason,
+          business_name: String(pageData.gstSellerName || pageData.billingName || ""),
+          business_gst_no: String(pageData.gstNumber || ""),
+          tracking_id: trackingId,
+          delivery_otp: cancelled || failed ? null : String(pageData.deliveryOtp || "") || null,
+          tracking,
+          last_tracking_step: lastTrackingStep(tracking),
+          billing_phone_number: String(pageData.billingPhone || "") || null,
+          billing_address_name: String(pageData.billingName || "") || null,
+          billing_address_pincode: String(pageData.pincode || "") || null,
+          shipping_address: pageShippingAddress,
+          shipping_address_hash: addressHash(pageShippingAddress),
+          supercoin_amount_applied: Number(pageData.supercoin) || 0,
+          is_bae_order: false,
+          cash_on_delivery: Boolean(pageData.cashOnDelivery),
+          refund_status: tracking.some((row) => /refund/i.test(row.status)) || /refund/i.test(String(pageData.pageText || ""))
+            ? "refund"
+            : null,
+          refund_amount: refundAmount,
+          refund_msg: /refund/i.test(String(pageData.pageText || ""))
+            ? (String(pageData.pageText || "").match(/Total refund[^.!]{0,80}/i) || [null])[0]
+            : null,
+          cancelled_date: cancelledAt ? new Date(cancelledAt) : cancelled ? orderDate : null,
+          cancelled_by_user: /as per your request|cancelled by you|you cancelled/i.test(
+            `${trackingText} ${pageData.pageText || ""}`
+          ),
+          order_status_pre_cancellation: cancelled ? (confirmed?.status || "Order Confirmed") : null,
+          shipment_partner_name: String(courier[1] || "").replace(/\s+/g, " ").trim(),
+        }),
+        // Our own checkout job's card and payment columns, written as they come: a COD job's blank card columns included.
         ...(await cardFieldsFor(userId, account.email, card.orderId).catch(() => ({}))),
         fetch_source: "scrape",
         is_logged_in: true,
@@ -2375,8 +2397,9 @@ export async function scrapeAndSave(
         ...(opts.applyCalendar !== false ? { since_date: jobSince(userId) } : {}),
         last_error: "",
       },
-      // Set by the cancel worker when the dashboard cancelled this unit; a later Update must not clear it.
-      $setOnInsert: { cancelled_from_bae: false },
+      // cancelled_from_bae is set by the cancel worker when the dashboard cancelled this unit; a later Update must not clear
+      // it. The IMEI and the invoice flag / path belong to the invoice pipeline and the capture.
+      $setOnInsert: { cancelled_from_bae: false, ...UNIT_INSERT_DEFAULTS },
     },
     { upsert: true }
   );

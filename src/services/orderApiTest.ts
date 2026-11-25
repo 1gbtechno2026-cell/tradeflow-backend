@@ -14,6 +14,7 @@ import {
   OrderApiSessionError,
   type MappedOrderUnit,
 } from "./orderApi.js";
+import { KEEP_WHEN_BLANK } from "./orderFetch.js";
 
 /**
  * The Test tab's "fetch & update via API" run.
@@ -132,14 +133,21 @@ function norm(v: unknown): string {
   return s.replace(/(T\d{2}:\d{2}):\d{2}/g, "$1").replace(/\s+/g, " ").toLowerCase();
 }
 
-export function diffAgainstScraper(mapped: MappedOrderUnit, saved: Record<string, unknown> | null): FieldDiff[] {
+/**
+ * `asSaved`: `saved` is the stored unit, so compare with what a save of `mapped` leaves there. A save keeps the stored
+ * OTP / refund value when the mapped one is blank (orderFetch.ts KEEP_WHEN_BLANK, unitSetFor), so that counts as the
+ * same. Leave it off when both sides are mappings.
+ */
+export function diffAgainstScraper(mapped: MappedOrderUnit, saved: Record<string, unknown> | null, asSaved = false): FieldDiff[] {
+  const keep: readonly string[] = asSaved ? KEEP_WHEN_BLANK : [];
   return COMPARED_FIELDS.map((field) => {
     const api = mapped[field];
     const scraper = saved ? saved[field] : undefined;
     const a = norm(api);
     const b = norm(scraper);
+    const kept = keep.includes(field) && (api == null || api === "");
     // Dates: same minute counts as same (the DOM gives minutes, the API ms).
-    const same = saved ? a === b || (a && b && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(a) && a.slice(0, 16) === b.slice(0, 16)) : false;
+    const same = saved ? kept || a === b || (a && b && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(a) && a.slice(0, 16) === b.slice(0, 16)) : false;
     return { field, api, scraper, same: Boolean(same) };
   });
 }
@@ -268,7 +276,7 @@ export async function runOrderApiTest(cfg: OrderApiTestConfig): Promise<OrderApi
           const mapped = mapApiUnitToOrder(details.orderView, t.unitId, t.unit);
           const saved = (await Order.findOne({ userId, unit_id: t.unitId }).lean()) as Record<string, unknown> | null;
           const scraper = saved ? Object.fromEntries(COMPARED_FIELDS.map((f) => [f, saved[f]])) : null;
-          const diff = diffAgainstScraper(mapped, scraper);
+          const diff = diffAgainstScraper(mapped, scraper, true);
           const file = path.join(dir, `${t.orderId}-${t.unitId}.json`);
           fs.writeFileSync(file, JSON.stringify({ raw: details.raw, mapped, scraper, diff }, null, 1));
           row.details = {

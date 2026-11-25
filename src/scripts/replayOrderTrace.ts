@@ -58,14 +58,17 @@ async function main() {
     const remapped = mapApiUnitToOrder(view, rec.unitId);
     const againstRun = rec.mapped ? diffAgainstScraper(remapped, rec.mapped).filter((d) => !d.same) : [];
     const saved = (await Order.findOne({ userId, unit_id: rec.unitId }).lean()) as Record<string, unknown> | null;
-    const againstDb = saved ? diffAgainstScraper(remapped, Object.fromEntries(COMPARED_FIELDS.map((k) => [k, saved[k]]))).filter((d) => !d.same) : null;
+    // As a save leaves the unit: a blank OTP / refund value in the answer keeps the stored one (unitSetFor).
+    const againstDb = saved ? diffAgainstScraper(remapped, Object.fromEntries(COMPARED_FIELDS.map((k) => [k, saved[k]])), true).filter((d) => !d.same) : null;
     if (againstRun.length) mapperDrift += 1;
     if (!saved) dbMissing += 1;
     else if (againstDb && againstDb.length) dbDiff += 1;
     const tag = againstRun.length ? `MAPPER DRIFT ${againstRun.map((d) => d.field).join(",")}` : "mapper ok";
     const dbTag = !saved ? "no document in order_details" : againstDb && againstDb.length ? `DB differs: ${againstDb.map((d) => d.field).join(",")}` : "db ok";
     console.log(`  ${rec.orderId} ${rec.unitId} (${rec.outcome}): ${tag} · ${dbTag}`);
-    for (const d of againstDb || []) console.log(`      ${d.field}: replay=${JSON.stringify(d.api)?.slice(0, 60)} db=${JSON.stringify(d.scraper)?.slice(0, 60)}`);
+    // A delivery OTP is never printed, only whether there is one.
+    const shown = (field: string, v: unknown) => (field === "delivery_otp" ? (v == null || v === "" ? "(none)" : "(a code)") : JSON.stringify(v)?.slice(0, 60));
+    for (const d of againstDb || []) console.log(`      ${d.field}: replay=${shown(d.field, d.api)} db=${shown(d.field, d.scraper)}`);
   }
   console.log(`\nunits: ${files.length} (api ${api}, scrape ${scrape}) · mapper drift ${mapperDrift} · db differs ${dbDiff} · db missing ${dbMissing}`);
   await mongoose.disconnect();

@@ -69,7 +69,9 @@ export async function recordUnitChanges(
     out.stageChanged = true;
     events.push({ ...base, type: "stage_changed", before: { status: before.status_key, stage: stageOf(before.status_key) }, after: { status: after.status_key, stage: stageOf(after.status_key) } });
   }
-  if (after.delivery_otp && !(before?.delivery_otp)) {
+  // A code that differs from the stored one, not only the first: a save keeps the stored OTP when Flipkart shows none
+  // (orderFetch.ts unitSetFor), so a second delivery attempt's code replaces a code, not a blank.
+  if (after.delivery_otp && after.delivery_otp !== before?.delivery_otp) {
     out.otpNew = true;
     events.push({ ...base, type: "otp_new", before: null, after: { otp: after.delivery_otp, status: after.status_key } });
   }

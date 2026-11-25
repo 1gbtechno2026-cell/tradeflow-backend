@@ -130,7 +130,7 @@ async function main() {
           r.details += 1;
           const saved = (await Order.findOne({ userId, unit_id: u.unitId }).lean()) as Record<string, unknown> | null;
           if (!saved) continue;
-          for (const d of diffAgainstScraper(read.mapped, saved)) {
+          for (const d of diffAgainstScraper(read.mapped, saved, true)) {
             if (d.same) r.fieldsSame += 1;
             else {
               r.fieldsDiff += 1;

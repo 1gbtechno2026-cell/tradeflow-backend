@@ -820,15 +820,24 @@ export async function ensureUpdateSchedules(): Promise<void> {
 // up. This sweep finds such stranded requests (open accounts, quiet a while, no
 // live job) and re-enqueues the missing per-account jobs; runOrderUpdateJob
 // re-reads the account's units from the request doc, so a half-done run resumes.
+// It takes only this system's requests: see reapCandidatesFilter.
 
 let reapingUpdates = false;
+
+/**
+ * The requests the update reaper may take: open, quiet for UPDATE_REAP_STALE_MS, and made on this system. A request's
+ * jobs live in the Redis of the system that made it. The two Macs share Atlas but not Redis, so without the systemId
+ * one Mac would re-enqueue the other's quiet request into its own queue and both would run it.
+ */
+export function reapCandidatesFilter(now = Date.now(), systemId = config.systemId) {
+  return { status: { $in: ["queued", "running"] }, systemId, updatedAt: { $lt: new Date(now - UPDATE_REAP_STALE_MS) } };
+}
 
 export async function reapStuckUpdates(): Promise<number> {
   if (reapingUpdates) return 0;
   reapingUpdates = true;
   try {
-    const staleBefore = new Date(Date.now() - UPDATE_REAP_STALE_MS);
-    const open = await OrderUpdateRequest.find({ status: { $in: ["queued", "running"] }, updatedAt: { $lt: staleBefore } })
+    const open = await OrderUpdateRequest.find(reapCandidatesFilter())
       .select("_id accounts.email accounts.status accounts.startedAt")
       .lean();
     if (!open.length) return 0;

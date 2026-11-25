@@ -28,6 +28,8 @@
     "bench:http": "tsx src/scripts/httpCheckoutBench.ts",
     "orders:api-bench": "tsx src/scripts/orderApiBench.ts",
     "orders:backfill-cancelled-by": "tsx src/scripts/backfillCancelledBy.ts",
+    "orders:unit-backfill": "tsx src/scripts/unitDataBackfill.ts",
+    "test:unit-save": "tsx src/scripts/unitSaveCheck.ts",
     "test:start-requests": "tsx src/scripts/startRequestsCheck.ts",
     "test:invoice-batch": "tsx src/scripts/invoiceBatchCheck.ts",
     "test:coupons": "tsx src/scripts/couponRunnerCheck.ts",

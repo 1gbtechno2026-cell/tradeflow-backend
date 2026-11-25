@@ -552,15 +552,23 @@ export async function getCancelRequest(userId: string, requestId: string) {
 // That is exactly how a cancellation gets stuck at 0/N. This sweep finds such
 // stranded requests (open units, quiet a while, no live job) and re-enqueues the
 // missing account jobs; runCancelJob already knows how to re-pick the units.
+// It takes only this system's requests: see cancelReapCandidatesFilter.
 
 let reaping = false;
+
+/**
+ * The requests the cancel reaper may take: open, quiet for REAP_STALE_MS, and made on this system. Their jobs live in
+ * this machine's Redis; another Mac's quiet request is that Mac's to re-enqueue (the Macs share Atlas, not Redis).
+ */
+export function cancelReapCandidatesFilter(now = Date.now(), systemId = config.systemId) {
+  return { status: { $in: ["queued", "running"] }, systemId, updatedAt: { $lt: new Date(now - REAP_STALE_MS) } };
+}
 
 export async function reapStuckCancels(): Promise<number> {
   if (reaping) return 0;
   reaping = true;
   try {
-    const staleBefore = new Date(Date.now() - REAP_STALE_MS);
-    const open = await CancelRequest.find({ status: { $in: ["queued", "running"] }, updatedAt: { $lt: staleBefore } })
+    const open = await CancelRequest.find(cancelReapCandidatesFilter())
       .select("_id units orders")
       .lean();
     if (!open.length) return 0;
@@ -757,7 +765,7 @@ async function applyToOrder(userId: Types.ObjectId, unitId: string, status: Canc
           cancelled_from_bae: true,
           cancelled_by_user: true,
           order_status_pre_cancellation: String(row?.status_key || "") || "Order Confirmed",
-          delivery_otp: null,
+          // delivery_otp is not written: a captured OTP stays on a cancelled unit, as every save keeps it (orderFetch.ts unitSetFor).
         },
       }
     );

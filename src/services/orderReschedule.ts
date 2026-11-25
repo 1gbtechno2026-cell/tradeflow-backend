@@ -601,15 +601,23 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
 // This sweep finds such stranded requests (open units, quiet a while, no live
 // job) and re-enqueues the missing per-account jobs; runRescheduleJob re-picks
 // the account's queued / stale-running units from the doc.
+// It takes only this system's requests: see rescheduleReapCandidatesFilter.
 
 let reapingReschedules = false;
+
+/**
+ * The requests the reschedule reaper may take: open, quiet for REAP_STALE_MS, and made on this system. Their jobs live
+ * in this machine's Redis; another Mac's quiet request is that Mac's to re-enqueue (the Macs share Atlas, not Redis).
+ */
+export function rescheduleReapCandidatesFilter(now = Date.now(), systemId = config.systemId) {
+  return { status: { $in: ["queued", "running"] }, systemId, updatedAt: { $lt: new Date(now - REAP_STALE_MS) } };
+}
 
 export async function reapStuckReschedules(): Promise<number> {
   if (reapingReschedules) return 0;
   reapingReschedules = true;
   try {
-    const staleBefore = new Date(Date.now() - REAP_STALE_MS);
-    const open = await RescheduleRequest.find({ status: { $in: ["queued", "running"] }, updatedAt: { $lt: staleBefore } })
+    const open = await RescheduleRequest.find(rescheduleReapCandidatesFilter())
       .select("_id units.email units.status units.startedAt")
       .lean();
     if (!open.length) return 0;

@@ -10,9 +10,18 @@ import {
   waitWithRetry,
   type JobLogger,
 } from "./helpers.js";
-import { sleep } from "../services/browser.js";
+import { flipkartLoginUrl, sleep } from "../services/browser.js";
 import { CheckoutFailure, classifyPageText } from "../services/checkoutErrors.js";
 import type { FlipkartApiWatcher } from "./FlipkartApiWatcher.js";
+
+/**
+ * What fetchAccountMobile throws when Flipkart sends /account to its login
+ * page. The "Pre-flight:" prefix carries it past the method's own catch; the
+ * words map to SESSION_EXPIRED (checkoutErrors.ts classifyThrownMessage), and
+ * the runner confirms the landing before it fails the job
+ * (checkoutRunner.ts loginLandingFailure).
+ */
+export const PREFLIGHT_LOGIN_MESSAGE = "Pre-flight: Session expired — Flipkart showed the login page on /account";
 
 /** Remembered Flipkart checkout URLs when a button or page is missing. pageUID is per-session — omit it. */
 const VIEWCART_URL = "https://www.flipkart.com/viewcart?exploreMode=TRUE&preference=FLIPKART";
@@ -1911,14 +1920,14 @@ export class FlipkartCheckout {
 
       // Hard-fail if Flipkart redirected us back to login. This is a much
       // clearer signal than reading an empty mobileNumber and confusedly
-      // continuing.
+      // continuing. flipkartLoginUrl, not includes("/account/login"): Flipkart
+      // sends /account to /login?ret=%2faccount, which that test never matched —
+      // a later check in the runner caught it until 2026-11-17, and after that
+      // dead sessions failed as ADDRESS_SELECTION_FAILED and were re-queued.
       const url = (this.page.url() || "").toLowerCase();
-      if (url.includes("/account/login")) {
+      if (flipkartLoginUrl(this.page.url())) {
         this.log("error", `[preflight] /account redirected to ${this.page.url()} — session is not actually logged in`);
-        throw new Error(
-          "Pre-flight: /account redirected to login page. Flipkart did not honour the OTP — " +
-          "the account may need manual verification (Profiles → Setup Login)."
-        );
+        throw new Error(PREFLIGHT_LOGIN_MESSAGE);
       }
       this.log("info", `[preflight] /account landed on ${url}`);
 

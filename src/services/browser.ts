@@ -344,6 +344,21 @@ export function flipkartLoginUrl(url: string) {
   return /\/(?:account\/)?login(?:\/|\?|$)/i.test(url);
 }
 
+/**
+ * The confirmation behind every dead-session hand-off (sessionEligibility.ts):
+ * a page already sent to Flipkart's login page gets the saved cookies attached
+ * again and opens My Orders once more. True = it landed on the login page
+ * again. The same re-check fetch has always done inline (orderFetch.ts
+ * processAccount). Throws when the cookies cannot be attached or the page does
+ * not load — a caller treats a throw as "not confirmed".
+ */
+export async function confirmLoginLanding(page: Page, cookies: unknown[]): Promise<boolean> {
+  await restoreFlipkartSession(page, cookies);
+  await page.goto("https://www.flipkart.com/account/orders", { waitUntil: "domcontentloaded", timeout: 30_000 });
+  await sleep(2500);
+  return flipkartLoginUrl(page.url());
+}
+
 /** Abort any Flipkart logout request so a stray click cannot kill the saved session. */
 export async function blockFlipkartLogout(page: Page) {
   const guard = async (route: Route) => {

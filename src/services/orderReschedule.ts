@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DelayedError, type Job } from "bullmq";
 import { Types } from "mongoose";
-import type { Page } from "playwright";
+import type { Browser, BrowserContext, Page } from "playwright";
 import { itemIdOf } from "../automation/FlipkartCancel.js";
 import { fullOrderId } from "../automation/PaymentApiWatcher.js";
 import { config } from "../config.js";
@@ -10,9 +10,19 @@ import { Order } from "../models/Order.js";
 import { RescheduleRequest, type IRescheduleRequest, type IRescheduleUnit, type RescheduleUnitStatus } from "../models/RescheduleRequest.js";
 import { getRescheduleQueue, type RescheduleJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
-import { blockFlipkartLogout, desktopContext, flipkartLoginUrl, launchStealthBrowser, restoreFlipkartSession, sleep } from "./browser.js";
+import {
+  blockFlipkartLogout,
+  confirmLoginLanding,
+  desktopContext,
+  flipkartLoginUrl,
+  launchStealthBrowser,
+  restoreFlipkartSession,
+  sleep,
+  type LaunchOptions,
+} from "./browser.js";
 import { claimEgress } from "./proxyPool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
+import { markSessionEligibleForRelogin } from "./sessionEligibility.js";
 import { clearedByStop } from "./requestCommon.js";
 import { openRequestTasksQuietly, syncRequestTasksQuietly, syncRequestTasksSoon } from "./syncTaskLog.js";
 
@@ -349,9 +359,41 @@ function dateNeedles(ymd: string): RegExp[] {
   return [new RegExp(`\\b${day}(st|nd|rd|th)?\\s+${mon}`, "i"), new RegExp(`\\b${mon}\\w*\\s+${day}\\b`, "i"), new RegExp(`\\b${day}(st|nd|rd|th)?\\s+${monLong}`, "i"), new RegExp(`\\b${dow}\\w*,?\\s+${day}\\b`, "i")];
 }
 
-export async function runRescheduleJob(job: Job<RescheduleJobData>, token: string | undefined): Promise<void> {
+/** What every unit of an account ends with once its session is gone. */
+const SESSION_SENTENCE = "Session expired — re-login this ID";
+/** Appended to it when the dead-session hand-off moved the ID to Not logged in. */
+const MOVED_TO_NOT_LOGGED_IN = " — moved to Not logged in";
+
+/**
+ * What a reschedule job reaches beyond Mongo. The worker runs on
+ * `rescheduleJobDefaults`; the checks (scripts/deadSessionCheckoutCheck.ts) swap
+ * in a sealed Chromium whose every request is answered locally, no proxy and
+ * no Redis lock.
+ */
+export interface RescheduleJobDeps {
+  /** The per-account lock (accountLock.ts). */
+  lock: typeof lockAccount;
+  /** This account's proxy from the pool. */
+  egress: typeof claimEgress;
+  /** The account's Chrome, and its desktop context. */
+  launch: (options: LaunchOptions) => Promise<Browser>;
+  context: (browser: Browser) => Promise<BrowserContext>;
+  /** Where a unit's page captures go. */
+  artifactDir: (requestId: string) => string;
+}
+
+export const rescheduleJobDefaults: RescheduleJobDeps = {
+  lock: lockAccount,
+  egress: claimEgress,
+  launch: launchStealthBrowser,
+  context: desktopContext,
+  artifactDir: (requestId) => path.resolve("debug/reschedule-runs", requestId),
+};
+
+export async function runRescheduleJob(job: Job<RescheduleJobData>, token: string | undefined, overrides: Partial<RescheduleJobDeps> = {}): Promise<void> {
+  const deps: RescheduleJobDeps = { ...rescheduleJobDefaults, ...overrides };
   const { requestId, email } = job.data;
-  const unlock = await lockAccount(email, `reschedule:${requestId}:${config.workerId}`);
+  const unlock = await deps.lock(email, `reschedule:${requestId}:${config.workerId}`);
   if (!unlock) {
     await job.moveToDelayed(Date.now() + LOCK_RETRY_MS, token);
     throw new DelayedError();
@@ -365,7 +407,11 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
     if (!units.length) return;
     await RescheduleRequest.updateOne({ _id: requestId, status: "queued" }, { $set: { status: "running" } });
     const log = (msg: string) => console.log(`[reschedule ${requestId}] ${email} ${msg}`);
+    // Units of this account Flipkart answered for in this job — any of them
+    // proves the session worked: no dead-session hand-off then.
+    let wentThrough = 0;
     const finish = async (u: IRescheduleUnit, status: RescheduleUnitStatus, message: string, extra: Partial<IRescheduleUnit> = {}) => {
+      if (status === "rescheduled" || status === "not_available" || status === "needs_review") wentThrough++;
       await setUnit(requestId, u.unitId, { status, message, finishedAt: new Date(), ...extra });
       await applyToOrder(request.userId, u.unitId, status, message, extra.chosen || "");
       log(`${u.orderId}/${u.unitId} → ${status}${message ? `: ${message}` : ""}`);
@@ -376,18 +422,55 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
       for (const u of units) await finish(u, "failed", `Session: ${session.reason} — re-login this ID`);
       return;
     }
-    const lease = await claimEgress(`reschedule:${requestId}:${email}`).catch(() => ({ egress: null, release: async () => undefined }));
+    const lease = await deps.egress(`reschedule:${requestId}:${email}`).catch(() => ({ egress: null, release: async () => undefined }));
     const egress = lease.egress;
-    const browser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
-    const artifactDir = path.resolve("debug/reschedule-runs", requestId);
+    const browser = await deps.launch({ headless: config.headless, proxy: egress?.proxy });
+    const artifactDir = deps.artifactDir(requestId);
     fs.mkdirSync(artifactDir, { recursive: true });
     try {
-      const ctx = await desktopContext(browser);
+      const ctx = await deps.context(browser);
       const page = await ctx.newPage();
       await blockFlipkartLogout(page);
       await restoreFlipkartSession(page, session.cookies);
       let sessionDead = false;
       const needles = dateNeedles(request.date);
+
+      // The dead-session hand-off (sessionEligibility.ts), at most once per
+      // job, at the first login page — and only when Flipkart answered for no
+      // unit of this account in this job (`wentThrough`). The landing is first
+      // confirmed on this page: the saved cookies attached again, My Orders
+      // opened once more (browser.ts confirmLoginLanding). The hand-off's own
+      // rules (24 h, same session, the cap) then decide whether the ID moves to
+      // Not logged in. Resolves to what this job's session sentences get appended.
+      let handOff: Promise<string> | null = null;
+      const sessionGone = (): Promise<string> =>
+        (handOff ??= (async () => {
+          if (wentThrough) {
+            log(`login page after Flipkart answered for ${wentThrough} unit(s) in this job — the session worked, not handed off`);
+            return "";
+          }
+          let confirmed = false;
+          try {
+            confirmed = await confirmLoginLanding(page, session.cookies);
+            if (!confirmed) log("login page, but /account/orders opened with the cookies attached again — not handed off");
+          } catch (err) {
+            log(`login page; the re-check on /account/orders did not finish (${err instanceof Error ? err.message.split("\n")[0].slice(0, 120) : String(err)}) — not handed off`);
+          }
+          if (!confirmed) return "";
+          const out = await markSessionEligibleForRelogin({
+            userId: request.userId,
+            platformId: session.platformId,
+            email: session.email,
+            reason: "Reschedule: Flipkart showed the login page twice — re-login",
+            flow: "reschedule",
+            confirmed: true,
+            sessionSavedAt: session.sessionSavedAt,
+            via: "worker",
+            requestId,
+          });
+          log(`Flipkart showed the login page twice — ${out.demoted ? "moved to Not logged in for re-login" : `not moved${out.note}`}`);
+          return out.demoted ? MOVED_TO_NOT_LOGGED_IN : "";
+        })());
 
       for (const u of units) {
         // Batch requests → Cancel (services/syncActions.ts) marks the request; a unit this job has not started is
@@ -403,7 +486,7 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
           continue;
         }
         if (sessionDead) {
-          await finish(u, "failed", "Session expired — re-login this ID");
+          await finish(u, "failed", `${SESSION_SENTENCE}${(await handOff) ?? ""}`);
           continue;
         }
         await setUnit(requestId, u.unitId, { status: "running", startedAt: new Date() });
@@ -415,7 +498,7 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
           await page.goto(`https://www.flipkart.com/order_details?${q.toString()}`, { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS });
           if (flipkartLoginUrl(page.url())) {
             sessionDead = true;
-            await finish(u, "failed", "Session expired — re-login this ID");
+            await finish(u, "failed", `${SESSION_SENTENCE}${await sessionGone()}`);
             continue;
           }
           // The page is client-rendered; wait until the order card is there (or give up on a blank page).
@@ -488,8 +571,9 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
         } catch (err) {
           const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
           await page.screenshot({ path: `${base}-error.png`, fullPage: true }).catch(() => undefined);
-          await finish(u, "failed", message.slice(0, 500));
-          if (/SESSION_EXPIRED/.test(message)) sessionDead = true;
+          const loggedOut = /SESSION_EXPIRED/.test(message);
+          if (loggedOut) sessionDead = true;
+          await finish(u, "failed", `${message.slice(0, 500)}${loggedOut ? await sessionGone() : ""}`);
         }
       }
     } finally {

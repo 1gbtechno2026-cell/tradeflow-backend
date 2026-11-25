@@ -7,10 +7,18 @@ import { fullOrderId } from "../automation/PaymentApiWatcher.js";
 import { config } from "../config.js";
 import { CancelRequest, type CancelOrderStatus, type CancelUnitStatus, type ICancelOrder, type ICancelUnit } from "../models/CancelRequest.js";
 import { Order } from "../models/Order.js";
-import type { APIRequestContext, Page } from "playwright";
+import type { APIRequestContext, Browser, BrowserContext, Page } from "playwright";
 import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
 import { getCancelQueue, type CancelJobData } from "../queue.js";
-import { blockFlipkartLogout, desktopContext, flipkartLoginUrl, launchStealthBrowser, restoreFlipkartSession } from "./browser.js";
+import {
+  blockFlipkartLogout,
+  confirmLoginLanding,
+  desktopContext,
+  flipkartLoginUrl,
+  launchStealthBrowser,
+  restoreFlipkartSession,
+  type LaunchOptions,
+} from "./browser.js";
 import { lockAccount } from "./accountLock.js";
 import { fetchOrderDetails, mapApiUnitToOrder, openOrderApiSession, orderViewFromPageFetch, OrderApiSessionError, type ApiOrderView } from "./orderApi.js";
 import { cancelUnitViaApi, HttpCancelHandoff } from "./httpCancel.js";
@@ -18,6 +26,7 @@ import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { fallbackUnitId, saveMappedUnit, type OrderAccount } from "./orderFetch.js";
 import { claimEgress } from "./proxyPool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
+import { markSessionEligibleForRelogin } from "./sessionEligibility.js";
 import { clearedByStop } from "./requestCommon.js";
 import { openRequestTasksQuietly, syncRequestTasksQuietly, syncRequestTasksSoon } from "./syncTaskLog.js";
 
@@ -759,9 +768,44 @@ async function applyToOrder(userId: Types.ObjectId, unitId: string, status: Canc
   await Order.updateOne({ userId, unit_id: unitId }, { $set: { cancel_status, cancel_error: status === "dry_run" ? "" : message } });
 }
 
-export async function runCancelJob(job: Job<CancelJobData>, token: string | undefined): Promise<void> {
+/** What every unit (and urgent order page) of an account ends with once its session is gone. */
+const SESSION_SENTENCE = "Session expired — re-login this ID";
+/** Appended to it when the dead-session hand-off moved the ID to Not logged in. */
+const MOVED_TO_NOT_LOGGED_IN = " — moved to Not logged in";
+
+/**
+ * What a cancel job reaches beyond Mongo. The worker runs on
+ * `cancelJobDefaults`; the checks (scripts/deadSessionCheckoutCheck.ts) swap in
+ * a sealed Chromium whose every request is answered locally, no proxy, no API
+ * pass and no Redis lock.
+ */
+export interface CancelJobDeps {
+  /** The per-account lock (accountLock.ts). */
+  lock: typeof lockAccount;
+  /** This account's proxy from the pool. */
+  egress: typeof claimEgress;
+  /** API or page mode for the workspace (the fetch-mode switch). */
+  fetchMode: typeof resolveOrderFetchMode;
+  /** The account's Chrome, and its desktop context. */
+  launch: (options: LaunchOptions) => Promise<Browser>;
+  context: (browser: Browser) => Promise<BrowserContext>;
+  /** Where a failed unit's screenshot goes. */
+  artifactDir: (requestId: string) => string;
+}
+
+export const cancelJobDefaults: CancelJobDeps = {
+  lock: lockAccount,
+  egress: claimEgress,
+  fetchMode: resolveOrderFetchMode,
+  launch: launchStealthBrowser,
+  context: desktopContext,
+  artifactDir: (requestId) => path.resolve("debug/cancel-runs", requestId),
+};
+
+export async function runCancelJob(job: Job<CancelJobData>, token: string | undefined, overrides: Partial<CancelJobDeps> = {}): Promise<void> {
+  const deps: CancelJobDeps = { ...cancelJobDefaults, ...overrides };
   const { requestId, email } = job.data;
-  const unlock = await lockAccount(email, `cancel:${requestId}:${config.workerId}`);
+  const unlock = await deps.lock(email, `cancel:${requestId}:${config.workerId}`);
   if (!unlock) {
     // A checkout, sync or another cancel is on this account right now — come
     // back shortly rather than use the same login twice at once.
@@ -785,12 +829,17 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
     await CancelRequest.updateOne({ _id: requestId, status: "queued" }, { $set: { status: "running" } });
     const log = (msg: string) => console.log(`[cancel ${requestId}] ${email} ${msg}`);
 
+    // What of this account went through in this job — over the API or in
+    // Chrome. Any of it proves the session worked: no dead-session hand-off then.
+    let wentThrough = 0;
     const finish = async (u: ICancelUnit, status: CancelUnitStatus, message: string) => {
+      if (status === "cancelled" || status === "dry_run" || status === "not_cancellable") wentThrough++;
       await setUnit(requestId, u.unitId, { status, message, finishedAt: new Date() });
       await applyToOrder(request.userId, u.unitId, status, message);
       log(`${u.orderId}/${u.unitId} → ${status}${message ? `: ${message}` : ""}`);
     };
     const finishOrder = async (o: ICancelOrder, status: CancelOrderStatus, message: string, unitsFound = 0) => {
+      if (status === "read") wentThrough++;
       await setOrder(requestId, o.orderId, { status, message, unitsFound, finishedAt: new Date() });
       log(`${o.orderId} order page → ${status}${message ? `: ${message}` : ""}`);
     };
@@ -826,12 +875,66 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
     const account: OrderAccount = { id: new Types.ObjectId(session.platformId), email: session.email, cookies: session.cookies };
     const userId = String(request.userId);
 
-    const lease = await claimEgress(`cancel:${requestId}:${email}`).catch(() => ({ egress: null, release: async () => undefined }));
+    // The dead-session hand-off (sessionEligibility.ts), at most once per job,
+    // at the first login page — and only when nothing of this account went
+    // through in this job (`wentThrough`). The landing is first confirmed: the
+    // saved cookies attached again, My Orders opened once more (browser.ts
+    // confirmLoginLanding). The hand-off's own rules (24 h, same session, the
+    // cap) then decide whether the ID moves to Not logged in. Resolves to what
+    // this job's session sentences get appended.
+    let handOff: Promise<string> | null = null;
+    // The re-check runs in a context of its own on the same browser (same proxy): the job's tabs share one cookie
+    // jar, and attaching the cookies again there clears them first — under a tab that may be in the middle of a unit.
+    const recheck = async (on: Page): Promise<boolean> => {
+      const browser = on.context().browser();
+      if (!browser) return confirmLoginLanding(on, session.cookies);
+      const probeContext = await deps.context(browser);
+      try {
+        const probe = await probeContext.newPage();
+        await blockFlipkartLogout(probe);
+        return await confirmLoginLanding(probe, session.cookies);
+      } finally {
+        await probeContext.close().catch(() => undefined);
+      }
+    };
+    const sessionGone = (on: Page): Promise<string> =>
+      (handOff ??= (async () => {
+        if (wentThrough) {
+          log(`login page after ${wentThrough} unit(s) or order page(s) went through in this job — the session worked, not handed off`);
+          return "";
+        }
+        let confirmed = false;
+        try {
+          confirmed = await recheck(on);
+          if (!confirmed) log("login page, but /account/orders opened with the cookies attached again — not handed off");
+        } catch (err) {
+          log(`login page; the re-check on /account/orders did not finish (${err instanceof Error ? err.message.split("\n")[0].slice(0, 120) : String(err)}) — not handed off`);
+        }
+        // Another tab may have got a unit through while the re-check ran.
+        if (!confirmed || wentThrough) return "";
+        const out = await markSessionEligibleForRelogin({
+          userId: request.userId,
+          platformId: session.platformId,
+          email: session.email,
+          reason: "Cancel: Flipkart showed the login page twice — re-login",
+          flow: "cancel",
+          confirmed: true,
+          sessionSavedAt: session.sessionSavedAt,
+          via: "worker",
+          requestId,
+        });
+        log(`Flipkart showed the login page twice — ${out.demoted ? "moved to Not logged in for re-login" : `not moved${out.note}`}`);
+        return out.demoted ? MOVED_TO_NOT_LOGGED_IN : "";
+      })());
+    /** What a unit (or urgent order page) ends with once the account's session is gone. */
+    const sessionSentence = async () => `${SESSION_SENTENCE}${(await handOff) ?? ""}`;
+
+    const lease = await deps.egress(`cancel:${requestId}:${email}`).catch(() => ({ egress: null, release: async () => undefined }));
     const egress = lease.egress;
 
     // API mode (the fetch-mode switch): every unit through Flipkart's cancel API
     // first — no browser. What the API cannot answer stays for the Chrome flow.
-    const fetchMode = await resolveOrderFetchMode(userId).catch(() => null);
+    const fetchMode = await deps.fetchMode(userId).catch(() => null);
     if (fetchMode?.mode === "api" && units.length) {
       const leftover: ICancelUnit[] = [];
       let api: APIRequestContext | null = null;
@@ -888,11 +991,11 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
       log(`Chrome for ${units.length} unit(s)${orders.length ? ` and ${orders.length} order page(s)` : ""}`);
     }
 
-    const browser = await launchStealthBrowser({ headless: config.headless, proxy: egress?.proxy });
-    const artifactDir = path.resolve("debug/cancel-runs", requestId);
+    const browser = await deps.launch({ headless: config.headless, proxy: egress?.proxy });
+    const artifactDir = deps.artifactDir(requestId);
     const speed = await resolveCancelSpeed(userId).catch(() => null);
     try {
-      const ctx = await desktopContext(browser);
+      const ctx = await deps.context(browser);
       const first = await ctx.newPage();
       await blockFlipkartLogout(first);
       await restoreFlipkartSession(first, session.cookies);
@@ -910,7 +1013,7 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
           continue;
         }
         if (sessionDead) {
-          await finishOrder(o, "failed", "Session expired — re-login this ID");
+          await finishOrder(o, "failed", await sessionSentence());
           continue;
         }
         await setOrder(requestId, o.orderId, { status: "running", startedAt: new Date() });
@@ -918,7 +1021,7 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
           const read = await withTimeout(readOrderPage(first, o.orderId), ORDER_PAGE_TIMEOUT_MS, `${o.orderId} order page`);
           if (read.loginShown) {
             sessionDead = true;
-            await finishOrder(o, "failed", "Session expired — re-login this ID");
+            await finishOrder(o, "failed", `${SESSION_SENTENCE}${await sessionGone(first)}`);
             continue;
           }
           const unitIds = Object.keys(read.view?.units || {});
@@ -968,8 +1071,9 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
           const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
           fs.mkdirSync(artifactDir, { recursive: true });
           await withTimeout(first.screenshot({ path: path.join(artifactDir, `${o.orderId}-order-page.png`), fullPage: true }), 15_000, "screenshot").catch(() => undefined);
-          await finishOrder(o, "failed", message.slice(0, 500));
-          if (/SESSION_EXPIRED/.test(message)) sessionDead = true;
+          const loggedOut = /SESSION_EXPIRED/.test(message);
+          if (loggedOut) sessionDead = true;
+          await finishOrder(o, "failed", `${message.slice(0, 500)}${loggedOut ? await sessionGone(first) : ""}`);
         }
       }
       if (!units.length) return;
@@ -996,7 +1100,7 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
             continue;
           }
           if (sessionDead) {
-            await finish(u, "failed", "Session expired — re-login this ID");
+            await finish(u, "failed", await sessionSentence());
             continue;
           }
           await setUnit(requestId, u.unitId, { status: "running", startedAt: new Date() });
@@ -1044,9 +1148,10 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
             fs.mkdirSync(artifactDir, { recursive: true });
             const base = path.join(artifactDir, `${u.unitId}-${lastStep || "start"}`);
             await withTimeout(page.screenshot({ path: `${base}.png`, fullPage: true }), 15_000, "screenshot").catch(() => undefined);
-            await finish(u, "failed", message.slice(0, 500));
             // Every tab shares the login: once it is gone, the rest are failed, not attempted.
-            if (/SESSION_EXPIRED/.test(message)) sessionDead = true;
+            const loggedOut = /SESSION_EXPIRED/.test(message);
+            if (loggedOut) sessionDead = true;
+            await finish(u, "failed", `${message.slice(0, 500)}${loggedOut ? await sessionGone(page) : ""}`);
             if (err instanceof UnitTimeoutError) {
               // The tab is not trusted any more: drop it and carry on in a fresh one.
               log(`${u.orderId}/${u.unitId} replacing the hung tab`);

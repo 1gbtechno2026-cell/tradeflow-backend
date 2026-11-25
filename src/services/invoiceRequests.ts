@@ -11,6 +11,7 @@ import { invoiceStoreEnabled } from "./invoiceCapture.js";
 import { downloadAndStoreInvoice, resolveInvoiceTargets, type InvoiceTarget } from "./invoiceOnDemand.js";
 import { openOrderApiSession } from "./orderApi.js";
 import { cookiesFor } from "./orderFetch.js";
+import { markSessionEligibleForRelogin } from "./sessionEligibility.js";
 import {
   ABORTED_WHILE_RUNNING,
   assertValueLimit,
@@ -84,6 +85,7 @@ const WATCHDOG_EVERY_MS = 30 * 1000;
 const LEDGER_EVERY_MS = 2000;
 
 const OPEN = ["queued", "in_progress"] as const;
+const OBJECT_ID_RE = /^[a-f0-9]{24}$/i;
 
 /** What the batch needs from outside. The worker and the API use `invoiceBatchDefaults`; the checks swap parts of it. */
 export interface InvoiceBatchDeps {
@@ -502,6 +504,11 @@ export async function runInvoiceBatchJob(job: Job<InvoiceBatchJobData>, override
     await col().updateOne({ _id: id, startedAt: null }, { $set: { startedAt: new Date() } });
     await col().updateOne({ _id: id }, { $set: { workerHost: hostName() } });
 
+    // The session this job is about to use, read before it is opened: a dead-session report names it, so a login
+    // that lands after this read is never reported on (sessionEligibility.ts). The cookies are not read here.
+    const account = OBJECT_ID_RE.test(accountId)
+      ? await PlatformId.findOne({ _id: accountId, userId: request.userId }).select("email sessionSavedAt").lean().catch(() => null)
+      : null;
     ctx = await deps.openSession(accountId);
     if (!ctx) {
       for (const t of mine) await finishTask(id, t.i, "queued", { status: "failed", ...classified("not_logged_in", "no usable saved session for this Platform ID") });
@@ -532,7 +539,22 @@ export async function runInvoiceBatchJob(job: Job<InvoiceBatchJobData>, override
       } catch (err) {
         const why = classifyPlatformError(err);
         await finishTask(id, t.i, "in_progress", { status: "failed", ...why });
-        if (why.errorClass === "not_logged_in") sessionDead = classified("not_logged_in", `session refused on ${t.orderId}`);
+        if (why.errorClass === "not_logged_in") {
+          sessionDead = classified("not_logged_in", `session refused on ${t.orderId}`);
+          // To Session Health and "Needs attention", once per account and run, as an unconfirmed report: the batch has
+          // no page to re-check the session with, so the status is left for a Chrome flow to move. A 500 never gets here.
+          await markSessionEligibleForRelogin({
+            userId: request.userId,
+            platformId: accountId,
+            email: account?.email || target.email || "",
+            reason: `Invoices: ${why.detail || why.error}`,
+            flow: "invoice",
+            confirmed: false,
+            sessionSavedAt: account?.sessionSavedAt ?? null,
+            via: "worker",
+            requestId,
+          });
+        }
         // Flipkart asked for room: give it some before this account's next order.
         if (why.errorClass === "rate_limited") await sleep(5000);
       }

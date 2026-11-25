@@ -82,7 +82,7 @@ function stubs(queueName: string, ledgerCollection: string, origin: string, all:
     loadSession: async (email) =>
       kindOf(email) === "nosess"
         ? { ok: false as const, email, reason: 'Status is "pending", not logged_in' }
-        : { ok: true as const, email, platformId: `verify-${email.split("@")[0]}`, cookies: [{ name: "T", value: `${kindOf(email)}:${email}`, domain: "127.0.0.1", path: "/", httpOnly: true, secure: false, sameSite: "Lax" }] },
+        : { ok: true as const, email, platformId: `verify-${email.split("@")[0]}`, cookies: [{ name: "T", value: `${kindOf(email)}:${email}`, domain: "127.0.0.1", path: "/", httpOnly: true, secure: false, sameSite: "Lax" }], sessionSavedAt: new Date("2026-08-01T00:00:00Z") },
     // openContext is NOT stubbed: the links are opened through openOrderApiSession, as in production.
     resolveUrl: (link) => (link.startsWith(SITE) ? origin + link.slice(SITE.length) : link),
     allowHost: (host) => host === "127.0.0.1",
@@ -542,8 +542,15 @@ async function driverMain() {
       assert.deepEqual({ ...r.counts }, { total: 20, queued: 0, in_progress: 0, success: n("success"), failed: 0, cancelled: n("cancelled"), aborted: 0, timed_out: 0 });
       const l = await ledgerOf(c.request_id);
       assert.deepEqual({ status: l.status, message: l.message, success: l.success, cancelled: l.cancelled }, { status: "stopped", message: "Stopped by verify", success: n("success"), cancelled: n("cancelled") });
-      const jobs = await queue.getJobCounts("waiting", "active", "delayed");
-      assert.equal(jobs.waiting + jobs.active + jobs.delayed, 0);
+      // An account's job leaves the queue a moment after its task row reads success (the worker still settles the
+      // request and its ledger row): wait for the last one in flight, then nothing may be left.
+      let left = -1;
+      for (const until = Date.now() + 15_000; ; await sleep(100)) {
+        const jobs = await queue.getJobCounts("waiting", "active", "delayed");
+        left = jobs.waiting + jobs.active + jobs.delayed;
+        if (left === 0 || Date.now() > until) break;
+      }
+      assert.equal(left, 0, "a job of the stopped request is still in the queue 15 s after the stop");
     });
 
     // ── D: the worker dies, then comes back ─────────────────────────────────

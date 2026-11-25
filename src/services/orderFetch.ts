@@ -13,6 +13,7 @@ import {
   blockFlipkartLogout,
   clearLocalThrowawayFlipkartCookies,
   closeBrowser,
+  confirmLoginLanding,
   flipkartLoginUrl,
   launchStealthContext,
   restoreFlipkartSession,
@@ -23,6 +24,7 @@ import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSyn
 import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { finishRun, startRun } from "./orderJobRuns.js";
+import { DemoteCircuit, markSessionEligibleForRelogin, SessionDeadError, type DeadSessionOutcome } from "./sessionEligibility.js";
 import { openFetchTasks, type FetchTaskRun } from "./syncTaskLog.js";
 import { cardFieldsFor, checkoutOrderIdsForMany, type PlacedOrderRef } from "./orderLinks.js";
 import { captureInvoicesForAccount, type InvoiceMode } from "./invoiceCapture.js";
@@ -1019,7 +1021,25 @@ export interface OrderAccount {
   id: Types.ObjectId;
   email: string;
   cookies: unknown[];
+  /**
+   * The session these cookies belong to (the row's sessionSavedAt when it was
+   * read). A dead-session report names it, so a login that lands meanwhile is
+   * never touched (sessionEligibility.ts).
+   */
+  sessionSavedAt?: Date | null;
 }
+
+/**
+ * The account's sentence once Flipkart has sent it to the login page twice
+ * and the dead-session hand-off has answered — the update's and the fetch's.
+ * It reads as "not logged in" in the task log.
+ */
+export function sessionExpiredMessage(out: DeadSessionOutcome): string {
+  return out.demoted ? "Session expired — Flipkart logged this ID out; moved to Not logged in for re-login" : `Session expired — Flipkart logged this ID out${out.note} — re-login this ID`;
+}
+
+/** An API-mode unit whose page fallback is given up: the fallback page landed on Flipkart's login page twice. */
+export const PAGE_FALLBACK_SKIPPED = "page fallback skipped — Flipkart sent this ID to the login page";
 
 interface QueueAccount extends OrderAccount {
   existing: ExistingUnit[];
@@ -1267,6 +1287,33 @@ export async function apiScrapeAndSave(
   return result;
 }
 
+/**
+ * What a fetch run reaches outside Mongo: Chrome and Flipkart's order API.
+ * The app passes none of it (fetchDefaults); scripts/deadSessionFlowsCheck.ts
+ * passes a Chromium that answers every request itself and a fake API.
+ */
+export interface FetchDeps {
+  launch: typeof launchStealthContext;
+  openApi: typeof openOrderApiSession;
+  walkList: typeof walkOrderList;
+  apiRead: typeof apiScrapeAndSave;
+}
+
+const fetchDefaults: FetchDeps = { launch: launchStealthContext, openApi: openOrderApiSession, walkList: walkOrderList, apiRead: apiScrapeAndSave };
+
+/** One fetch run, as its lanes see it. */
+interface FetchRunContext {
+  /** The run's ledger id — what a dead-session report names as its request. */
+  runId: string;
+  deps: FetchDeps;
+  /**
+   * The run's dead-session circuit (sessionEligibility.ts): an account counts
+   * "alive" once its list is read (API) or My Orders opens (page), "dead" at a
+   * confirmed login landing. Once open, the run moves no ID to Not logged in.
+   */
+  circuit: DemoteCircuit;
+}
+
 // ---- The fetch invariant -----------------------------------------------------
 //
 //   listed − dropped_by_date − known + carried = queued = enriched
@@ -1359,25 +1406,27 @@ function logRunInvariant(userId: string) {
 
 /**
  * API-mode discovery + enrichment for one account. Returns false when the
- * API would not serve this session at all (then the page path runs instead).
- * A single unit the API cannot serve is retried on the page via getPage().
+ * API would not serve this session at all (then the page path runs instead) —
+ * and only then: before anything of the account was read. A single unit the
+ * API cannot serve is retried on the page via getPage().
  */
 async function processAccountViaApi(
   getPage: () => Promise<Page>,
   userId: string,
   queue: QueueAccount[],
   row: QueueAccount,
-  index: number
+  index: number,
+  run: FetchRunContext
 ): Promise<boolean> {
   const job = state(userId);
   job.currentEmail = row.email;
   job.phase = "discover";
   log(userId, "info", `Discover ${index + 1}/${queue.length}: ${row.email} (API)`);
-  const ctx = await openOrderApiSession(row.cookies);
+  const ctx = await run.deps.openApi(row.cookies);
   try {
     let walk: Awaited<ReturnType<typeof walkOrderList>>;
     try {
-      walk = await walkOrderList(ctx, jobSince(userId), {
+      walk = await run.deps.walkList(ctx, jobSince(userId), {
         onPage: (p) => log(userId, "info", `${row.email}: list page ${p.page} · ${p.units} unit(s) · ${p.older} older than ${jobSinceLabel(userId)} · ${p.ms}ms`),
         onPageRaw: (page, request) => traceFor(userId)?.list({ email: row.email, page: page.page, request, response: { orders: page.orders, moreOrder: page.moreOrder, nextCallParams: page.nextCallParams }, ms: page.ms }),
       });
@@ -1389,6 +1438,8 @@ async function processAccountViaApi(
       log(userId, "warn", `${row.email}: API list unavailable (${why.slice(0, 160)}) — using the page`);
       return false;
     }
+    // The list answered: this session is alive for the run's circuit, whatever its page fallback meets later.
+    run.circuit.push("alive");
     const byUnit = new Map<string, ApiListedUnit>();
     const cards: ListCard[] = walk.units.map((u) => {
       byUnit.set(u.unitId, u);
@@ -1426,7 +1477,20 @@ async function processAccountViaApi(
 
     const acc = { enriched: 0, mapped: 0, oldAtEnrich: 0, failed: 0 };
     const enrichedUnits = new Set<string>();
+    // The page a unit falls back to — until Flipkart has sent it to the login page twice. The list API answered
+    // for this account, so that is no dead session to hand off; only the page is given up, and the account's
+    // other units that need it fail at once instead of each waiting on the login page.
     let fallbackPage: Page | null = null;
+    let fallbackChecked = false;
+    let fallbackDead = false;
+    const fallback = async (): Promise<Page> => {
+      if (fallbackDead) throw new Error(PAGE_FALLBACK_SKIPPED);
+      if (!fallbackPage) {
+        fallbackPage = await getPage();
+        await restoreFlipkartSession(fallbackPage, row.cookies);
+      }
+      return fallbackPage;
+    };
     for (let n = 0; n < pending.length; n++) {
       const rowIdx = pending[n];
       if (job.cancelled) throw new Error("cancelled");
@@ -1443,15 +1507,24 @@ async function processAccountViaApi(
       let result: Awaited<ReturnType<typeof saveMappedUnit>>;
       try {
         try {
-          result = await apiScrapeAndSave(ctx, userId, row, card, { applyCalendar: true, listUnit: byUnit.get(card.unitId)?.unit ?? null });
+          result = await run.deps.apiRead(ctx, userId, row, card, { applyCalendar: true, listUnit: byUnit.get(card.unitId)?.unit ?? null });
         } catch (apiErr) {
           const why = apiErr instanceof Error ? apiErr.message : String(apiErr);
-          log(userId, "warn", `${card.orderId} unit ${card.unitId}: API read failed (${why.slice(0, 140)}) — falling back to the page`);
-          if (!fallbackPage) {
-            fallbackPage = await getPage();
-            await restoreFlipkartSession(fallbackPage, row.cookies);
+          log(userId, "warn", `${card.orderId} unit ${card.unitId}: API read failed (${why.slice(0, 140)}) — ${fallbackDead ? "page fallback skipped" : "falling back to the page"}`);
+          const fp = await fallback();
+          try {
+            result = await scrapeAndSave(fp, userId, row, card, { applyCalendar: true });
+          } catch (pageErr) {
+            // The first login landing: once, look again with the cookies attached again.
+            if (!fallbackChecked && /^Flipkart session expired/.test(pageErr instanceof Error ? pageErr.message : String(pageErr))) {
+              fallbackChecked = true;
+              if (await confirmLoginLanding(fp, row.cookies).catch(() => false)) {
+                fallbackDead = true;
+                log(userId, "warn", `${row.email}: the page fallback landed on Flipkart's login page twice — the list API answered, so the ID is not moved to Not logged in; its other units skip the page`);
+              }
+            }
+            throw pageErr;
           }
-          result = await scrapeAndSave(fallbackPage, userId, row, card, { applyCalendar: true });
         }
         if (result.skippedOld) {
           job.report.idsSkippedOld += 1;
@@ -1499,13 +1572,8 @@ async function processAccountViaApi(
       const inv = await captureInvoicesForAccount({
         userId, platformAccountId: row.id, email: row.email, mode: job.invoices, justEnriched: enrichedUnits,
         api: ctx,
-        getPage: async () => {
-          if (!fallbackPage) {
-            fallbackPage = await getPage();
-            await restoreFlipkartSession(fallbackPage, row.cookies);
-          }
-          return fallbackPage;
-        },
+        // The same page fallback: given up once it landed on the login page twice (that order's invoice then fails at once).
+        getPage: fallback,
         cancelled: () => job.cancelled,
         log: (level, message) => log(userId, level, message),
       });
@@ -1602,6 +1670,8 @@ export interface OrderFetchStartOptions {
    * and on every task row.
    */
   source?: string;
+  /** The checks only (FetchDeps): what the run talks to instead of Chrome and Flipkart's order API. */
+  deps?: Partial<FetchDeps>;
 }
 
 /** Workspaces whose fetch is between "asked" and "running": the saved units of every account are read first, a batch of accounts at a time. */
@@ -1744,7 +1814,7 @@ async function beginOrderFetch(userId: string, emails: string[], sinceDate: Date
         if (existing.has(unitId)) continue;
         existing.set(unitId, { orderId: ref.orderId, itemId: "", unitId, orderUrl: orderDetailsUrl(ref.orderId), orderDate: ref.placedAt });
       }
-      queue.push({ id: row._id, email: row.email, cookies, existing: [...existing.values()] });
+      queue.push({ id: row._id, email: row.email, cookies, sessionSavedAt: row.sessionSavedAt ?? null, existing: [...existing.values()] });
     }
   }
   if (stopWhilePreparing.has(userId)) throw new OrderFetchStoppedError();
@@ -1828,7 +1898,8 @@ async function beginOrderFetch(userId: string, emails: string[], sinceDate: Date
   );
   for (const email of skipped.slice(0, 8)) log(userId, "warn", `Skipped ${email} — not logged in`);
 
-  void run(userId, queue).finally(() => {
+  const fetchRun: FetchRunContext = { runId, deps: { ...fetchDefaults, ...(opts.deps || {}) }, circuit: new DemoteCircuit() };
+  void run(userId, queue, fetchRun).finally(() => {
     job.running = false;
     job.phase = "";
     job.currentEmail = null;
@@ -1994,11 +2065,15 @@ export async function scrapeAndSave(
     waitUntil: "domcontentloaded",
     timeout: 25000,
   });
+  // Flipkart answers a logged-out session with its login page: say so now, not after waiting for an order to render on it.
+  if (flipkartLoginUrl(page.url())) throw new Error("Flipkart session expired");
   await sleep(900);
   try {
     await page.waitForFunction(
       () => /order_details|order_id=/i.test(location.href) && /price details|see all updates|download invoice|order confirmed|order not placed|failed:\\s*order confirmation|delivered/i.test(document.body.innerText || ""),
-      { timeout: 12000 }
+      undefined,
+      // 30 s: what this wait always was in fact — the options used to sit in the predicate's argument, so Playwright's default applied.
+      { timeout: 30_000 }
     );
   } catch {
     /* still try scrape */
@@ -2334,9 +2409,9 @@ export async function scrapeAndSave(
 }
 
 
-async function processAccount(getPage: () => Promise<Page>, userId: string, queue: QueueAccount[], row: QueueAccount, index: number) {
+async function processAccount(getPage: () => Promise<Page>, userId: string, queue: QueueAccount[], row: QueueAccount, index: number, run: FetchRunContext) {
   if (state(userId).mode === "api") {
-    const served = await processAccountViaApi(getPage, userId, queue, row, index);
+    const served = await processAccountViaApi(getPage, userId, queue, row, index, run);
     if (served) return;
   }
   const page = await getPage();
@@ -2353,8 +2428,27 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
     await sleep(2500);
   }
   if (flipkartLoginUrl(page.url())) {
-    throw new Error("Flipkart session expired. Refresh this ID in platform id first.");
+    // The second landing, with the cookies attached again, is the confirmation — and nothing of this account was
+    // read in this run (the API path hands an account over only when its list call failed). Handed off once
+    // (sessionEligibility.ts decides whether the row moves); the lane records the account's task and failed item.
+    const wasOpen = run.circuit.open;
+    run.circuit.push("dead");
+    if (run.circuit.open && !wasOpen) log(userId, "warn", `Dead sessions: ${run.circuit.describe()} — no ID is moved to Not logged in for the rest of this fetch`);
+    const out = await markSessionEligibleForRelogin({
+      userId,
+      platformId: row.id,
+      email: row.email,
+      reason: "Fetch: Flipkart sent /account/orders to the login page twice — re-login",
+      flow: "fetch",
+      confirmed: true,
+      sessionSavedAt: row.sessionSavedAt ?? null,
+      circuitOpen: run.circuit.open,
+      via: "page",
+      requestId: run.runId,
+    });
+    throw new SessionDeadError(sessionExpiredMessage(out));
   }
+  run.circuit.push("alive");
 
   const cards = await collectOrderIds(page, userId, row.existing);
   traceFor(userId)?.list({ email: row.email, page: 0, request: { source: "my-orders-page", existingMerged: row.existing.length }, response: cards, ms: 0 });
@@ -2469,7 +2563,7 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
   );
 }
 
-async function run(userId: string, queue: QueueAccount[]) {
+async function run(userId: string, queue: QueueAccount[], fetchRun: FetchRunContext) {
   const job = state(userId);
   const tasks = fetchTaskRuns.get(userId);
   const windows = Math.max(1, job.windows || 1);
@@ -2490,7 +2584,7 @@ async function run(userId: string, queue: QueueAccount[]) {
     let page: Page | null = null;
     const getPage = async () => {
       if (page) return page;
-      launched = await launchStealthContext();
+      launched = await fetchRun.deps.launch();
       job.liveBrowsers.push(launched);
       page = await launched.context.newPage();
       await blockFlipkartLogout(page);
@@ -2503,7 +2597,7 @@ async function run(userId: string, queue: QueueAccount[]) {
         const row = queue[i];
         tasks?.started(row.email);
         try {
-          await processAccount(getPage, userId, queue, row, i);
+          await processAccount(getPage, userId, queue, row, i, fetchRun);
           tasks?.succeeded(row.email);
         } catch (err) {
           if (job.cancelled || (err instanceof Error && err.message === "cancelled")) {

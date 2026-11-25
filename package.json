@@ -33,7 +33,10 @@
     "test:coupons": "tsx src/scripts/couponRunnerCheck.ts",
     "test:request-log": "tsx src/scripts/requestLogCheck.ts",
     "test:request-actions": "tsx src/scripts/requestActionsCheck.ts",
-    "request-log:backfill": "tsx src/scripts/requestLogBackfill.ts"
+    "request-log:backfill": "tsx src/scripts/requestLogBackfill.ts",
+    "test:dead-session": "tsx src/scripts/deadSessionCheck.ts",
+    "test:dead-session-flows": "tsx src/scripts/deadSessionFlowsCheck.ts",
+    "test:dead-session-checkout": "tsx src/scripts/deadSessionCheckoutCheck.ts"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.1156.0",

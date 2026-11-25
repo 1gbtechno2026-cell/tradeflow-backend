@@ -33,6 +33,7 @@ import {
   type ErrorClass,
   type LedgerModel,
 } from "./requestCommon.js";
+import { markSessionEligibleForRelogin } from "./sessionEligibility.js";
 import { resolveLoggedInSession, type SessionLookup } from "./sessionStore.js";
 import { openRequestTasksQuietly, syncRequestTasksQuietly, taskLog } from "./syncTaskLog.js";
 
@@ -676,7 +677,7 @@ export async function runCouponJob(job: Job<CouponJobData>, token: string | unde
   const email = String(job.data.email || "").toLowerCase();
   if (!Types.ObjectId.isValid(requestId)) return;
   const id = new Types.ObjectId(requestId);
-  const request = await OrderCouponRequest.findById(id).select("status links").lean();
+  const request = await OrderCouponRequest.findById(id).select("userId status links").lean();
   if (!request || (request.status !== "queued" && request.status !== "in_progress")) return;
 
   // The same lock checkout, cancel, update and the order sync take: one piece of work per account at a time.
@@ -723,11 +724,18 @@ export async function runCouponJob(job: Job<CouponJobData>, token: string | unde
       return;
     }
 
+    // A session these calls found dead goes to Session Health and "Needs attention", once per account and run, as an
+    // unconfirmed report (sessionEligibility.ts): with no page here to re-check it, the status is left for a Chrome
+    // flow to move. An HTTP 500 is never one of these.
+    const reportDeadSession = (why: string) =>
+      markSessionEligibleForRelogin({ userId: request.userId, platformId: session.platformId, email, reason: `Coupons: ${why}`, flow: "coupon", confirmed: false, sessionSavedAt: session.sessionSavedAt, via: "worker", requestId });
+
     // The account's coupons as they are now. A read that fails only means nothing will be claimed afterwards —
     // except 401, which is the session itself: the links would only be sent to login, so they are not opened.
     const before = deps.verify ? await readLiveOffers(ctx, deps) : null;
     if (before && !before.ok && before.sessionDead) {
       await end({ status: "failed", errorClass: "not_logged_in", error: ERROR_CLASSES.not_logged_in, note: before.reason }, []);
+      await reportDeadSession(before.reason);
       return;
     }
 
@@ -742,7 +750,12 @@ export async function runCouponJob(job: Job<CouponJobData>, token: string | unde
       }
       const result = await openCouponLink(ctx, link, deps);
       results.push(result);
-      if (result.errorClass === "not_logged_in") bounced = true;
+      if (result.errorClass === "not_logged_in") {
+        bounced = true;
+        await reportDeadSession(
+          result.loginBounce ? "a coupon link sent this session to Flipkart's login page" : `a coupon link was refused as not logged in${result.httpStatus ? ` (HTTP ${result.httpStatus})` : ""}`
+        );
+      }
       if (result.errorClass === "rate_limited") await sleep(5000);
       if (n < request.links.length - 1 && deps.linkPauseMs) await sleep(deps.linkPauseMs);
     }

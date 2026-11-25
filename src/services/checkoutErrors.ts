@@ -148,12 +148,24 @@ export const CHECKOUT_ERRORS: Record<CheckoutErrorCode, CheckoutErrorDef> = {
     failedStep: "product",
     stageDisplay: "Adding to cart",
   },
+  /**
+   * Flipkart sent this platform ID to its login page, or the ID has no session
+   * to open (not logged_in, no saved cookies). A verdict on the ID, whatever
+   * the product: the same login fails the same way again, and every retry
+   * spends one of the batch's attempts — 166 of them went on six dead accounts
+   * from 2026-10-28 to 11-24 — so the same ID is not re-queued and the batch
+   * goes on with its other IDs. A dead session the runner confirmed is handed
+   * to sessionEligibility.ts (checkoutRunner.ts loginLandingFailure); a login
+   * landing its re-check did NOT confirm is no verdict, and that failure
+   * overrides noRetry so the ID is re-queued as before (UNCONFIRMED_LANDING).
+   */
   SESSION_EXPIRED: {
     code: "SESSION_EXPIRED",
     display: "Session expired",
     source: "PLATFORM",
     failedStep: "session",
     stageDisplay: "Session",
+    noRetry: true,
   },
   /**
    * Flipkart is asking for a delivery pincode — it has not judged the product yet.

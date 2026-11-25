@@ -7,9 +7,18 @@ import type { AddressDetails } from "../types.js";
 
 const OBJECT_ID_RE = /^[a-f0-9]{24}$/i;
 
+/** The one refusal of a logged_in row with a saved session that a flow may hand over as confirmed: there is nothing to log in with. */
+export const NO_SAVED_COOKIES = "No saved session cookies";
+
+/**
+ * `sessionSavedAt` is the session the flow is about to test. A flow that later
+ * reports it dead passes it on to markSessionEligibleForRelogin
+ * (sessionEligibility.ts), whose writes match only that session — a login that
+ * lands meanwhile is never touched. A refusal carries it when the row has one.
+ */
 export type SessionLookup =
-  | { ok: true; email: string; platformId: string; cookies: unknown[] }
-  | { ok: false; email: string; reason: string };
+  | { ok: true; email: string; platformId: string; cookies: unknown[]; sessionSavedAt: Date }
+  | { ok: false; email: string; reason: string; sessionSavedAt?: Date | null };
 
 function cookiesFor(row: Pick<IPlatformId, "sessionCookies" | "sessionState"> | null) {
   const fromState = row?.sessionState?.cookies;
@@ -41,16 +50,17 @@ export async function resolveLoggedInSession(idOrEmail: string): Promise<Session
       ok: false,
       email: row.email,
       reason: `Status is "${row.status}", not logged_in`,
+      sessionSavedAt: row.sessionSavedAt ?? null,
     };
   }
 
   if (!row.sessionSavedAt) {
-    return { ok: false, email: row.email, reason: "No sessionSavedAt — session was never stored" };
+    return { ok: false, email: row.email, reason: "No sessionSavedAt — session was never stored", sessionSavedAt: null };
   }
 
   const cookies = cookiesFor(row);
   if (!cookies.length) {
-    return { ok: false, email: row.email, reason: "No saved session cookies" };
+    return { ok: false, email: row.email, reason: NO_SAVED_COOKIES, sessionSavedAt: row.sessionSavedAt };
   }
 
   return {
@@ -58,6 +68,7 @@ export async function resolveLoggedInSession(idOrEmail: string): Promise<Session
     email: row.email,
     platformId: String(row._id),
     cookies,
+    sessionSavedAt: row.sessionSavedAt,
   };
 }
 

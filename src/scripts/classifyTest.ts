@@ -9,7 +9,14 @@
  *
  * The samples come from the reference project's own test suite, plus the two
  * pages that produced real production failures.
+ *
+ * Also the login-page test of the /account pre-flight: from 2026-11-17 dead
+ * sessions failed as ADDRESS_SELECTION_FAILED (and were re-queued on the same
+ * ID) because FlipkartCheckout tested includes("/account/login") while
+ * Flipkart sends /account to /login?ret=%2faccount.
  */
+import { PREFLIGHT_LOGIN_MESSAGE } from "../automation/FlipkartCheckout.js";
+import { flipkartLoginUrl } from "../services/browser.js";
 import { classifyPageText, classifyThrownMessage, CHECKOUT_ERRORS } from "../services/checkoutErrors.js";
 
 type Expect = string | null;
@@ -119,6 +126,8 @@ const VERDICTS = [
   "ITEM_NOT_DELIVERABLE",
   "MAX_UNITS_REACHED",
   "COD_UNAVAILABLE",
+  // The login page, or no session at all: the same ID fails the same way, and each retry spends an attempt.
+  "SESSION_EXPIRED",
 ] as const;
 for (const code of [...VERDICTS, "PINCODE_NOT_SET"] as const) {
   const def = CHECKOUT_ERRORS[code];
@@ -139,6 +148,11 @@ console.log("\nThrown-message mapping");
 for (const [msg, want] of [
   ["Enter pincode to see if the product is in stock (122017)", "PINCODE_NOT_SET"],
   ["Session expired: Flipkart showed the login page on viewcart", "SESSION_EXPIRED"],
+  ["Session expired: Flipkart showed the login page on viewcart — moved to Not logged in", "SESSION_EXPIRED"],
+  ["Pre-flight: Session expired — Flipkart showed the login page on /account", "SESSION_EXPIRED"],
+  ["Pre-flight: Session expired — Flipkart showed the login page on /account — moved to Not logged in", "SESSION_EXPIRED"],
+  // A real address failure keeps its own code.
+  ["No Platform-ID phone stored for this account and its registered mobile could not be read. Add a phone on the Platform ID, or turn the Ordering Phone toggle on.", "ADDRESS_SELECTION_FAILED"],
   ["Product not in viewcart", "ADD_TO_CART_FAILED"],
   ["Cash on Delivery is unavailable for this cart on this account/pincode", "COD_UNAVAILABLE"],
 ] as const) {
@@ -146,6 +160,32 @@ for (const [msg, want] of [
   const pass = got === want;
   if (!pass) failures += 1;
   console.log(`  ${pass ? "ok  " : "FAIL"} "${msg.slice(0, 44)}..." -> ${got}`);
+}
+
+console.log("\nThe /account pre-flight's login page (FlipkartCheckout.fetchAccountMobile)");
+{
+  const check = (pass: boolean, label: string) => {
+    if (!pass) failures += 1;
+    console.log(`  ${pass ? "ok  " : "FAIL"} ${label}`);
+  };
+  const today = "https://www.flipkart.com/login?ret=%2faccount";
+  const oldTest = (url: string) => url.toLowerCase().includes("/account/login");
+  check(flipkartLoginUrl(today) === true, `flipkartLoginUrl("${today}") is true`);
+  check(oldTest(today) === false, `the old includes("/account/login") is false for it — the miss this guards against`);
+  for (const [url, want] of [
+    ["https://www.flipkart.com/account/login?ret=%2faccount", true],
+    ["https://www.flipkart.com/login?ret=%2faccount%2forders", true],
+    ["https://www.flipkart.com/login", true],
+    ["https://www.flipkart.com/account", false],
+    ["https://www.flipkart.com/account/orders", false],
+    ["https://www.flipkart.com/account/addresses", false],
+    ["https://www.flipkart.com/viewcart?exploreMode=TRUE&preference=FLIPKART", false],
+  ] as const) {
+    check(flipkartLoginUrl(url) === want, `flipkartLoginUrl("${url}") is ${want}`);
+  }
+  check(PREFLIGHT_LOGIN_MESSAGE === "Pre-flight: Session expired — Flipkart showed the login page on /account", "what fetchAccountMobile throws on it");
+  const thrown = classifyThrownMessage(PREFLIGHT_LOGIN_MESSAGE);
+  check(thrown.code === "SESSION_EXPIRED" && thrown.noRetry === true, `classifyThrownMessage(it) → ${thrown.code}, noRetry=${thrown.noRetry} (want SESSION_EXPIRED, noRetry=true)`);
 }
 
 console.log(failures === 0 ? "\nPASS — all cases\n" : `\nFAIL — ${failures} case(s)\n`);

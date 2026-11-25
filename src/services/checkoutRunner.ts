@@ -1,6 +1,6 @@
 import type { Page } from "playwright";
 import { CheckoutJob } from "../models/CheckoutJob.js";
-import { FlipkartCheckout, OutOfStockPincodeError } from "../automation/FlipkartCheckout.js";
+import { FlipkartCheckout, OutOfStockPincodeError, PREFLIGHT_LOGIN_MESSAGE } from "../automation/FlipkartCheckout.js";
 import { FlipkartApiWatcher } from "../automation/FlipkartApiWatcher.js";
 import { PaymentApiWatcher, type PlacedOrderDetails } from "../automation/PaymentApiWatcher.js";
 import { closeReporter, openReporter, reporterFor } from "./jobReporter.js";
@@ -17,6 +17,7 @@ import { currentProxyMode } from "./proxyMode.js";
 import { setNavigationTimeoutScale } from "../automation/helpers.js";
 import {
   blockFlipkartLogout,
+  confirmLoginLanding,
   desktopContext,
   flipkartLoginUrl,
   launchMobileBrowser,
@@ -33,7 +34,8 @@ import { cardPoolAdmission } from "./cardPool.js";
 import { getRedis } from "../lib/redis.js";
 import { nextOrderingPhone } from "./orderingPhonePool.js";
 import { PlatformId } from "../models/PlatformId.js";
-import { resolveLoggedInSession } from "./sessionStore.js";
+import { resolveLoggedInSession, type SessionLookup } from "./sessionStore.js";
+import { markSessionEligibleForRelogin } from "./sessionEligibility.js";
 import { lockAccount } from "./accountLock.js";
 import { enqueueOrderSync } from "./orderSync.js";
 import { resolveCheckoutSettings } from "./checkoutSettings.js";
@@ -228,6 +230,77 @@ if (PAYMENT_DRY_RUN) console.warn("[checkout] PAYMENT_DRY_RUN=true — orders st
 async function checkoutShowsE002(page: Page): Promise<boolean> {
   const text = String(await page.evaluate(() => document.body?.innerText || "").catch(() => ""));
   return /Something went wrong/i.test(text) && !/Deliver to/i.test(text);
+}
+
+/** What the job says when the desktop leg lands on Flipkart's login page, by where it did. */
+const LOGIN_LANDING = {
+  viewcart: { message: "Session expired: Flipkart showed the login page on viewcart", step: "cart" },
+  "/account": { message: PREFLIGHT_LOGIN_MESSAGE, step: "preflight" },
+} as const;
+
+/** Appended to the job's error when the hand-off moved the ID to Not logged in. */
+export const MOVED_TO_NOT_LOGGED_IN = " — moved to Not logged in";
+
+/**
+ * A login landing the re-check did not confirm — My Orders opened with the
+ * cookies attached again, or the re-check could not run. That is no verdict on
+ * the ID, so the job is re-queued on it as SESSION_EXPIRED always was; only a
+ * confirmed landing keeps SESSION_EXPIRED's noRetry.
+ */
+const UNCONFIRMED_LANDING = { noRetry: false } as const;
+
+/**
+ * The desktop leg landed on Flipkart's login page — on viewcart, or on /account
+ * in the pre-flight — and the job is about to fail SESSION_EXPIRED. Nothing is
+ * in the cart yet.
+ *
+ * First the landing is confirmed on the same, still-open page: the saved
+ * cookies attached again and My Orders opened once more (browser.ts
+ * confirmLoginLanding). Only a second landing is a verdict on the ID: it is
+ * not re-queued (checkoutErrors.ts noRetry), and it goes to the one
+ * dead-session hand-off (sessionEligibility.ts), whose own rules — a session
+ * saved less than 24 h ago, a session replaced since this job read it, the
+ * 6-hour cap — decide whether the ID moves to Not logged in. An unconfirmed
+ * landing is re-queued as before. Returns the failure to throw; never throws
+ * itself.
+ */
+export async function loginLandingFailure(
+  where: keyof typeof LOGIN_LANDING,
+  input: {
+    page: Page;
+    session: Extract<SessionLookup, { ok: true }>;
+    userId: string;
+    jobId: string;
+    log: (level: LogLevel, message: string, step?: string) => void;
+  }
+): Promise<CheckoutFailure> {
+  const { message, step } = LOGIN_LANDING[where];
+  const { page, session, log } = input;
+  let confirmed = false;
+  try {
+    confirmed = await confirmLoginLanding(page, session.cookies);
+    if (!confirmed) log("warn", `[session] login page on ${where}, but /account/orders opened with the cookies attached again — not handed off`, step);
+  } catch (err) {
+    log("warn", `[session] login page on ${where}; the re-check on /account/orders did not finish (${err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : String(err)}) — not handed off`, step);
+  }
+  if (!confirmed) return new CheckoutFailure("SESSION_EXPIRED", message, UNCONFIRMED_LANDING);
+  const out = await markSessionEligibleForRelogin({
+    userId: input.userId,
+    platformId: session.platformId,
+    email: session.email,
+    reason: `Checkout: Flipkart sent this ID to the login page (${where}, then /account/orders) — re-login`,
+    flow: "checkout",
+    confirmed: true,
+    sessionSavedAt: session.sessionSavedAt,
+    via: "worker",
+    requestId: input.jobId,
+  });
+  log(
+    out.demoted ? "warn" : "info",
+    `[session] Flipkart sent this ID to the login page twice (${where}, then /account/orders) — ${out.demoted ? "moved to Not logged in for re-login" : `not moved${out.note}`}`,
+    step
+  );
+  return new CheckoutFailure("SESSION_EXPIRED", out.demoted ? `${message}${MOVED_TO_NOT_LOGGED_IN}` : message);
 }
 
 /** How quiet a `running` job's heartbeat must go before another worker may take
@@ -492,9 +565,16 @@ async function runClaimedCheckoutJob(
     job.errorDetails = fields.errorDetails;
     job.completedAt = new Date();
     job.logs.push({ at: new Date(), level: "error", step: "session", message: session.reason });
+    if (sessionFail.noRetry) {
+      job.logs.push({ at: new Date(), level: "info", step: "batch", message: `${sessionFail.code} is a verdict on this platform ID — not re-queued; the batch continues with the next ID` });
+    }
     await job.save();
     await releaseReservation();
-    await maybeEnqueueRetry(data, job.userId, "session", job.request);
+    // An ID with no session to open fails the same way on a retry: the batch goes on with its other IDs.
+    if (!sessionFail.noRetry) await maybeEnqueueRetry(data, job.userId, "session", job.request);
+    // No Chrome was opened: the account is free again at once (held, it would keep the dashboard's
+    // login of exactly this ID, and every other flow on it, waiting out ACCOUNT_LOCK_MS).
+    await unlockAccount();
     return;
   }
 
@@ -958,16 +1038,30 @@ async function runClaimedCheckoutJob(
     log("info", "Opening viewcart to empty existing items", "cart");
     await checkout.emptyCart();
     if (flipkartLoginUrl(page.url())) {
-      throw new Error("Session expired: Flipkart showed the login page on viewcart");
+      throw await loginLandingFailure("viewcart", { page, session, userId: job.userId, jobId: data.jobId, log });
     }
 
-    // Pre-flight: /account is the session guard (fetchAccountMobile throws if
-    // /account bounced to login). The delivery phone was already resolved above
-    // (ordering pool, or this ID's stored DB phone) and written onto the
-    // address; only if the toggle is off AND no phone is stored do we fall back
-    // to the account's own live mobile here.
+    // Pre-flight: /account is the session guard (fetchAccountMobile throws
+    // PREFLIGHT_LOGIN_MESSAGE when Flipkart sends /account to its login page).
+    // The delivery phone was already resolved above (ordering pool, or this
+    // ID's stored DB phone) and written onto the address; only if the toggle is
+    // off AND no phone is stored do we fall back to the account's own live
+    // mobile here.
     log("info", "Pre-flight: verify session", "preflight");
-    const accountMobile = await checkout.fetchAccountMobile();
+    let accountMobile: string | null = null;
+    let accountError: unknown = null;
+    try {
+      accountMobile = await checkout.fetchAccountMobile();
+    } catch (err) {
+      accountError = err;
+    }
+    // Checked before the phone: a read that gave nothing because the page is on
+    // the login page is the session, never the phone error below (which reads
+    // as ADDRESS_SELECTION_FAILED).
+    if (flipkartLoginUrl(page.url()) || (accountError instanceof Error && accountError.message === PREFLIGHT_LOGIN_MESSAGE)) {
+      throw await loginLandingFailure("/account", { page, session, userId: job.userId, jobId: data.jobId, log });
+    }
+    if (accountError) throw accountError;
     let phone = String(address.mobile || "").replace(/\D/g, "").slice(-10);
     if (!phone && !useOrderingPhone) {
       // Toggle off but this ID had no cached phone in the DB — read it live from
@@ -996,7 +1090,8 @@ async function runClaimedCheckoutJob(
     log("info", `Pre-flight done: one Flipkart address, ${deliveryPhoneSource} phone ending ${phone.slice(-4)}`, "preflight");
 
     if (flipkartLoginUrl(page.url())) {
-      throw new Error("Session expired: Flipkart showed the login page during pre-flight");
+      // Not confirmed (viewcart and /account both passed just before): re-queued as SESSION_EXPIRED always was.
+      throw new CheckoutFailure("SESSION_EXPIRED", "Session expired: Flipkart showed the login page during pre-flight", UNCONFIRMED_LANDING);
     }
 
     // ---- desktop leg done; everything from here is the m-site ----------------

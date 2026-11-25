@@ -5,18 +5,18 @@ import { config } from "../config.js";
 import { isDestroyedContext } from "../lib/evalOnPage.js";
 import { Order } from "../models/Order.js";
 import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
-import { markSessionEligibleForRelogin } from "./sessionEligibility.js";
+import { demoteCircuitFor, forgetDemoteCircuit, markSessionEligibleForRelogin, SessionDeadError } from "./sessionEligibility.js";
 import { OrderUpdateRequest, type IOrderUpdateRequest, type IUpdateAccount, type UpdateSource } from "../models/OrderUpdateRequest.js";
 import { getUpdateQueue, type UpdateJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
-import { blockFlipkartLogout, closeBrowser, flipkartLoginUrl, launchStealthContext, restoreFlipkartSession, sleep } from "./browser.js";
+import { blockFlipkartLogout, closeBrowser, confirmLoginLanding, flipkartLoginUrl, launchStealthContext, restoreFlipkartSession, sleep } from "./browser.js";
 import { openOrderApiSession, OrderApiSessionError } from "./orderApi.js";
-import { apiScrapeAndSave, scrapeAndSave, type OrderAccount } from "./orderFetch.js";
+import { apiScrapeAndSave, scrapeAndSave, sessionExpiredMessage, type OrderAccount } from "./orderFetch.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { DEFAULT_UPDATE_STATUSES, stageOf } from "./orderLifecycle.js";
 import { resolveTargets, type UpdateTriggerInput } from "./orderUpdate.js";
 import { recordUnitChanges, snapshotUnit } from "./orderUnitEvents.js";
-import { resolveLoggedInSession, workspaceUserId } from "./sessionStore.js";
+import { NO_SAVED_COOKIES, resolveLoggedInSession, workspaceUserId } from "./sessionStore.js";
 import { noteDeliveredOrder, queueInvoicesAfterUpdate } from "./requestChains.js";
 import { closeUpdateAccountRows, openRequestTasksQuietly, syncRequestTasksQuietly, taskLog, updateTaskKey } from "./syncTaskLog.js";
 
@@ -408,13 +408,20 @@ async function bumpAccount(requestId: Types.ObjectId | string, email: string, in
   await OrderUpdateRequest.updateOne({ _id: requestId }, { $inc }, { arrayFilters: [{ "a.email": email }] });
 }
 
-/** Done once every account is settled — the last job to finish closes the request. */
-async function settleRequest(requestId: Types.ObjectId | string) {
+/**
+ * Done once every account is settled — the last job to finish closes the
+ * request, and its dead-session circuit goes with it. A stopped request never
+ * closes here: an account that stops on it drops the circuit once no other
+ * account of it is still running.
+ */
+async function settleRequest(requestId: Types.ObjectId | string, stopped = false) {
   const res = await OrderUpdateRequest.updateOne(
     { _id: requestId, status: { $in: ["queued", "running"] }, "accounts.status": { $nin: ["queued", "running"] } },
     { $set: { status: "done", finishedAt: new Date() } }
   );
+  if (!res.modifiedCount && stopped && !(await OrderUpdateRequest.exists({ _id: requestId, "accounts.status": "running" }).catch(() => true))) forgetDemoteCircuit(String(requestId));
   if (res.modifiedCount) {
+    forgetDemoteCircuit(String(requestId));
     const row = await OrderUpdateRequest.findById(requestId).select("-accounts.units").lean();
     if (row) {
       const pub = publicUpdateRequest(row);
@@ -427,11 +434,44 @@ async function settleRequest(requestId: Types.ObjectId | string) {
   }
 }
 
-export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string | undefined): Promise<void> {
+/** My Orders: where the update's Chrome checks that the account is logged in before it opens any order. */
+const MY_ORDERS_URL = "https://www.flipkart.com/account/orders?link=home_orders";
+/** A unit that needed the page after Flipkart had sent this ID to the login page twice: no Chrome is opened for it. */
+export const PAGE_SKIPPED = "page skipped — Flipkart sent this ID to the login page";
+
+/**
+ * What one update job reaches outside Mongo. The worker passes nothing;
+ * scripts/deadSessionFlowsCheck.ts passes a Chromium that answers every
+ * request itself, a fake order API and no Redis lock.
+ */
+export interface UpdateJobDeps {
+  launch: typeof launchStealthContext;
+  lock: typeof lockAccount;
+  /** Flipkart's order API (API mode): the session, and one unit's read. */
+  openApi: typeof openOrderApiSession;
+  apiRead: typeof apiScrapeAndSave;
+}
+
+const updateJobDefaults: UpdateJobDeps = { launch: launchStealthContext, lock: lockAccount, openApi: openOrderApiSession, apiRead: apiScrapeAndSave };
+
+/**
+ * One account of an update request.
+ *
+ * A dead session (sessionEligibility.ts): Chrome opens My Orders before any
+ * order, and a login landing there is looked at once more with the cookies
+ * attached again (confirmLoginLanding). A second landing marks the page dead —
+ * no unit opens Chrome for this account again. If the account read nothing in
+ * this run, it is handed off once (F1's rules decide whether the row moves to
+ * Not logged in), its units end failed with one sentence and the account
+ * stops. If it had read units already, nothing is handed off: only the page
+ * work left is skipped.
+ */
+export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string | undefined, overrides: Partial<UpdateJobDeps> = {}): Promise<void> {
   if (job.name === "sweep") {
     await runUpdateSweep(job.data.sweep === "ofd" ? "ofd" : "active");
     return;
   }
+  const deps: UpdateJobDeps = { ...updateJobDefaults, ...overrides };
   const { requestId, email } = job.data;
   const request = await OrderUpdateRequest.findById(requestId).lean();
   if (!request || request.status === "cancelled") return;
@@ -441,7 +481,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
   const stale = account.status === "running" && (!account.startedAt || Date.now() - new Date(account.startedAt).getTime() > STALE_ACCOUNT_MS);
   if (account.status !== "queued" && !stale) return;
 
-  const unlock = await lockAccount(me, `update:${requestId}:${config.workerId}`);
+  const unlock = await deps.lock(me, `update:${requestId}:${config.workerId}`);
   if (!unlock) {
     await job.moveToDelayed(Date.now() + LOCK_RETRY_MS, token);
     throw new DelayedError();
@@ -452,6 +492,9 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
   let chromeHeld = false; // true once this account has taken a slot from the Chrome gate
   // How this account ended, for the task log: the units it never got to end the same way.
   let ended: { status: string; message: string } | null = null;
+  // Units this run read — whether a dead page is handed off, and how the account counts in the request's circuit.
+  let read = 0;
+  let circuitPushed = false;
   try {
     await OrderUpdateRequest.updateOne({ _id: requestId, status: "queued" }, { $set: { status: "running", startedAt: new Date() } });
     await setAccount(requestId, me, { status: "running", startedAt: new Date(), done: 0, failed: 0, statusChanged: 0, otpNew: 0, message: "" });
@@ -460,15 +503,31 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
     if (!session.ok) {
       ended = { status: "failed", message: `Session: ${session.reason} — re-login this ID` };
       await setAccount(requestId, me, { status: "failed", finishedAt: new Date(), message: `Session: ${session.reason} — re-login this ID` });
-      await markSessionEligibleForRelogin({ userId: request.userId, platformId: account.platformId, email: me, reason: `Update: ${session.reason} — re-login this ID`, via: "worker", requestId });
+      // Only "no saved cookies" on a logged_in row is certain without a page; a row with no sessionSavedAt is already in the login pool.
+      await markSessionEligibleForRelogin({
+        userId: request.userId,
+        platformId: account.platformId,
+        email: me,
+        reason: `Update: ${session.reason} — re-login this ID`,
+        flow: "update",
+        confirmed: session.reason === NO_SAVED_COOKIES,
+        sessionSavedAt: session.sessionSavedAt ?? null,
+        via: "worker",
+        requestId,
+      });
       await log("warn", `session: ${session.reason} — re-login this ID`);
       return;
     }
-    const acct: OrderAccount = { id: new Types.ObjectId(session.platformId), email: session.email, cookies: session.cookies };
+    const acct: OrderAccount = { id: new Types.ObjectId(session.platformId), email: session.email, cookies: session.cookies, sessionSavedAt: session.sessionSavedAt };
     const mode = request.mode;
 
+    // Chrome, on the first unit that needs the page. `page` is kept only once My Orders opened on it.
     let page: Page | null = null;
-    const openPage = async () => {
+    let tab: Page | null = null; // the account's one tab, kept or not
+    // Flipkart sent this ID to the login page twice: no unit opens Chrome for it again.
+    let pageDead = false;
+    const openPage = async (): Promise<Page> => {
+      if (pageDead) throw new SessionDeadError(PAGE_SKIPPED);
       if (page) return page;
       // One browser per account, and no more than CHROME_GATE_MAX across all windows.
       // Guard the acquire so a retry after a failed launch never takes a 2nd slot.
@@ -476,19 +535,51 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
         await acquireChrome();
         chromeHeld = true;
       }
-      launched = await launchStealthContext({ headless: config.headless });
-      page = await launched.context.newPage();
-      await blockFlipkartLogout(page);
-      await restoreFlipkartSession(page, acct.cookies);
-      await page.goto("https://www.flipkart.com/account/orders?link=home_orders", { waitUntil: "domcontentloaded", timeout: 30_000 });
-      if (flipkartLoginUrl(page.url())) throw new Error("Flipkart session expired. Refresh this ID in platform id first.");
-      return page;
+      // One browser and one tab for the account, however many times the check below runs.
+      const l = launched ?? (launched = await deps.launch({ headless: config.headless }));
+      let p = tab;
+      if (!p) {
+        p = tab = await l.context.newPage();
+        await blockFlipkartLogout(p);
+      }
+      await restoreFlipkartSession(p, acct.cookies);
+      try {
+        await p.goto(MY_ORDERS_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      } catch (err) {
+        // A My Orders load that timed out or failed says nothing about the login: the tab is kept, as it always
+        // was, so the next unit goes straight to its own order page (scrapeAndSave's login checks still stop a
+        // dead one). Only a tab sitting on the login page is not kept.
+        if (!flipkartLoginUrl(p.url())) page = p;
+        throw err;
+      }
+      if (flipkartLoginUrl(p.url())) {
+        // Once more with the cookies attached again; a re-check that cannot run (it throws) confirms nothing.
+        if (await confirmLoginLanding(p, acct.cookies).catch(() => false)) {
+          pageDead = true;
+          throw new SessionDeadError();
+        }
+        if (flipkartLoginUrl(p.url())) throw new Error("Flipkart session expired. Refresh this ID in platform id first.");
+      }
+      page = p;
+      return p;
     };
+    // The stored page was sent to the login page later (an order URL): looked at once more, once per account.
+    let landingChecked = false;
+    /** Is this failure Flipkart's login page, twice? Sets pageDead when it is. */
+    const loginTwice = async (err: unknown, text: string): Promise<boolean> => {
+      if (err instanceof SessionDeadError) return true;
+      if (pageDead || landingChecked || !page || !/^Flipkart session expired/.test(text)) return false;
+      landingChecked = true;
+      pageDead = await confirmLoginLanding(page, acct.cookies).catch(() => false);
+      return pageDead;
+    };
+    // The dead page has been dealt with: handed off, or (units already read) the rest of the page work skipped.
+    let deadNoted = false;
 
     let api: APIRequestContext | null = null;
     if (mode === "api") {
       try {
-        api = await openOrderApiSession(acct.cookies);
+        api = await deps.openApi(acct.cookies);
       } catch (err) {
         await log("warn", `API session unavailable (${err instanceof Error ? err.message : err}) — using the page`);
       }
@@ -518,15 +609,16 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           let usedPage = false; // did this unit already go through Chrome this round?
           if (api) {
             try {
-              result = await apiScrapeAndSave(api, userId, acct, card, { applyCalendar: false });
+              result = await deps.apiRead(api, userId, acct, card, { applyCalendar: false });
             } catch (apiErr) {
               if (apiErr instanceof OrderApiSessionError) {
-                await log("warn", `${apiErr.message} — using the page from here`);
+                await log("warn", `${apiErr.message} — ${pageDead ? "and the page is skipped: the rest of this account fails" : "using the page from here"}`);
                 await api.dispose().catch(() => undefined);
                 api = null;
                 via = "page";
               } else {
-                await log("warn", `${u.orderId}/${u.unitId}: API read failed (${apiErr instanceof Error ? apiErr.message.slice(0, 140) : apiErr}) — page`);
+                // "— page" alone is no failure yet (the page may read it); "— page skipped" is this unit's failure.
+                await log("warn", `${u.orderId}/${u.unitId}: API read failed (${apiErr instanceof Error ? apiErr.message.slice(0, 140) : apiErr}) — ${pageDead ? "page skipped" : "page"}`);
               }
               result = await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
               usedPage = true;
@@ -547,6 +639,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
           if (changes.stageChanged && stageOf(after?.status_key) === "delivered") await noteDeliveredOrder(requestId, u.orderId);
           await bumpAccount(requestId, me, { done: 1, ...(changes.stageChanged ? { statusChanged: 1 } : {}), ...(changes.otpNew ? { otpNew: 1 } : {}) });
+          read += 1;
           taskLog.mark(requestId, taskKey, { status: "success" });
           if (changes.stageChanged || changes.otpNew || changes.addressChanged) {
             await log(
@@ -556,20 +649,57 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           }
         } catch (err) {
           if (isDestroyedContext(err)) throw err;
-          await bumpAccount(requestId, me, { failed: 1 });
           const text = err instanceof Error ? err.message.split("\n")[0] : String(err);
+          const dead = await loginTwice(err, text);
+          await bumpAccount(requestId, me, { failed: 1 });
           taskLog.mark(requestId, taskKey, { status: "failed", message: text });
           if (/gave no data/.test(text)) noData++;
-          await log("warn", `${u.orderId}/${u.unitId}: ${text.slice(0, 200)}`);
+          // A unit that only skipped the dead page adds nothing: the account's one line already said why.
+          if (!(dead && deadNoted)) await log("warn", `${u.orderId}/${u.unitId}: ${text.slice(0, 200)}`);
+          if (dead && !deadNoted) {
+            deadNoted = true;
+            if (read === 0) {
+              // Nothing of this account read in this run, the order API refused it (or the run reads pages) and
+              // Flipkart sent My Orders to the login page twice: handed off once; the account stops here.
+              const circuit = demoteCircuitFor(String(requestId));
+              const wasOpen = circuit.open;
+              circuit.push("dead");
+              circuitPushed = true;
+              if (circuit.open && !wasOpen) await pushLog(requestId, "warn", `Dead sessions: ${circuit.describe()} — no ID is moved to Not logged in for the rest of this update`);
+              const out = await markSessionEligibleForRelogin({
+                userId: request.userId,
+                platformId: acct.id,
+                email: me,
+                reason: `Update: ${mode === "api" ? "the order API refused this ID and " : ""}Flipkart sent /account/orders to the login page twice — re-login`,
+                flow: "update",
+                confirmed: true,
+                sessionSavedAt: session.sessionSavedAt,
+                circuitOpen: circuit.open,
+                via: "worker",
+                requestId,
+              });
+              const message = sessionExpiredMessage(out);
+              // The units it never got to are failed with it (closeUpdateAccountRows gives their rows the same sentence).
+              const untried = account.units.length - (n + 1);
+              if (untried > 0) await bumpAccount(requestId, me, { failed: untried });
+              ended = { status: "failed", message };
+              await setAccount(requestId, me, { status: "failed", via, finishedAt: new Date(), message });
+              await log("warn", `${message}${untried ? ` · ${untried} more unit(s) not tried` : ""}`);
+              return;
+            }
+            await log("warn", `Flipkart sent this ID to the login page twice after ${read} unit(s) were read — not moved to Not logged in; the rest of its page work is skipped`);
+          }
         }
       }
       // ── Phase 2 — surgical scrape ───────────────────────────────────────────
       // Only OFD units the API couldn't give an OTP for. One browser (gated), each
       // unit already counted as `done` in Phase 1, so here we pick up only the OTP
-      // (and any stage move the page reveals) without re-counting.
-      if (needsScrape.length) {
+      // (and any stage move the page reveals) without re-counting. Not on a page
+      // that is already dead.
+      if (needsScrape.length && !pageDead) {
         await log("info", `${needsScrape.length} out-for-delivery unit(s) without an API OTP — scraping those for OTP`);
-        for (const u of needsScrape) {
+        for (let k = 0; k < needsScrape.length; k++) {
+          const u = needsScrape[k];
           const fresh = await OrderUpdateRequest.findById(requestId).select("status").lean();
           if (!fresh || fresh.status === "cancelled") break;
           const card = { orderId: u.orderId, itemId: u.itemId, unitId: u.unitId, orderUrl: u.orderUrl, amount: "" };
@@ -588,19 +718,23 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
             }
           } catch (err) {
             if (isDestroyedContext(err)) throw err;
-            await log("warn", `${u.orderId}/${u.unitId}: OTP scrape failed (${err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : err})`);
+            const text = err instanceof Error ? err.message.split("\n")[0] : String(err);
+            if (await loginTwice(err, text)) {
+              // Every unit of this pass was read over the API in this run: no hand-off, the rest of the pass is skipped.
+              deadNoted = true;
+              await log("warn", `Flipkart sent this ID to the login page twice during the OTP pass — not moved to Not logged in (${read} unit(s) read); ${needsScrape.length - k} OTP scrape(s) skipped`);
+              break;
+            }
+            await log("warn", `${u.orderId}/${u.unitId}: OTP scrape failed (${text.slice(0, 160)})`);
           }
         }
       }
 
       const final = (await OrderUpdateRequest.findById(requestId).select("accounts").lean())?.accounts.find((a) => a.email === me);
-      // Every unit's page rendered nothing and the API refused the session:
-      // the login is the problem, not the orders. Mark the Platform ID's last
-      // check as an error (Session Health → Suspect) and tell the dashboard.
+      // Every order page rendered nothing on a page that had passed the login check: the orders, not the login,
+      // are the likely problem (a CSV that paired this ID with another one's orders). Nothing is handed off.
       if (noData > 0 && (final?.done ?? 0) === 0 && noData === account.units.length) {
-        const reason = `Update: ${noData} order page(s) rendered nothing and the API refused the session — re-login this ID`;
-        await markSessionEligibleForRelogin({ userId: request.userId, platformId: acct.id, email: me, reason, via, requestId });
-        await log("warn", `every order page rendered nothing (${noData}) — Platform ID set eligible for re-login`);
+        await log("warn", `every order page rendered nothing — the session passed the login check; these orders may belong to another Platform ID (${noData} unit(s))`);
       }
       ended = { status: "done", message: "" };
       await setAccount(requestId, me, {
@@ -618,6 +752,8 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
     await setAccount(requestId, me, { status: "failed", finishedAt: new Date(), message });
     await log("error", `failed: ${message}`);
   } finally {
+    // How this account counts in its request's dead-session circuit, unless its hand-off already counted it.
+    if (!circuitPushed) demoteCircuitFor(String(requestId)).push(read > 0 ? "alive" : "other");
     if (launched) {
       const l = launched as { browser: Browser; context: BrowserContext };
       await closeBrowser(l.browser, l.context).catch(() => undefined);
@@ -625,7 +761,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
     if (chromeHeld) releaseChrome();
     await unlock();
     if (ended) await closeUpdateAccountRows(requestId, me, ended);
-    await settleRequest(requestId);
+    await settleRequest(requestId, ended?.status === "cancelled");
     await sleep(300);
   }
 }

@@ -16,6 +16,9 @@ export interface IPlatformId {
   lastChecked: Date | null;
   /** Set when a worker demoted this row from logged_in to pending (cookies kept). The dashboard's verify-undo reverses it. */
   statusBeforeDemote?: string;
+  /** When and by whom ("trade-flow:<flow>", "verify-http:…") the row was demoted — what Session Health → Undo matches (last 24 h). */
+  demotedAt?: Date | null;
+  demotedBy?: string;
   /** The last session check a worker recorded — read by Session Health. Mirrors the dashboard model's richer field (kept Mixed here). */
   sessionCheck?: unknown;
 }
@@ -32,6 +35,8 @@ const PlatformIdSchema = new Schema<IPlatformId>(
     phone: { type: String, default: "" },
     lastChecked: { type: Date, default: null },
     statusBeforeDemote: { type: String, default: "" },
+    demotedAt: { type: Date, default: null },
+    demotedBy: { type: String, default: "" },
     sessionCheck: { type: Schema.Types.Mixed, default: null },
   },
   { timestamps: true, strict: false }

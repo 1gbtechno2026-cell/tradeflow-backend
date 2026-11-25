@@ -30,6 +30,8 @@
     "orders:backfill-cancelled-by": "tsx src/scripts/backfillCancelledBy.ts",
     "orders:unit-backfill": "tsx src/scripts/unitDataBackfill.ts",
     "test:unit-save": "tsx src/scripts/unitSaveCheck.ts",
+    "test:unit-mapper": "tsx src/scripts/unitMapperCheck.ts",
+    "test:refund-card": "tsx src/scripts/refundCardSaveCheck.ts",
     "test:start-requests": "tsx src/scripts/startRequestsCheck.ts",
     "test:invoice-batch": "tsx src/scripts/invoiceBatchCheck.ts",
     "test:coupons": "tsx src/scripts/couponRunnerCheck.ts",

@@ -101,6 +101,12 @@ export interface IOrder {
   refund_status: string | null;
   refund_amount: string | null;
   refund_msg: string | null;
+  /** From Flipkart's refund card (data-quality U3): when the money came back, and "reversal" | "supercoins" | "refund". */
+  refund_date: Date | null;
+  refund_kind: string | null;
+  /** Where card_name / card_number came from: "checkout" (our job), "flipkart_refund" (Flipkart's refund sentence,
+   *  orders no job of ours placed — decision 6), "" unknown / none. */
+  card_source: string;
   cancelled_date: Date | null;
   cancelled_from_bae: boolean;
   cancelled_by_user: boolean;
@@ -228,6 +234,9 @@ const OrderSchema = new Schema<IOrder>(
     refund_status: { type: String, default: null },
     refund_amount: { type: String, default: null },
     refund_msg: { type: String, default: null },
+    refund_date: { type: Date, default: null },
+    refund_kind: { type: String, default: null },
+    card_source: { type: String, default: "" },
     cancelled_date: { type: Date, default: null },
     cancelled_from_bae: { type: Boolean, default: false },
     cancelled_by_user: { type: Boolean, default: false },

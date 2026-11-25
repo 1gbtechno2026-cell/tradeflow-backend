@@ -127,10 +127,14 @@ function norm(v: unknown): string {
   if (typeof v === "boolean") return v ? "true" : "false";
   if (typeof v === "number") return String(v);
   const s = String(v).trim();
-  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return new Date(s).toISOString().slice(0, 16);
-  // Timestamps inside text ("Delivered · 2026-09-23T21:50:50+05:30"): the DOM
-  // only ever has minutes, the API has seconds — compare to the minute.
-  return s.replace(/(T\d{2}:\d{2}):\d{2}/g, "$1").replace(/\s+/g, " ").toLowerCase();
+  // A whole timestamp only: the reference's Last Tracking Step STARTS with one ("2026-09-23T21:50:50+05:30 | Delivered").
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?$/.test(s)) {
+    const at = new Date(s);
+    if (!Number.isNaN(at.getTime())) return at.toISOString().slice(0, 16);
+  }
+  // Timestamps inside text ("2026-09-23T21:50:50.123000+05:30 | Delivered"): the DOM
+  // only ever has minutes, the API has seconds and milliseconds — compare to the minute.
+  return s.replace(/(T\d{2}:\d{2}):\d{2}(\.\d+)?/g, "$1").replace(/\s+/g, " ").toLowerCase();
 }
 
 /**

@@ -19,7 +19,7 @@ import {
   restoreFlipkartSession,
   sleep,
 } from "./browser.js";
-import { addressHash, openOrderApiSession, type MappedOrderUnit, type ShippingAddress } from "./orderApi.js";
+import { addressHash, openOrderApiSession, referenceLastStep, type MappedOrderUnit, type RefundCard, type ShippingAddress } from "./orderApi.js";
 import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSync.js";
 import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
@@ -941,13 +941,9 @@ function parseTracking(raw: string): ITrackingStage[] {
   return stages;
 }
 
+/** The reference's ASCII "date | stage [| step | remark | remark date]" (data-quality U5), the same as the API path's. */
 function lastTrackingStep(tracking: ITrackingStage[]) {
-  const done = [...tracking].reverse().find((row) => row.stage === "DONE");
-  if (!done) return "";
-  const last = done.detailed_steps.slice(-1)[0];
-  const when = last?.progress[0]?.date || done.date;
-  if (!when) return done.status;
-  return `${done.status} · ${when}`;
+  return referenceLastStep(tracking);
 }
 
 export function parseOrderId(raw: string): string | null {
@@ -1191,6 +1187,19 @@ export function unitSetFor<T extends object>(fields: T): Partial<T> {
 // writes scrapeAndSave() does, so a unit saved either way looks identical in
 // Order Units History. A unit the API cannot serve falls back to the page.
 
+/**
+ * The card columns of a save (data-quality U3, decision 6). Our own checkout job always wins (card_source "checkout"
+ * for a card job; a COD job writes its blank card columns with card_source ""). Only when no job of ours placed the
+ * order does the card Flipkart's refund sentence names fill card_name / card_number, marked card_source
+ * "flipkart_refund". A failed job lookup writes nothing, so a stored checkout card is never replaced by a guess.
+ */
+export function cardColumnsFor(own: Record<string, unknown> | null, refundCard: RefundCard | null | undefined): Record<string, unknown> {
+  if (own === null) return {};
+  if (Object.keys(own).length) return { ...own, card_source: own.payment_mode === "card" ? "checkout" : "" };
+  if (!refundCard?.last4) return {};
+  return { card_name: refundCard.bank, card_number: `XXXXXXXXXXXX${refundCard.last4}`, card_source: "flipkart_refund" };
+}
+
 /** Persist one API-mapped unit exactly as scrapeAndSave() persists a scraped one. */
 export async function saveMappedUnit(
   userId: string,
@@ -1223,12 +1232,23 @@ export async function saveMappedUnit(
   }
 
   const lastFetch = new Date();
-  const existing = await Order.findOne({ userId, unit_id: mapped.unit_id }).select("id").lean();
+  const existing = await Order.findOne({ userId, unit_id: mapped.unit_id }).select("id api_extra.refund_card").lean();
   const seq = existing?.id || (await nextSeq("order_fetch"));
   // api_extra (fsn = the product id, listing_id, seller_id, prices) is kept on the unit: the
   // dashboard's Product ID / Listing ID filters and the Order Details rows read it. It was
   // dropped here until 2026-11-24, so only units saved from then on carry it.
-  const { api_extra, ...fields } = mapped;
+  const { api_extra, refund_card, refund_date, refund_kind, ...fields } = mapped;
+  const own = await cardFieldsFor(userId, account.email, mapped.order_id).catch(() => null);
+  const cardColumns = cardColumnsFor(own, refund_card);
+  // A refund's date and kind belong to its refund card: an answer without one leaves the stored pair, as unitSetFor
+  // leaves the stored status / amount / message.
+  const refundExtra = mapped.refund_status || mapped.refund_amount ? { refund_date: refund_date ?? null, refund_kind: refund_kind ?? null } : {};
+  // api_extra is written whole, so the structured refund card (bank, network, type, last four) is carried forward from
+  // the stored row when this save writes no card columns at all (no job of ours, no card in this answer, or a failed
+  // job lookup) — card_name / card_number stay then too. A checkout job's columns drop it.
+  const storedRefundCard = (existing as { api_extra?: { refund_card?: RefundCard | null } } | null)?.api_extra?.refund_card || null;
+  const keptRefundCard = cardColumns.card_source === "flipkart_refund" && refund_card ? refund_card : !Object.keys(cardColumns).length ? storedRefundCard : null;
+  const apiExtra = api_extra && keptRefundCard ? { ...api_extra, refund_card: keptRefundCard } : api_extra;
   await Order.updateOne(
     { userId, unit_id: mapped.unit_id },
     {
@@ -1239,10 +1259,12 @@ export async function saveMappedUnit(
         platform_email: account.email,
         platform: "FLIPKART",
         ...unitSetFor(fields),
-        ...(api_extra ? { api_extra } : {}),
+        ...refundExtra,
+        ...(apiExtra ? { api_extra: apiExtra } : {}),
         is_bae_order: false,
         // Our own checkout job's card and payment columns, written as they come: a COD job's blank card columns included.
-        ...(await cardFieldsFor(userId, account.email, mapped.order_id).catch(() => ({}))),
+        // Else the card Flipkart's refund sentence names (cardColumnsFor).
+        ...cardColumns,
         fetch_source: "api",
         is_logged_in: true,
         last_fetch: lastFetch,
@@ -2283,8 +2305,13 @@ export async function scrapeAndSave(
   // if (delivered && !cancelled && !failed) { downloadDeliveredInvoice(...) }
 
   const lastFetch = new Date();
-  const existing = await Order.findOne({ userId, unit_id: unitKey }).select("id").lean();
+  const existing = await Order.findOne({ userId, unit_id: unitKey }).select("id product_name refund_status").lean();
   const seq = existing?.id || (await nextSeq("order_fetch"));
+  // The page shows Flipkart's title without its subtitle; a stored name that starts with it is the fuller one the API
+  // read gave (decision 7, "Title (Colour, Storage) (8 GB RAM)") and stays.
+  const storedName = String(existing?.product_name || "");
+  if (productName && storedName.length > productName.length && storedName.startsWith(productName)) productName = storedName;
+  const storedRefundStatus = String((existing as { refund_status?: string | null } | null)?.refund_status || "").trim();
   const statusKey = failed
     ? failState?.status_key || "Failed"
     : delivered
@@ -2379,11 +2406,15 @@ export async function scrapeAndSave(
           supercoin_amount_applied: Number(pageData.supercoin) || 0,
           is_bae_order: false,
           cash_on_delivery: Boolean(pageData.cashOnDelivery),
-          refund_status: tracking.some((row) => /refund/i.test(row.status)) || /refund/i.test(String(pageData.pageText || ""))
-            ? "refund"
-            : null,
+          // The page's bare "refund" marker only on a unit with no refund status yet: Flipkart's own status and
+          // sentences (U3, the API read: "Completed" / "Processed") stay, blank here = kept (unitSetFor).
+          refund_status: storedRefundStatus
+            ? null
+            : tracking.some((row) => /refund/i.test(row.status)) || /refund/i.test(String(pageData.pageText || ""))
+              ? "refund"
+              : null,
           refund_amount: refundAmount,
-          refund_msg: /refund/i.test(String(pageData.pageText || ""))
+          refund_msg: !storedRefundStatus && /refund/i.test(String(pageData.pageText || ""))
             ? (String(pageData.pageText || "").match(/Total refund[^.!]{0,80}/i) || [null])[0]
             : null,
           cancelled_date: cancelledAt ? new Date(cancelledAt) : cancelled ? orderDate : null,

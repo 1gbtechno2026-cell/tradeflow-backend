@@ -3,7 +3,9 @@ import type { ITrackingStage, ITrackingStep } from "../models/Order.js";
 import { mapPlaywrightCookies } from "./browser.js";
 
 /** "2026-09-23T21:50:50+05:30" — the same IST form orderFetch.toIstIso writes
- *  (kept local so this module never imports the scraper, which imports it). */
+ *  (kept local so this module never imports the scraper, which imports it).
+ *  Flipkart's milliseconds are kept when they are not zero ("…21:50:50.123+05:30",
+ *  data-quality U5), so the reference's Last Tracking Step can print them. */
 function toIstIso(value?: Date | string | null): string | null {
   const at = value instanceof Date ? value : value ? new Date(value) : null;
   if (!at || Number.isNaN(at.getTime())) return null;
@@ -18,7 +20,9 @@ function toIstIso(value?: Date | string | null): string | null {
     hourCycle: "h23",
   }).formatToParts(at);
   const get = (type: string) => parts.find((p) => p.type === type)?.value || "00";
-  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}+05:30`;
+  const ms = at.getTime() % 1000;
+  const fraction = ms ? `.${String(ms < 0 ? ms + 1000 : ms).padStart(3, "0")}` : "";
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}${fraction}+05:30`;
 }
 
 /**
@@ -134,7 +138,14 @@ export interface ApiUnit {
   moneyDataBag?: ApiMoney;
   deliveryDataBag?: {
     promiseDataBag?: {
+      /** The first promise, made at checkout. */
       promisedDate?: number | null;
+      /** A later promise when Flipkart moved the date; currentSlotEndDate equals it when it exists. */
+      newPromisedDate?: number | null;
+      currentSlotStartDate?: number | null;
+      /** The current promise (end of the delivery slot): newPromisedDate when there is one, else promisedDate. */
+      currentSlotEndDate?: number | null;
+      /** Flipkart's hand-over time — the reference prints it as Actual Delivery Date. */
       actualDeliveredDate?: number | null;
       deliveryMessage?: string;
       daysLeftToDeliver?: number;
@@ -159,7 +170,20 @@ export interface ApiUnit {
     }>;
   };
   nonReturnRefundDataBag?: { nonReturnRefunds?: unknown[] };
+  /** The refund card of the order page: "Total refund - ₹N" and one sub-widget per money movement
+   *  (status Completed / Processed / Accepted, the sentence naming the card). Also carries the
+   *  "Replacement Request" card ("We have resent this product"), which is not a refund. */
+  actionInfoDataBag?: ApiActionInfo | null;
   cancellationFeeDataBag?: { amount?: number | null; remark?: string | null };
+}
+
+export interface ApiActionInfo {
+  heading?: { contents?: Array<{ text?: string | null }> | null } | null;
+  subWidgets?: Array<{
+    status?: string | null;
+    subHeading?: string | null;
+    heading?: { contents?: Array<{ text?: string | null }> | null } | null;
+  }> | null;
 }
 
 export interface ApiOrder {
@@ -167,7 +191,8 @@ export interface ApiOrder {
   orderMoneyDataBag?: ApiMoney;
   units?: Record<string, ApiUnit>;
   sellerDataBag?: { sellerDetails?: Record<string, { sellerName?: string }> };
-  productDataBag?: Record<string, { productBasicData?: { title?: string } }>;
+  /** Keyed by FSN (and by listing id): title "MOTOROLA Edge 70 Fusion (Pantone SILHOUETTE, 128 GB)", subTitle "8 GB RAM". */
+  productDataBag?: Record<string, { productBasicData?: { title?: string | null; subTitle?: string | null; vertical?: string | null } }>;
 }
 
 export interface ApiOrderView extends ApiOrder {
@@ -381,11 +406,192 @@ export function trackingFromApi(unit: ApiUnit): ITrackingStage[] {
   return stages;
 }
 
-function lastTrackingStep(tracking: ITrackingStage[]): string {
+// ---- Last Tracking Step in the reference's layout (data-quality U5) ------------
+
+/** Characters Flipkart's text carries that Excel shows as junk in a file without a BOM. */
+const ASCII_FOR: Record<string, string> = {
+  "\u2018": "'",
+  "\u2019": "'",
+  "\u201C": '"',
+  "\u201D": '"',
+  "\u20B9": "Rs.",
+  "\u00B7": "-",
+  "\u2013": "-",
+  "\u2014": "-",
+  "\u2026": "...",
+  "\u00A0": " ",
+};
+
+/** One cell of the reference's Last Tracking Step: ASCII only, no "|" (the separator), one line. */
+export function asciiCell(value: unknown): string {
+  return String(value ?? "")
+    .replace(/%E2%82%B9/gi, "Rs.")
+    .replace(/[^\x00-\x7F]/g, (ch) => ASCII_FOR[ch] ?? ch.normalize("NFKD").replace(/[^\x00-\x7F]/g, ""))
+    .replace(/\|/g, "/")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** A timeline date as the reference prints it: "…T21:55:34+05:30", or "…T21:55:34.123000+05:30" when it has milliseconds. */
+function referenceDate(date: string): string {
+  return date.replace(/\.(\d{3})\+05:30$/, ".$1000+05:30");
+}
+
+/**
+ * The reference's Last Tracking Step: `${date} | ${stage}` for the newest DONE stage, and when that stage's last step
+ * carries Flipkart remarks beyond our own first entry, ` | ${step} | ${last remark} | ${last remark date}`.
+ * ASCII only. "" when no stage is DONE; the stage alone when it has no date at all.
+ * Replaces "Delivered · 2026-10-27T21:55:34+05:30" (U+00B7 on 34,721 units, junk in Excel).
+ */
+export function referenceLastStep(tracking: ITrackingStage[]): string {
   const done = [...tracking].reverse().find((row) => row.stage === "DONE");
   if (!done) return "";
-  const when = done.date || done.detailed_steps.slice(-1)[0]?.progress[0]?.date;
-  return when ? `${done.status} · ${when}` : done.status;
+  const last = done.detailed_steps.slice(-1)[0];
+  const when = done.date || last?.progress[0]?.date || null;
+  const status = asciiCell(done.status);
+  if (!when) return status;
+  let out = `${referenceDate(when)} | ${status}`;
+  const extra = last && last.progress.length > 1 ? last.progress[last.progress.length - 1] : null;
+  const extraAt = extra ? extra.date || last?.progress[0]?.date || null : null;
+  if (extra && extraAt) out += ` | ${asciiCell(last!.step_text)} | ${asciiCell(extra.remark)} | ${referenceDate(extraAt)}`;
+  return out;
+}
+
+// ---- Product name (data-quality U2, owner decision 7) ---------------------------
+
+/**
+ * The complete product name, like the reference: Flipkart's title plus its subTitle in brackets
+ * ("MOTOROLA Edge 70 Fusion (Pantone SILHOUETTE, 128 GB)" + "8 GB RAM" → "… (Pantone SILHOUETTE, 128 GB) (8 GB RAM)"),
+ * unless the title already holds the subtitle. Exported for the backfill.
+ */
+export function fullProductName(title: unknown, subTitle: unknown): string {
+  const base = String(title ?? "").trim();
+  const sub = String(subTitle ?? "").trim();
+  if (!base) return "";
+  return sub && !base.toLowerCase().includes(sub.toLowerCase()) ? `${base} (${sub})` : base;
+}
+
+// ---- Refund from the order page's refund card (data-quality U3, decisions 6 and 9) ----
+
+export interface RefundCard {
+  /** "HDFC", "ICICI" — every token before the network. */
+  bank: string;
+  /** "MASTERCARD", "VISA", "RUPAY" — the last token before Credit|Debit. */
+  network: string;
+  type: "Credit" | "Debit";
+  last4: string;
+}
+
+export interface RefundFromFlipkart {
+  /** "Completed" when every movement is, else the first other status ("Processed", "Accepted"). */
+  refund_status: string | null;
+  /** "1999.00" from "Total refund - ₹1,999" (else the sum of the movements' own amounts). */
+  refund_amount: string | null;
+  /** The sentences, joined with " | ". */
+  refund_msg: string | null;
+  refund_date: Date | null;
+  /** "reversal" (the charge was reversed, no money came back), "supercoins", "refund". */
+  refund_kind: "reversal" | "supercoins" | "refund";
+  card: RefundCard | null;
+}
+
+const REPLACEMENT_RE = /we have resent this product/i;
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+let refundShapeLogged = false;
+
+/** Flipkart writes the rupee sign URL-encoded in these texts ("%E2%82%B9"). */
+function decodeRupee(text: string): string {
+  return text.replace(/%E2%82%B9/gi, "\u20B9");
+}
+function amountIn(text: string): number | null {
+  const m = decodeRupee(text).match(/(?:\u20B9|Rs\.?|INR)?\s*(\d[\d,]*(?:\.\d+)?)/i);
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+function contentsText(h: { contents?: Array<{ text?: string | null }> | null } | null | undefined): string {
+  return (h?.contents || []).map((c) => String(c?.text ?? "")).filter((t) => t && t !== "null").join(" ").trim();
+}
+/**
+ * Mon D[,] [YYYY][,] H:MM AM|PM — read as IST. A sentence without a year takes the one nearest `ref`: the Refund
+ * stage's date when there is one (a "by Nov 23" promise read on Nov 18 belongs to the stage's Nov 23, not last year),
+ * else now — and only then never after now + 1 day (`latest`).
+ */
+function refundDateIn(sentence: string, ref: Date, latest: number | null): Date | null {
+  const m = sentence.match(/\b(?:on|by)\s+(?:by\s+)?([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?,?\s+(\d{1,2}):(\d{2})\s*([AP]M)/i);
+  if (!m) return null;
+  const month = MONTHS.indexOf(m[1].toLowerCase());
+  if (month < 0) return null;
+  const day = Number(m[2]);
+  let hour = Number(m[4]) % 12;
+  if (/pm/i.test(m[6])) hour += 12;
+  const at = (year: number) => new Date(Date.UTC(year, month, day, hour, Number(m[5])) - 330 * 60_000);
+  if (m[3]) return at(Number(m[3]));
+  const refYear = Number(new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", year: "numeric" }).format(ref));
+  const candidates = [refYear - 1, refYear, refYear + 1].map(at).filter((d) => latest == null || d.getTime() <= latest);
+  if (!candidates.length) return null;
+  return candidates.reduce((best, d) => (Math.abs(d.getTime() - ref.getTime()) < Math.abs(best.getTime() - ref.getTime()) ? d : best));
+}
+const CARD_RE = /your\s+(.+?)\s+(Credit|Debit)\s+Card\s+[*Xx]+\s*(\d{4})/i;
+/** "your HDFC MASTERCARD Credit Card ************1234" → { bank HDFC, network MASTERCARD, type Credit, last4 }. */
+export function refundCardIn(sentence: string): RefundCard | null {
+  const m = String(sentence || "").match(CARD_RE);
+  if (!m) return null;
+  const words = m[1].trim().split(/\s+/);
+  const network = words.length > 1 ? words.pop()! : "";
+  return { bank: words.join(" "), network: network.toUpperCase(), type: /^debit$/i.test(m[2]) ? "Debit" : "Credit", last4: m[3] };
+}
+
+/**
+ * Flipkart's refund card (units[].actionInfoDataBag) read into the unit's refund fields, or null when there is none:
+ * no sub-widgets, or only "We have resent this product" (a replacement, not a refund). Pure.
+ * `tracking` gives the Refund stage (the year of a sentence date, and the date when the sentence has none: "by
+ * Tomorrow"); without a dated Refund stage the year is the latest not after `now` + 1 day.
+ */
+export function refundFromActionInfo(unit: Pick<ApiUnit, "actionInfoDataBag">, tracking: ITrackingStage[], now: Date = new Date()): RefundFromFlipkart | null {
+  const block = unit.actionInfoDataBag;
+  const widgets = (block?.subWidgets || []).filter(Boolean);
+  if (!widgets.length) return null;
+  const sentences = widgets.map((w) => decodeRupee(String(w.subHeading ?? "")).replace(/\s+/g, " ").trim());
+  if (sentences.every((t) => REPLACEMENT_RE.test(t))) return null;
+  const money = widgets.filter((_, i) => !REPLACEMENT_RE.test(sentences[i]));
+  const moneySentences = sentences.filter((t) => !REPLACEMENT_RE.test(t));
+
+  const heading = contentsText(block?.heading);
+  const headingAmount = /total refund/i.test(heading) ? amountIn(heading.replace(/^.*?total refund\s*-?\s*/i, "")) : null;
+  const ownAmounts = money.map((w) => amountIn(contentsText(w.heading))).filter((n): n is number => n != null);
+  const amount = headingAmount ?? (ownAmounts.length ? ownAmounts.reduce((a, b) => a + b, 0) : null);
+
+  const statuses = money.map((w) => String(w.status ?? "").trim()).filter(Boolean);
+  const status = statuses.length ? (statuses.every((x) => /^completed$/i.test(x)) ? "Completed" : statuses.find((x) => !/^completed$/i.test(x))!) : null;
+
+  const joined = moneySentences.join(" ");
+  const kind: RefundFromFlipkart["refund_kind"] = /should have been reversed/i.test(joined) ? "reversal" : /supercoins/i.test(joined) ? "supercoins" : "refund";
+
+  const refundStage = [...tracking].reverse().find((s) => /^refund/i.test(s.status) && s.stage === "DONE" && s.date);
+  const stageAt = refundStage?.date ? new Date(refundStage.date) : null;
+  const dates = moneySentences.map((t) => refundDateIn(t, stageAt || now, stageAt ? null : now.getTime() + 24 * 3600_000)).filter((d): d is Date => Boolean(d));
+  const date = dates.length ? new Date(Math.max(...dates.map((d) => d.getTime()))) : stageAt;
+
+  let card: RefundCard | null = null;
+  for (const t of moneySentences) {
+    card = refundCardIn(t);
+    if (card) break;
+  }
+
+  if ((amount == null || !status) && !refundShapeLogged) {
+    // An answer we cannot read whole: logged once, digits masked; the fields it lacks stay as stored (unitSetFor).
+    refundShapeLogged = true;
+    console.warn(`[orders-api] refund card of an unknown shape: ${JSON.stringify({ heading, statuses, sentences: moneySentences }).replace(/\d/g, "9").slice(0, 400)}`);
+  }
+  return {
+    refund_status: status,
+    refund_amount: amount == null ? null : amount.toFixed(2),
+    refund_msg: moneySentences.join(" | ") || null,
+    refund_date: date,
+    refund_kind: kind,
+    card,
+  };
 }
 
 /** "Ekart Logistics" from the shipped step's link text "Ekart Logistics - FMPP…". */
@@ -478,9 +684,17 @@ export interface MappedOrderUnit {
   shipping_address_hash: string;
   supercoin_amount_applied: number;
   cash_on_delivery: boolean;
+  /** From Flipkart's refund card (refundFromActionInfo): "Completed" / "Processed" / "Accepted"; null without one. */
   refund_status: string | null;
   refund_amount: string | null;
   refund_msg: string | null;
+  /** When the money came back (or will), from the sentence (IST) or the Refund stage; null without a refund card. */
+  refund_date?: Date | null;
+  /** "reversal" | "supercoins" | "refund"; null without a refund card. */
+  refund_kind?: string | null;
+  /** The card the refund sentence names. Not a unit field: saveMappedUnit writes card_name / card_number from it
+   *  (card_source "flipkart_refund") only when no checkout job of ours placed the order. */
+  refund_card?: RefundCard | null;
   cancelled_date: Date | null;
   cancelled_by_user: boolean;
   /** Who cancelled, from Flipkart's own flag (status.fkCancelled): "flipkart" (seller policy, risk check…), "customer" (the account, us included), "" when not cancelled or unknown. */
@@ -500,6 +714,17 @@ export interface MappedOrderUnit {
     seller_id: string;
     invoice_eligible: boolean | null;
     customer_email: string;
+    /** Flipkart's title and subTitle as sent (product_name joins them, decision 7); pairing groups by the raw title. */
+    product_title?: string;
+    product_subtitle?: string;
+    /** The first promise (promisedDate), IST; delivery_date is the current one. */
+    first_promised_date?: string | null;
+    /** The Delivered stage's time, IST; actual_delivery_date is Flipkart's hand-over time when it sends one. */
+    delivered_stage_at?: string | null;
+    /** The "Replacement Request" sentence(s) when the refund card is only that ("We have resent this product"). */
+    action_info?: string;
+    /** Written by saveMappedUnit with card_source "flipkart_refund" only. */
+    refund_card?: RefundCard;
   };
 }
 
@@ -576,7 +801,8 @@ export function extractOtpFromPageFetch(raw: unknown): string | null {
   return null;
 }
 
-export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?: ApiUnit | null): MappedOrderUnit {
+/** `now` only bounds the year of a refund sentence without one ("on Oct 12 03:15 PM"); a trace replay passes the trace time. */
+export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?: ApiUnit | null, now: Date = new Date()): MappedOrderUnit {
   const unit: ApiUnit = { ...(listUnit || {}), ...((view.units || {})[unitId] || {}) };
   const meta = unit.metaData || {};
   const money = unit.moneyDataBag || {};
@@ -589,11 +815,24 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
   const statusText = String(meta.status?.text || "");
   const failed = /not placed/i.test(statusKey);
   const cancelledStage = tracking.find((s) => /^cancelled$/i.test(s.status) && s.stage === "DONE");
-  const deliveredStage = tracking.find((s) => /^delivered$/i.test(s.status) && s.stage === "DONE");
-  const delivered = /^delivered$/i.test(statusKey) || Boolean(deliveredStage);
-  const cancelled = !delivered && (/^cancelled$/i.test(statusKey) || Boolean(cancelledStage));
-  const returned = !delivered && !cancelled && /^returned$/i.test(statusKey);
-  const refunded = !delivered && !cancelled && !returned && /^refund/i.test(statusKey);
+  // Delivered comes from Flipkart's own key or a DATED Delivered stage, and a Cancelled / Refund stage after the
+  // Delivered one wins (T8: a dateless DONE "Delivered" node with a Refund stage after it made a cancelled unit
+  // Delivered, OD339115273746442100).
+  const deliveredAt = tracking.findIndex((s) => /^delivered$/i.test(s.status) && s.stage === "DONE");
+  const deliveredStage = deliveredAt >= 0 && tracking[deliveredAt].date ? tracking[deliveredAt] : undefined;
+  // The DONE Cancelled / Refund stage after the Delivered one that undoes it (OD339115273746442100: Delivered with no
+  // date, then Refund, no Cancelled stage).
+  const endingStage = deliveredAt >= 0 ? tracking.slice(deliveredAt + 1).find((s) => s.stage === "DONE" && /^(cancelled|refund)/i.test(s.status)) : undefined;
+  const keyReturned = /^returned$/i.test(statusKey);
+  const keyRefunded = /^refund/i.test(statusKey);
+  // A return still open ("Return requested", "Return approved") keeps the delivery it follows, as before T8; a
+  // Returned / Refund key after such a stage maps to Returned / Refunded, never to Cancelled.
+  const keyReturnOpen = /^return/i.test(statusKey) && !keyReturned;
+  const deliveryUndone = Boolean(endingStage) && !keyReturnOpen;
+  const delivered = (/^delivered$/i.test(statusKey) || Boolean(deliveredStage)) && !deliveryUndone;
+  const cancelled = !delivered && (/^cancelled$/i.test(statusKey) || Boolean(cancelledStage) || (deliveryUndone && !keyReturned && !keyRefunded));
+  const returned = !delivered && !cancelled && keyReturned;
+  const refunded = !delivered && !cancelled && !returned && keyRefunded;
   const current = [...tracking].reverse().find((s) => s.stage === "DONE");
   const confirmed = tracking.find((s) => /confirmed/i.test(s.status));
 
@@ -606,7 +845,8 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
 
   // The cancellation itself, not the return/refund steps the same node carries.
   const cancelStep = cancelledStage?.detailed_steps.find((st) => /cancel/i.test(st.event) || /cancel/i.test(st.step_text));
-  const cancelledAt = cancelStep?.progress[0]?.date || cancelledStage?.date || null;
+  // With no Cancelled stage (T8's shape) the stage that undid the delivery dates the cancellation, not the order date.
+  const cancelledAt = cancelStep?.progress[0]?.date || cancelledStage?.date || (cancelled ? endingStage?.date : null) || null;
   // How far the order had got when it was cancelled: the furthest DONE stage
   // before the Cancelled one ("Shipped", "Order Confirmed").
   const furthestBeforeCancel = [...tracking]
@@ -624,14 +864,26 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
     view.sellerDataBag?.sellerDetails?.[String(meta.sellerId || "")]?.sellerName ||
     Object.values(view.sellerDataBag?.sellerDetails || {})[0]?.sellerName ||
     "";
-  const refunds = unit.nonReturnRefundDataBag?.nonReturnRefunds || [];
   const invoice = view.actionEligibilityResponses?.DOWNLOAD_INVOICE;
+  // Decision 7: title + subTitle. productDataBag is keyed by FSN (and by listing id).
+  const product = (view.productDataBag?.[String(meta.fsn || "")] || view.productDataBag?.[String(meta.listingId || "")])?.productBasicData;
+  const productTitle = String(meta.title || product?.title || "").trim();
+  const productSubtitle = String(product?.subTitle || "").trim();
+  const refund = refundFromActionInfo(unit, tracking, now);
+  const replacement = !refund && (unit.actionInfoDataBag?.subWidgets || []).some((w) => /we have resent this product/i.test(String(w?.subHeading || "")));
+  const promised = promise.currentSlotEndDate ?? promise.newPromisedDate ?? promise.promisedDate;
 
+  // A cancelled unit reads the cancel step's sentence, never a stage title ("Refund" stood on 3,173 units); with no
+  // Cancelled stage (T8's shape) the sentence of the stage that undid the delivery; then Flipkart's status text when
+  // it is not one of this unit's stage titles ("Delivered" on T8's shape).
+  const isStageTitle = (text: string) => tracking.some((s) => s.status.trim().toLowerCase() === text.trim().toLowerCase());
   const statusLabel = failed
     ? statusText || "Order not placed"
     : delivered
       ? "Your item has been delivered"
-      : current?.detailed_steps.slice(-1)[0]?.step_text || statusText || current?.status || "";
+      : cancelled
+        ? cancelStep?.step_text || (!cancelledStage ? endingStage?.detailed_steps[0]?.step_text : "") || (statusText && !isStageTitle(statusText) ? statusText : "") || "Cancelled"
+        : current?.detailed_steps.slice(-1)[0]?.step_text || statusText || current?.status || "";
 
   return {
     order_id: orderId,
@@ -639,19 +891,20 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
     unit_id: unitId,
     order_url: `https://www.flipkart.com/order_details?order_id=${orderId}&item_id=${itemId}&unit_id=${unitId}`,
     order_date: orderDate,
-    product_name: String(meta.title || view.productDataBag?.[String(meta.fsn || "")]?.productBasicData?.title || ""),
+    product_name: fullProductName(productTitle, productSubtitle),
     seller_name: String(sellerName || ""),
     quantity: 1,
     total_amount: total,
     unit_amount: unitAmount,
     // A failed order still carries the promise it would have had; the page
     // shows no delivery date for it. A cancelled order keeps its promise,
-    // as the reference export does.
-    delivery_date: failed ? null : dateOf(promise.promisedDate),
-    // The "Delivered" timeline step is what the page (and so the scraper)
-    // calls the delivery time; promiseDataBag.actualDeliveredDate is an
-    // earlier hand-over scan, hours before it on every unit compared.
-    actual_delivery_date: (deliveredStage?.date ? new Date(deliveredStage.date) : null) || dateOf(promise.actualDeliveredDate),
+    // as the reference export does. The CURRENT promise (U4): Flipkart moves
+    // it on 164 of 3,930 traced units; the first one stays in api_extra.
+    delivery_date: failed ? null : dateOf(promised),
+    // Flipkart's hand-over time, the reference's Actual Delivery Date (U16,
+    // "reference wins"); the "Delivered" stage — 1–4 h later on most units —
+    // stays in the timeline and in api_extra.delivered_stage_at.
+    actual_delivery_date: dateOf(promise.actualDeliveredDate) || (deliveredStage?.date ? new Date(deliveredStage.date) : null),
     ewb_number: String(b2b.ewbNumber || ""),
     // The page's banner. The DOM scraper is not consistent here — it saved
     // "Delivered on Sep 17" on a multi-unit order and "Your item has been
@@ -670,19 +923,14 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
               ? "Refunded"
               : statusKey || current?.status || "",
     status_label: statusLabel,
-    status_reason: failed
-      ? String(meta.statusReason || statusText || "Payment was not successful")
-      : cancelled
-        ? cancelledStage?.detailed_steps[0]?.step_text || statusText || "Cancelled on Flipkart"
-        : meta.statusReason
-          ? String(meta.statusReason)
-          : null,
+    // Only what Flipkart sends as a reason; the cancel sentence is the label now, and cancel_reason_text keeps statusText.
+    status_reason: failed ? String(meta.statusReason || statusText || "Payment was not successful") : meta.statusReason ? String(meta.statusReason) : null,
     business_name: String(b2b.businessName || view.customerInfo?.businessName || ""),
     business_gst_no: String(b2b.gstNumber || view.customerInfo?.gstNumber || ""),
     tracking_id: String(meta.trackingId || "").toUpperCase(),
     delivery_otp: extractDeliveryOtp(unit.deliveryDataBag), // otpCallout / handOverInfo — null until a live out-for-delivery unit carries one
     tracking,
-    last_tracking_step: lastTrackingStep(tracking),
+    last_tracking_step: referenceLastStep(tracking),
     billing_phone_number: String(billing.phoneNumber || view.customerInfo?.phoneNumber || "") || null,
     billing_address_name: String(billing.name || "").trim() || null,
     billing_address_pincode: String(billing.pinCode || "") || null,
@@ -690,9 +938,13 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
     shipping_address_hash: addressHash(shippingAddressFrom(view.addresses?.SHIPPING || view.addresses?.BILLING)),
     supercoin_amount_applied: 0,
     cash_on_delivery: /cash on delivery/i.test(paymentMode),
-    refund_status: refunds.length || refunded ? "refund" : null,
-    refund_amount: null,
-    refund_msg: null,
+    // Flipkart's refund card; null without one, which leaves a stored refund as it is (unitSetFor).
+    refund_status: refund?.refund_status ?? null,
+    refund_amount: refund?.refund_amount ?? null,
+    refund_msg: refund?.refund_msg ?? null,
+    refund_date: refund?.refund_date ?? null,
+    refund_kind: refund ? refund.refund_kind : null,
+    refund_card: refund?.card ?? null,
     cancelled_date: cancelledAt ? new Date(cancelledAt) : cancelled ? orderDate : null,
     cancelled_by_user: /as per your request|cancelled by you|you cancelled/i.test(cancelledText),
     cancelled_by: cancelled ? (meta.status?.fkCancelled === true ? "flipkart" : /as per your request|cancelled by you|you cancelled/i.test(cancelledText) ? "customer" : "") : "",
@@ -713,6 +965,13 @@ export function mapApiUnitToOrder(view: ApiOrderView, unitId: string, listUnit?:
       seller_id: String(meta.sellerId || ""),
       invoice_eligible: invoice ? Boolean(invoice.eligible) : null,
       customer_email: String(view.customerInfo?.emailId || ""),
+      product_title: productTitle,
+      product_subtitle: productSubtitle,
+      first_promised_date: iso(promise.promisedDate),
+      delivered_stage_at: tracking[deliveredAt]?.date || null,
+      ...(replacement
+        ? { action_info: (unit.actionInfoDataBag?.subWidgets || []).map((w) => decodeRupee(String(w?.subHeading || "")).trim()).filter(Boolean).join(" | ") }
+        : {}),
     },
   };
 }

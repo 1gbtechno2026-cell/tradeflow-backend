@@ -63,9 +63,22 @@ export const config = {
    * Which deployment this process belongs to — the owner of the batches it
    * creates and the only one that consumes or sweeps them. All processes that
    * share one Redis share one TRADEFLOW_SYSTEM_ID (e.g. "aws" for every Fargate
-   * task, the hostname for a developer Mac). Defaults to the machine name.
+   * task, the hostname for a developer Mac). Defaults to the machine name —
+   * which a Mac takes from the network it is on (this one went from
+   * "IT-Admin-1gbTechnos-MacBook-Air" to "Mac.lan" on 2026-11-23), so a Mac
+   * sets it in its .env: what the request log calls "this machine's" must not
+   * change with the Wi-Fi.
    */
   systemId: (process.env.TRADEFLOW_SYSTEM_ID || os.hostname().split(".")[0] || "local").trim(),
+  /**
+   * This machine's name on the rows it writes for itself — a fetch's host, an
+   * invoice or coupon request's host — and in the request log's checks of
+   * "this machine's fetch" (services/requestCommon.ts hostName). Read once, so
+   * a name the network changes while the process runs never makes its own
+   * rows look like another machine's. TRADEFLOW_HOST_ID pins it (a Mac sets
+   * the same value as TRADEFLOW_SYSTEM_ID); else the machine name at start.
+   */
+  hostId: (process.env.TRADEFLOW_HOST_ID || os.hostname().split(".")[0] || "host").trim(),
   /**
    * required  — a worker with no proxy exits at boot and takes no jobs; a job
    *             whose proxy vanishes mid-batch waits (re-queued) for a free one.

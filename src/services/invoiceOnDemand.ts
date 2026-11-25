@@ -108,11 +108,26 @@ export async function downloadInvoicesByOrderId(opts: {
   concurrency?: number;
   cancelled?: () => boolean;
   log?: (level: "info" | "warn", msg: string) => void;
+  /**
+   * For whoever records the run order by order (the sweep as a request —
+   * services/invoiceSweep.ts): called when an order is taken and when it has
+   * an answer. An order the run never reached (it was stopped) gets neither.
+   * Neither may fail the download: what they throw is dropped.
+   */
+  onStart?: (orderId: string) => void | Promise<void>;
+  onResult?: (result: OrderDownloadResult) => void | Promise<void>;
 }): Promise<OrderDownloadResult[]> {
   const log = opts.log || (() => undefined);
   const want = [...new Set(opts.orderIds.map((s) => s.trim()).filter(Boolean))];
   const results = new Map<string, OrderDownloadResult>();
   for (const o of want) results.set(o, { orderId: o, status: "unknown_order" });
+  const started = async (orderId: string) => {
+    if (opts.onStart) await Promise.resolve(opts.onStart(orderId)).catch(() => undefined);
+  };
+  const answered = async (result: OrderDownloadResult) => {
+    results.set(result.orderId, result);
+    if (opts.onResult) await Promise.resolve(opts.onResult(result)).catch(() => undefined);
+  };
 
   if (!invoiceStoreEnabled()) {
     for (const o of want) results.set(o, { orderId: o, status: "failed", error: "invoice store not configured (INVOICE_S3_BUCKET)" });
@@ -122,6 +137,7 @@ export async function downloadInvoicesByOrderId(opts: {
 
   // Resolve order → owning account, collecting every unit row of the order.
   const byOrder = await resolveInvoiceTargets(opts.userId, want);
+  for (const o of want) if (!byOrder.has(o)) await answered({ orderId: o, status: "unknown_order" });
 
   // Group by account so each session is opened once.
   const byAccount = new Map<string, InvoiceTarget[]>();
@@ -135,31 +151,32 @@ export async function downloadInvoicesByOrderId(opts: {
     const acc = await PlatformId.findById(accountId).lean();
     const cookies = cookiesFor(acc as Parameters<typeof cookiesFor>[0]);
     if (!cookies.length) {
-      for (const t of targets) results.set(t.orderId, { orderId: t.orderId, status: "no_session", units: t.unitIds.length });
+      for (const t of targets) await answered({ orderId: t.orderId, status: "no_session", units: t.unitIds.length });
       return;
     }
     let ctx: APIRequestContext;
     try {
       ctx = await openOrderApiSession(cookies);
     } catch (err) {
-      for (const t of targets) results.set(t.orderId, { orderId: t.orderId, status: "no_session", units: t.unitIds.length, error: (err as Error).message });
+      for (const t of targets) await answered({ orderId: t.orderId, status: "no_session", units: t.unitIds.length, error: (err as Error).message });
       return;
     }
     try {
       for (const t of targets) {
         if (opts.cancelled?.()) break;
+        await started(t.orderId);
         const key = rawInvoiceKey(t.userId, t.orderId);
         try {
           if (!opts.force && (await invoiceExists(key))) {
             await Order.updateMany({ _id: { $in: t.rowIds } }, { $set: { invoice_s3_key: key, is_invoice_downloaded: true } });
-            results.set(t.orderId, { orderId: t.orderId, status: "already", units: t.unitIds.length });
+            await answered({ orderId: t.orderId, status: "already", units: t.unitIds.length });
             continue;
           }
           const stored = await downloadAndStoreInvoice(ctx, t);
-          results.set(t.orderId, { orderId: t.orderId, status: "downloaded", units: t.unitIds.length, parts: stored.parts, sizeKb: Math.round(stored.size / 1024) });
+          await answered({ orderId: t.orderId, status: "downloaded", units: t.unitIds.length, parts: stored.parts, sizeKb: Math.round(stored.size / 1024) });
           log("info", `${t.orderId}: invoice ${opts.force ? "re-" : ""}downloaded (${stored.parts.join(", ")})`);
         } catch (err) {
-          results.set(t.orderId, { orderId: t.orderId, status: "failed", units: t.unitIds.length, error: (err as Error).message.split("\n")[0].slice(0, 160) });
+          await answered({ orderId: t.orderId, status: "failed", units: t.unitIds.length, error: (err as Error).message.split("\n")[0].slice(0, 160) });
           log("warn", `${t.orderId}: invoice failed (${(err as Error).message.split("\n")[0].slice(0, 120)})`);
         }
         await new Promise((r) => setTimeout(r, 250));

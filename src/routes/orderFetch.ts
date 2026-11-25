@@ -4,25 +4,22 @@ import { Router, type Response } from "express";
 import { config } from "../config.js";
 import { workspaceUserId } from "../services/sessionStore.js";
 import { resolveOrderFetchMode, setOrderFetchMode } from "../services/orderSyncSettings.js";
-import {
-  getOrderFetchJob,
-  isOrderFetchPreparing,
-  OrderFetchStoppedError,
-  reserveOrderFetch,
-  startOrderFetch,
-  stopOrderFetch,
-  type OrderFetchStartOptions,
-} from "../services/orderFetch.js";
+import { getOrderFetchJob, isOrderFetchPreparing, stopOrderFetch } from "../services/orderFetch.js";
+import { triggerFetch } from "../services/fetchTrigger.js";
 import { createInvoiceRequest, getInvoiceRequest, listInvoiceRequests, stopInvoiceRequest } from "../services/invoiceRequests.js";
 import { createCouponRequest, getCouponRequest, listCouponRequests, stopCouponRequest } from "../services/couponRequests.js";
-import { assertFlipkart, hostName, RequestInputError } from "../services/requestCommon.js";
-import { parseFetchBody, parseUpdateBody, planFetch, planUpdate, queueUpdateAfterFetch } from "../services/startRequests.js";
+import { assertFlipkart, RequestInputError } from "../services/requestCommon.js";
+import { holdUpdatePreparation, parseFetchBody, parseUpdateBody, planUpdate, UPDATE_PREPARING_MESSAGE } from "../services/startRequests.js";
 import { resolveCheckoutSettings, setCheckoutSettings } from "../services/checkoutSettings.js";
 import { abortCancelRequest, getCancelRequest, listCancelRequests, previewCancellation, requestCancellation, resolveCancelSpeed, retryCancelRequest, setCancelSpeed } from "../services/orderCancel.js";
 import { abortRescheduleRequest, getRescheduleRequest, listRescheduleRequests, previewReschedule, requestReschedule, retryRescheduleRequest } from "../services/orderReschedule.js";
 import { proxyModeStatus, setProxyMode } from "../services/proxyMode.js";
-import { createQueuedRun, failRunById, finishRun, listRuns, startRun, stopRunById, syncPanel } from "../services/orderJobRuns.js";
+import { finishRun, listRuns, startRun, syncPanel } from "../services/orderJobRuns.js";
 import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays, setScheduledInvoices } from "../services/orderFetchSchedule.js";
+import { liveProbes } from "../services/requestLogLive.js";
+import { retryBatch, stopBatch } from "../services/syncActions.js";
+import { batchIssues, getBatch, listBatches, listTasks } from "../services/syncBatches.js";
+import { logDefaults } from "../services/syncTaskLog.js";
 import {
   abortUpdateRequest,
   cancelUpdateRequest,
@@ -64,9 +61,6 @@ function sendError(res: Response, err: unknown, fallback: string, status = 400) 
   res.status(status).json({ error: err instanceof Error ? err.message : fallback });
 }
 
-/** Up to this many accounts the trigger answers once the run is going; a longer list is prepared in the background (≈0.1 s per account). */
-const FETCH_INLINE_START_MAX = 100;
-
 /**
  * Fetch Order Units. Body — the reference's, and the one this route always took:
  *   { platform, email_ids? | emails?, fetch_orders_after_date?, enable_login?,
@@ -75,73 +69,14 @@ const FETCH_INLINE_START_MAX = 100;
  * workspace's look-back. Answers with `request_id` (the ledger run id). What
  * was asked is kept on that run (meta.params). `enable_login` and
  * `force_fetch` are recorded only: an account that is not logged in is
- * skipped and listed, as before, and one fetch runs at a time.
+ * skipped and listed, as before, and one fetch runs at a time. The start
+ * itself is services/fetchTrigger.ts — Batch requests → Retry uses it too.
  */
 orderFetchRouter.post("/fetch/trigger", async (req, res) => {
-  // The workspace's one fetch slot, held from the first check until startOrderFetch has taken over:
-  // working out who to fetch takes a second or two, and a second trigger in that window is refused, not answered.
-  let release: (() => void) | undefined;
   try {
-    const body = parseFetchBody(req.body);
-    const userId = userIdFrom(req);
-    release = reserveOrderFetch(userId);
-    const plan = await planFetch(userId, body);
-    if (!plan.loggedIn) throw new Error(`None of the ${plan.emails.length} email(s) are logged in. Login them in platform id first.`);
-    const opts: OrderFetchStartOptions = {
-      invoices: body.invoices,
-      trigger: body.trigger,
-      by: body.by,
-      params: plan.params,
-      reserved: true,
-      onFinished: body.runUpdateAfterFetch
-        ? async (info) => {
-            await queueUpdateAfterFetch(userId, { runId: info.runId, emails: info.emails, selection: plan.selection, cancelled: info.cancelled, by: body.by, trigger: body.trigger });
-          }
-        : undefined,
-    };
-    const preparing = plan.emails.length > FETCH_INLINE_START_MAX;
-    let requestId = "";
-    if (preparing) {
-      // The id is handed out now; the run adopts this row when its account list is ready.
-      requestId = await createQueuedRun(userId, "fetch", {
-        trigger: body.trigger,
-        by: body.by,
-        total: plan.loggedIn,
-        message: `Preparing ${plan.loggedIn} account(s) — the fetch starts when their saved units are read`,
-        meta: { platform: body.platform, params: plan.params, emails_count: plan.loggedIn, host: hostName(), pid: process.pid },
-      });
-      void startOrderFetch(userId, plan.emails, plan.sinceDate, { ...opts, runId: requestId }).catch((err) => {
-        const reason = err instanceof Error ? err.message : String(err);
-        console.warn(`[orders-fetch] fetch ${requestId} could not start: ${reason}`);
-        // Force kill during the preparation is a stop, not a failure.
-        return err instanceof OrderFetchStoppedError ? stopRunById(requestId, reason) : failRunById(requestId, `Could not start: ${reason}`);
-      });
-    } else {
-      requestId = (await startOrderFetch(userId, plan.emails, plan.sinceDate, opts)).runId;
-    }
-    const job = getOrderFetchJob(userId);
-    const queued = preparing ? plan.loggedIn : job.total;
-    res.json({
-      message: "Order fetch triggered successfully",
-      platform: body.platform,
-      selection_method: plan.selection,
-      total_accounts_found: plan.emails.length,
-      valid_accounts_queued: queued,
-      tasks_created: queued,
-      windows: preparing ? null : job.windows,
-      fetch_orders_after_date: plan.afterDate,
-      fetch_orders_after_date_source: plan.afterDateSource,
-      invoices: body.invoices,
-      request_id: requestId,
-      params: plan.params,
-      preparing,
-      timestamp: Math.floor(Date.now() / 1000),
-    });
+    res.json(await triggerFetch(userIdFrom(req), parseFetchBody(req.body)));
   } catch (err) {
     sendError(res, err, "Could not start fetch");
-  } finally {
-    // startOrderFetch marks the workspace as preparing before its first await, so nothing slips in between.
-    release?.();
   }
 });
 
@@ -205,25 +140,18 @@ orderFetchRouter.put("/fetch/mode", async (req, res) => {
  * Status labels are the reference's and are matched to how units store them
  * (services/startRequests.ts). At most 2000 order ids / emails / pairs.
  */
-/**
- * Workspaces whose update request is being put together right now. Reading the
- * units and their accounts normally takes 1-4 s, but has been seen to take
- * minutes on a slow database; a second press (or a retry after the dashboard
- * gave up waiting) must not queue the same update twice.
- */
-const updatesBeingPrepared = new Set<string>();
-
 orderFetchRouter.post("/update/trigger", async (req, res) => {
-  let held = "";
+  // The workspace's update-preparation slot (services/startRequests.ts): a second press while a request is being
+  // put together must not queue the same update twice. Batch requests → Retry of an update takes the same slot.
+  let release: (() => void) | null = null;
   try {
     const body = parseUpdateBody(req.body);
     const userId = userIdFrom(req);
-    if (updatesBeingPrepared.has(userId)) {
-      res.status(409).json({ error: "An update request is already being prepared — it will appear in a moment", code: "update_preparing" });
+    release = holdUpdatePreparation(userId);
+    if (!release) {
+      res.status(409).json({ error: UPDATE_PREPARING_MESSAGE, code: "update_preparing" });
       return;
     }
-    updatesBeingPrepared.add(userId);
-    held = userId;
     const plan = await planUpdate(userId, body);
     // Queued on the worker (services/orderUpdateQueue.ts): one job per account.
     const request = await createUpdateRequest(userId, plan.input, { source: body.source, by: body.by, params: plan.params, parentId: body.parentId });
@@ -241,7 +169,7 @@ orderFetchRouter.post("/update/trigger", async (req, res) => {
   } catch (err) {
     sendError(res, err, "Could not start update");
   } finally {
-    if (held) updatesBeingPrepared.delete(held);
+    release?.();
   }
 });
 
@@ -293,6 +221,113 @@ orderFetchRouter.get("/sync/runs", async (req, res) => {
   const userId = String(req.query.userId || "").trim() || workspaceUserId();
   const type = String(req.query.type || "") as "fetch" | "update" | "invoices" | "coupons" | "reschedule" | "cancel" | "";
   res.json({ runs: await listRuns(userId, type || undefined, Number(req.query.limit) || 20) });
+});
+
+/**
+ * Batch requests — every request of every kind (fetch, update, invoice fetch, coupon apply, cancel,
+ * reschedule), newest first, in the reference's shape:
+ *   GET /sync/batches?page=&page_size=25&platform=&task_type=&source=&status=&created_from=&created_to=
+ *   → { count, page, page_size, task_types, results: [{ request_id, platform, task_type, source, status,
+ *       triggered_by, parent_id, child_ids, params, created_at, started_at, finished_at, counts, finished_count,
+ *       progress_percent, avg_seconds_per_task, eta_seconds, duration_seconds, can_cancel, can_retry, … }] }
+ * created_from / created_to are India-time days. Built by services/syncBatches.ts.
+ */
+orderFetchRouter.get("/sync/batches", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim() || workspaceUserId();
+    res.json(await listBatches(userId, req.query as Record<string, unknown>, logDefaults, liveProbes));
+  } catch (err) {
+    sendError(res, err, "Could not list the batch requests", 500);
+  }
+});
+
+/** The tasks of one request that ended one way (?status=failed | timedout | aborted | cancelled), grouped by error class, with the items for "Copy all". */
+orderFetchRouter.get("/sync/batches/:id/issues", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim() || workspaceUserId();
+    const out = await batchIssues(userId, req.params.id, req.query as Record<string, unknown>);
+    if (!out) {
+      res.status(404).json({ error: "Request not found" });
+      return;
+    }
+    res.json(out);
+  } catch (err) {
+    sendError(res, err, "Could not read the request's issues", 500);
+  }
+});
+
+/** One request: its batch row, SETTINGS as labels, OUTCOME, and the ISSUES summary. The full id only. */
+orderFetchRouter.get("/sync/batches/:id", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim() || workspaceUserId();
+    const out = await getBatch(userId, req.params.id, logDefaults, liveProbes);
+    if (!out) {
+      res.status(404).json({ error: "Request not found" });
+      return;
+    }
+    res.json(out);
+  } catch (err) {
+    sendError(res, err, "Could not read the request", 500);
+  }
+});
+
+/**
+ * Cancel one request, whatever its kind — the reference's row action "Cancel" (ours was "Stop"; the stop routes of
+ * each kind still work and this calls them). Body: { by? }. What is queued ends "Cancelled before it started", what
+ * is running finishes or ends "Stopped while running: the request was cancelled", and the request reads `cancelled`
+ * with its tally kept. Answers the request as GET /sync/batches/:id does, with `message` and `stop`. 409 when it has
+ * already ended (`not_open`), is another machine's to stop (`other_machine`) or is already being cancelled.
+ */
+orderFetchRouter.post("/sync/batches/:id/cancel", async (req, res) => {
+  try {
+    const out = await stopBatch(userIdFrom(req), req.params.id, String(req.body?.by || "").trim());
+    if (!out) {
+      res.status(404).json({ error: "Request not found" });
+      return;
+    }
+    res.json(out);
+  } catch (err) {
+    sendError(res, err, "Could not cancel the request", 500);
+  }
+});
+
+/**
+ * Retry the unsuccessful tasks of a request that has ended, as ONE new request of the same kind and settings
+ * (source `system-retry`, parent = this request). Body — the reference's:
+ *   { statuses: ["failed"] }                      the tasks that ended that way (failed | timedout | aborted | cancelled)
+ *   { statuses: ["failed"], error_code: "…" }     one error class of them
+ *   { all_incomplete: true }                      failed + timed out + aborted + cancelled
+ * (+ by). Items already queued or running in any request are skipped. 202 with the new `request_id`, what was
+ * retried and what was skipped. 409: still open, tasks no longer kept (7 days), nothing to retry, everything
+ * already queued; the kind's own refusals ("Order fetch is already running", …) are answered in its words.
+ */
+orderFetchRouter.post("/sync/batches/:id/retry", async (req, res) => {
+  try {
+    const out = await retryBatch(userIdFrom(req), req.params.id, req.body, String(req.body?.by || "").trim());
+    if (!out) {
+      res.status(404).json({ error: "Request not found" });
+      return;
+    }
+    res.status(202).json(out);
+  } catch (err) {
+    sendError(res, err, "Could not retry the request");
+  }
+});
+
+/**
+ * All tasks — the task log (order_sync_tasks), kept 7 days:
+ *   GET /sync/tasks?page=&page_size=50&order_id=&email=&platform=&task_type=&source=&status=&error_code=&request_id=&created_from=&created_to=
+ *   → { count, error_classes: [{ code, label }], results: [{ id, request_id, platform, task_type, source, status,
+ *       email, order_id, unit_id, triggered_by, created_at, started_at, finished_at, duration_seconds, error, error_code }] }
+ * request_id is the full id (the 8-character one is refused).
+ */
+orderFetchRouter.get("/sync/tasks", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim() || workspaceUserId();
+    res.json(await listTasks(userId, req.query as Record<string, unknown>));
+  } catch (err) {
+    sendError(res, err, "Could not list the tasks", 500);
+  }
 });
 
 orderFetchRouter.post("/update/stop", async (req, res) => {
@@ -383,9 +418,12 @@ orderFetchRouter.post("/invoice/trigger", async (req, res) => {
   }
 });
 
+/** ?limit= (20), and to narrow: ?source=user,system-retry (comma list) and ?sweep=0 | 1 (the 3-hourly sweep's runs, or none of them). */
 orderFetchRouter.get("/invoice/requests", async (req, res) => {
   const userId = String(req.query.userId || "").trim() || workspaceUserId();
-  res.json({ requests: await listInvoiceRequests(userId, Number(req.query.limit) || 20) });
+  const sources = String(req.query.source || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const sweep = String(req.query.sweep ?? "").trim();
+  res.json({ requests: await listInvoiceRequests(userId, Number(req.query.limit) || 20, { sources, sweep: sweep === "0" ? false : sweep === "1" ? true : undefined }) });
 });
 
 /** One request with its per-order tasks. */

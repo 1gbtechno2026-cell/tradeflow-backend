@@ -3,8 +3,10 @@ import { Invoice } from "../models/Invoice.js";
 import { OrderJobRun } from "../models/OrderJobRun.js";
 import { config } from "../config.js";
 import { invoiceStoreEnabled } from "./invoiceCapture.js";
-import { downloadInvoicesByOrderId } from "./invoiceOnDemand.js";
+import { downloadInvoicesByOrderId, type OrderDownloadResult } from "./invoiceOnDemand.js";
 import { startRun, progressRun, finishRun } from "./orderJobRuns.js";
+import { recordSweepAsRequest, type SweepPhase } from "./invoiceSweepRequest.js";
+import { CHAIN_INVOICE_SWEEP } from "./requestChains.js";
 
 /** Scheduled invoice sweep on/off (INVOICE_SCHEDULE=0 to disable). */
 export const INVOICE_SCHEDULE_ENABLED = String(process.env.INVOICE_SCHEDULE ?? "1") !== "0";
@@ -39,7 +41,16 @@ export interface InvoiceSweepResult {
 
 export async function runInvoiceSweep(
   userId: string,
-  opts: { concurrency?: number; cap?: number; cancelled?: () => boolean; log?: (level: "info" | "warn", msg: string) => void } = {}
+  opts: {
+    concurrency?: number;
+    cap?: number;
+    cancelled?: () => boolean;
+    log?: (level: "info" | "warn", msg: string) => void;
+    /** For whoever records the run as a request (services/invoiceSweepRequest.ts): a phase's orders before it starts, and each order as it is taken and answered. */
+    onPhase?: (phase: SweepPhase, orderIds: string[]) => void | Promise<void>;
+    onStart?: (orderId: string) => void | Promise<void>;
+    onResult?: (result: OrderDownloadResult) => void | Promise<void>;
+  } = {}
 ): Promise<InvoiceSweepResult> {
   const log = opts.log || (() => undefined);
   const cap = opts.cap ?? config.invoiceMaxPerRun;
@@ -64,7 +75,8 @@ export async function runInvoiceSweep(
   ).slice(0, cap) as string[];
   out.phase1.candidates = missing.length;
   if (missing.length && !opts.cancelled?.()) {
-    const r = await downloadInvoicesByOrderId({ userId, orderIds: missing, force: false, concurrency, cancelled: opts.cancelled, log });
+    await opts.onPhase?.("capture", missing);
+    const r = await downloadInvoicesByOrderId({ userId, orderIds: missing, force: false, concurrency, cancelled: opts.cancelled, log, onStart: opts.onStart, onResult: opts.onResult });
     const downloaded = r.filter((x) => x.status === "downloaded").map((x) => x.orderId);
     out.phase1.downloaded = downloaded.length;
     out.phase1.failed = r.filter((x) => x.status === "failed").length;
@@ -80,7 +92,8 @@ export async function runInvoiceSweep(
   ).map((d) => String(d.order_id));
   out.phase2.candidates = due.length;
   if (due.length && !opts.cancelled?.()) {
-    const r = await downloadInvoicesByOrderId({ userId, orderIds: due, force: true, concurrency, cancelled: opts.cancelled, log });
+    await opts.onPhase?.("recapture", due);
+    const r = await downloadInvoicesByOrderId({ userId, orderIds: due, force: true, concurrency, cancelled: opts.cancelled, log, onStart: opts.onStart, onResult: opts.onResult });
     const ok = r.filter((x) => x.status === "downloaded").map((x) => x.orderId);
     out.phase2.recaptured = ok.length;
     out.phase2.failed = r.filter((x) => x.status === "failed").length;
@@ -103,6 +116,15 @@ export async function runInvoiceSweep(
  * panel / running indicator shows it), single-flights against a run already in
  * progress, and reports counts. This is what the worker schedule and the manual
  * "Invoices" button invoke.
+ *
+ * Since step 5 a run that has something to download is also a REQUEST of the
+ * log — the reference's nightly "Invoice fetch", source `system-cron` (`user`
+ * for the button): one order_invoice_requests document, a task per order,
+ * written as the sweep goes (services/invoiceSweepRequest.ts). The sweep
+ * itself is untouched: the same schedule, the same single-flight, the same
+ * cap per phase, the same downloads, the same captured_at / settled
+ * bookkeeping. Batch requests → Cancel on such a request stops the sweep
+ * between two orders. CHAIN_INVOICE_SWEEP=0 leaves the request out.
  */
 export async function runTrackedInvoiceSweep(
   userId: string,
@@ -111,23 +133,27 @@ export async function runTrackedInvoiceSweep(
   const open = await OrderJobRun.findOne({ userId, type: "invoices", status: "running" }).select("_id").lean();
   if (open) return { skipped: true, reason: "an invoice run is already in progress" };
 
-  await startRun(userId, "invoices", {
+  const ledgerRunId = await startRun(userId, "invoices", {
     trigger: input.trigger || "system-cron",
     by: input.by || "schedule",
     message: "Invoice sweep running…",
     meta: { request: "invoice_fetch", platform: "FLIPKART", sweep: true, params: { force: false, cap_per_phase: config.invoiceMaxPerRun } },
   });
+  const recorder = CHAIN_INVOICE_SWEEP ? recordSweepAsRequest(userId, { source: input.trigger === "user" ? "user" : "system-cron", by: input.trigger === "user" ? input.by || "" : "", ledgerRunId, capPerPhase: config.invoiceMaxPerRun }) : null;
   try {
     const result = await runInvoiceSweep(userId, {
       log: (lvl, m) => {
         if (lvl === "info") void progressRun(userId, "invoices", { message: m });
       },
+      ...(recorder ? { cancelled: recorder.stopped, onPhase: recorder.onPhase, onStart: recorder.onStart, onResult: recorder.onResult } : {}),
     });
     const success = result.phase1.downloaded + result.phase2.recaptured;
     const failed = result.phase1.failed + result.phase2.failed;
     const total = result.phase1.candidates + result.phase2.candidates;
+    const stopped = Boolean(recorder?.stopped());
+    await recorder?.finish();
     await finishRun(userId, "invoices", {
-      status: "completed",
+      status: stopped ? "stopped" : "completed",
       total,
       processed: total,
       success,
@@ -137,6 +163,7 @@ export async function runTrackedInvoiceSweep(
     });
     return { skipped: false, result };
   } catch (err) {
+    await recorder?.finish(err);
     await finishRun(userId, "invoices", {
       status: "failed",
       total: 0,

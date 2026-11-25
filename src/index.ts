@@ -10,6 +10,8 @@ import { closeInterruptedFetchRuns } from "./services/orderJobRuns.js";
 import { startInvoiceRequestWatchdog } from "./services/invoiceRequests.js";
 import { startCouponRequestWatchdog } from "./services/couponRequests.js";
 import { hostName } from "./services/requestCommon.js";
+import { startRequestLogKeeper } from "./services/requestLogKeeper.js";
+import { afterTimedOut, liveProbes } from "./services/requestLogLive.js";
 import { startQueueMetrics } from "./services/queueMetrics.js";
 import { smsRouter } from "./routes/sms.js";
 import { describeError, isTransientError, throttledWarn } from "./lib/resilience.js";
@@ -118,6 +120,9 @@ async function main() {
   // (one started before those queues existed) is failed with "restart the worker".
   startInvoiceRequestWatchdog();
   startCouponRequestWatchdog();
+  // The request log (Batch requests / All tasks): task rows kept in step with every request — the first pass covers
+  // the 7 days the log keeps — and a request left open with nothing behind it closed as timed out (this machine's only).
+  startRequestLogKeeper({ probes: liveProbes, afterClose: afterTimedOut, userId: config.userId || undefined });
 }
 
 main().catch((err) => {

@@ -23,6 +23,7 @@ import { readUnitViaApi, walkOrderList, type ApiListedUnit } from "./orderApiSyn
 import { beginTrace, endTrace, traceFor } from "./orderTrace.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { finishRun, startRun } from "./orderJobRuns.js";
+import { openFetchTasks, type FetchTaskRun } from "./syncTaskLog.js";
 import { cardFieldsFor, checkoutOrderIdsForMany, type PlacedOrderRef } from "./orderLinks.js";
 import { captureInvoicesForAccount, type InvoiceMode } from "./invoiceCapture.js";
 import type { APIRequestContext } from "playwright";
@@ -1594,6 +1595,13 @@ export interface OrderFetchStartOptions {
   onFinished?: (info: { runId: string; cancelled: boolean; emails: string[] }) => void | Promise<void>;
   /** The caller holds the workspace's fetch slot (reserveOrderFetch) — the start is its own, not a second one. */
   reserved?: boolean;
+  /**
+   * The request log's source word when it is not the trigger itself:
+   * "system-retry" for a fetch made by Batch requests → Retry (its trigger
+   * stays "user" — someone pressed it). Kept on the ledger row (meta.source)
+   * and on every task row.
+   */
+  source?: string;
 }
 
 /** Workspaces whose fetch is between "asked" and "running": the saved units of every account are read first, a batch of accounts at a time. */
@@ -1603,6 +1611,8 @@ const stopWhilePreparing = new Set<string>();
 const reserved = new Set<string>();
 /** One token per run, so a run that was stopped knows it at its end even when another fetch has started since. */
 const runTokens = new Map<string, object>();
+/** The task-log rows of the run going now, per workspace: a row per account (services/syncTaskLog.ts openFetchTasks). */
+const fetchTaskRuns = new Map<string, FetchTaskRun>();
 const stoppedRuns = new WeakSet<object>();
 
 /** A stop (Force kill) arrived while the account list was still being prepared: nothing was started. */
@@ -1788,7 +1798,9 @@ async function beginOrderFetch(userId: string, emails: string[], sinceDate: Date
     invoices: job.invoices,
     platform: "FLIPKART",
     params: opts.params || {},
-    host: os.hostname().split(".")[0] || "host",
+    ...(opts.source ? { source: opts.source } : {}),
+    // The machine as the request log names it (config.hostId): fixed for the process, so this run stays "this machine's".
+    host: config.hostId,
     pid: process.pid,
   };
   const runId =
@@ -1803,6 +1815,10 @@ async function beginOrderFetch(userId: string, emails: string[], sinceDate: Date
     }).catch(() => undefined)) || "";
   const runToken = {};
   runTokens.set(userId, runToken);
+  // The task log: every account of this run queued, the ones skipped as not logged in already failed.
+  const tasks = runId ? openFetchTasks({ userId, runId, source: opts.source || opts.trigger || "user", by: opts.by || "", emails: fetchedEmails, skipped }) : null;
+  if (tasks) fetchTaskRuns.set(userId, tasks);
+  else fetchTaskRuns.delete(userId);
   beginTrace(userId, "fetch", { since: sinceDate.toISOString(), emails: queue.map((q) => q.email), windows, mode: job.mode, modeSource: resolved.source });
   log(
     userId,
@@ -1826,6 +1842,11 @@ async function beginOrderFetch(userId: string, emails: string[], sinceDate: Date
     const total = Math.max(rep.idsDiscovered || 0, rep.enrichQueued || rep.idsOpened || 0);
     const processed = job.cancelled ? known + (rep.idsOpened || 0) : total;
     const cancelled = job.cancelled || stoppedRuns.has(runToken);
+    // The accounts this run never reached are closed in the task log (cancelled / cut off when it was stopped);
+    // the per-account counts are final at once and close the ledger row with it.
+    if (tasks && fetchTaskRuns.get(userId) === tasks) fetchTaskRuns.delete(userId);
+    const taskEnd = tasks?.finish(cancelled);
+    void taskEnd?.written.catch(() => undefined);
     void finishRun(userId, "fetch", {
       status: cancelled ? "stopped" : "completed",
       total,
@@ -1835,7 +1856,7 @@ async function beginOrderFetch(userId: string, emails: string[], sinceDate: Date
       cancelled: cancelled ? Math.max(0, total - processed) : 0,
       failedItems: failedAccounts.get(userId) || [],
       message: `${rep.accountsDone}/${rep.accountsQueued} email(s) · ${rep.idsDiscovered} unit IDs found, ${rep.idsNew} new, ${rep.idsScraped} saved, ${rep.idsFailed} failed, ${rep.idsSkippedOld} older than ${job.sinceLabel}`,
-      meta: { ...runMeta, report: rep },
+      meta: { ...runMeta, report: rep, ...(taskEnd ? { task_counts: taskEnd.counts } : {}) },
     })
       .catch(() => undefined)
       // After the row is closed: what follows the fetch (the update of run_update_after_fetch) reads and writes it.
@@ -2450,6 +2471,7 @@ async function processAccount(getPage: () => Promise<Page>, userId: string, queu
 
 async function run(userId: string, queue: QueueAccount[]) {
   const job = state(userId);
+  const tasks = fetchTaskRuns.get(userId);
   const windows = Math.max(1, job.windows || 1);
   let next = 0;
   log(
@@ -2479,14 +2501,17 @@ async function run(userId: string, queue: QueueAccount[]) {
         const i = next++;
         if (i >= queue.length) break;
         const row = queue[i];
+        tasks?.started(row.email);
         try {
           await processAccount(getPage, userId, queue, row, i);
+          tasks?.succeeded(row.email);
         } catch (err) {
           if (job.cancelled || (err instanceof Error && err.message === "cancelled")) {
             log(userId, "warn", `Stopped at ${row.email}`);
             break;
           }
           job.failed += 1;
+          tasks?.failed(row.email, (err instanceof Error ? err.message : String(err)).split("\n")[0].slice(0, 200));
           log(userId, "error", `${row.email} failed: ${err instanceof Error ? err.message : err}`);
           const list = failedAccounts.get(userId) || [];
           if (list.length < 500) list.push({ key: row.email, reason: (err instanceof Error ? err.message : String(err)).split("\n")[0].slice(0, 200) });

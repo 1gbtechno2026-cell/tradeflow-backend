@@ -33,6 +33,7 @@ import {
   type ClassifiedError,
   type LedgerModel,
 } from "./requestCommon.js";
+import { openRequestTasksQuietly, syncRequestTasksQuietly, syncRequestTasksSoon } from "./syncTaskLog.js";
 
 /**
  * "Download Order Invoices" as a batch — the reference's "Invoice fetch".
@@ -236,9 +237,15 @@ export function parseInvoiceOrderIds(value: unknown): string[] {
   return distinct(splitValues(value).map((id) => id.toUpperCase()));
 }
 
+/**
+ * `source`, `retryOf`, `parentId` and `params` are for the requests nobody
+ * types: Batch requests → Retry ("system-retry", retryOf = the request it
+ * retries) and the invoice fetch an update queues when it saw units arrive at
+ * Delivered ("system-update", parentId = that update — services/requestChains.ts).
+ */
 export async function createInvoiceRequest(
   userId: string,
-  input: { orderIds: unknown; force?: boolean; by?: string; source?: string; platform?: string },
+  input: { orderIds: unknown; force?: boolean; by?: string; source?: string; platform?: string; retryOf?: string; parentId?: string; params?: Record<string, unknown> },
   overrides: Partial<InvoiceBatchDeps> = {}
 ) {
   const deps = { ...invoiceBatchDefaults, ...overrides };
@@ -283,9 +290,11 @@ export async function createInvoiceRequest(
     createdBy: String(input.by || "").trim(),
     status: nothingToRun ? "completed" : "queued",
     message: nothingToRun ? "None of these orders is in Order Units" : "",
-    params: { order_ids_count: orderIds.length, force },
+    params: { order_ids_count: orderIds.length, force, ...(input.params || {}) },
     tasks,
     counts,
+    retryOf: String(input.retryOf || ""),
+    parentId: String(input.parentId || input.retryOf || ""),
     queue: deps.queueName,
     systemId: config.systemId,
     host: hostName(),
@@ -294,8 +303,11 @@ export async function createInvoiceRequest(
     finishedAt: nothingToRun ? now : null,
   });
   const requestId = String(request._id);
+  // The task log: a row per order, written before a job can take one (services/syncTaskLog.ts).
+  await openRequestTasksQuietly("invoices", request.toObject());
   await openRequestRun(
-    { userId, type: "invoices", refId: requestId, trigger: "user", by: String(input.by || "").trim(), total: counts.total, message: `Invoice fetch · ${counts.total} order(s) waiting for the worker`, meta: { request: "invoice_fetch", platform: "FLIPKART", params: { order_ids_count: orderIds.length, force }, queue: deps.queueName } },
+    // The panel's trigger chip knows two words: a request the system queued by itself reads system-cron, one somebody pressed reads user.
+    { userId, type: "invoices", refId: requestId, trigger: /^system-(?!retry)/.test(input.source || "") ? "system-cron" : "user", by: String(input.by || "").trim(), total: counts.total, message: `Invoice fetch · ${counts.total} order(s) waiting for the worker`, meta: { request: "invoice_fetch", platform: "FLIPKART", source: input.source || "user", params: { order_ids_count: orderIds.length, force }, queue: deps.queueName } },
     deps.ledger
   ).catch(() => undefined);
 
@@ -309,6 +321,7 @@ export async function createInvoiceRequest(
       const reason = `Could not queue the request: ${err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : String(err)}`;
       await endOpenTasks(request._id, { status: "failed", errorClass: "internal_error", error: ERROR_CLASSES.internal_error, detail: reason }, reason);
       await syncLedger(requestId, deps, { final: true });
+      await syncRequestTasksQuietly("invoices", requestId);
       throw new RequestInputError(reason, 503, "queue_unavailable");
     }
   }
@@ -335,6 +348,17 @@ async function endOpenTasks(id: Types.ObjectId, patch: { status: RequestTaskStat
   return res.modifiedCount === 1;
 }
 
+/**
+ * endOpenTasks for a request that does not run on the batch queue — a sweep
+ * run recorded as a request (services/invoiceSweep.ts): what is still queued
+ * when the run ends (it broke, or its worker was restarted under it) is ended
+ * with one status and sentence, and the request closed.
+ */
+export async function endOpenInvoiceTasks(requestId: string, patch: { status: RequestTaskStatus; errorClass: string; error: string; detail?: string }, message: string, opts: { alsoRunning?: Partial<IInvoiceTask> } = {}): Promise<boolean> {
+  if (!Types.ObjectId.isValid(requestId)) return false;
+  return endOpenTasks(new Types.ObjectId(requestId), patch, message, { requestStatus: "completed", alsoRunning: opts.alsoRunning });
+}
+
 /** Both reads say whether a worker is behind an open request (`worker_alive`, `stalled`, `stalled_message`). */
 export async function getInvoiceRequest(userId: string, requestId: string) {
   if (!Types.ObjectId.isValid(requestId)) return null;
@@ -342,8 +366,17 @@ export async function getInvoiceRequest(userId: string, requestId: string) {
   return row ? (await withLiveness([{ row: publicInvoiceRequest(row, true), queue: row.queue || INVOICE_BATCH_QUEUE }], "order"))[0] : null;
 }
 
-export async function listInvoiceRequests(userId: string, limit = 20) {
-  const rows = await OrderInvoiceRequest.find({ userId }).sort({ createdAt: -1 }).limit(Math.min(100, Math.max(1, limit))).select("-tasks").lean();
+/**
+ * The newest invoice requests. `only` narrows them (GET /invoice/requests?source=&sweep=): the sync panel's
+ * "Download Order Invoices" row asks for the batches people started (source user / system-retry, no sweep run),
+ * so a sweep run or a Delivered-check request never takes that row — or its Stop — from them.
+ */
+export async function listInvoiceRequests(userId: string, limit = 20, only: { sources?: string[]; sweep?: boolean } = {}) {
+  const filter: Record<string, unknown> = { userId };
+  if (only.sources?.length) filter.source = only.sources.includes("user") ? { $in: [...only.sources, null, ""] } : { $in: only.sources };
+  if (only.sweep === false) filter["params.sweep"] = { $ne: true };
+  else if (only.sweep === true) filter["params.sweep"] = true;
+  const rows = await OrderInvoiceRequest.find(filter).sort({ createdAt: -1 }).limit(Math.min(100, Math.max(1, limit))).select("-tasks").lean();
   return withLiveness(rows.map((r) => ({ row: publicInvoiceRequest(r), queue: r.queue || INVOICE_BATCH_QUEUE })), "order");
 }
 
@@ -376,6 +409,7 @@ export async function stopInvoiceRequest(userId: string, requestId: string, by =
         if (job && (await job.remove().then(() => true, () => false))) removed++;
       }
       await syncLedger(requestId, deps, { final: true });
+      await syncRequestTasksQuietly("invoices", requestId);
       console.log(`[invoice-batch] request ${requestId} stopped by ${by || "a user"} — ${removed} account job(s) removed from the queue`);
     }
   }
@@ -428,6 +462,8 @@ async function settleInvoiceRequest(requestId: string, deps: InvoiceBatchDeps) {
     console.log(`[invoice-batch] request ${requestId} finished: ${row?.counts.success ?? 0} downloaded, ${row?.counts.failed ?? 0} failed`);
   }
   await syncLedger(requestId, deps, { final: true });
+  // The task log follows what this account's job wrote on the request — at once when that ended the request.
+  await syncRequestTasksSoon("invoices", requestId, res.modifiedCount > 0);
 }
 
 /** One account of one request: its orders that have not ended, one after another over one session. */
@@ -588,6 +624,7 @@ export async function failUnclaimedInvoiceRequests(opts: { pickupMs?: number; qu
         await job?.remove().catch(() => undefined);
       }
       await syncLedger(requestId, deps, { final: true, parked: WORKER_NOT_PICKED_UP });
+      await syncRequestTasksQuietly("invoices", requestId);
       out.failed++;
       console.warn(`[invoice-batch] request ${requestId} failed: ${WORKER_NOT_PICKED_UP}`);
     } else {

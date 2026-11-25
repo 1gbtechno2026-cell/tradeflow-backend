@@ -41,6 +41,13 @@ export interface IRescheduleRequest {
   date: string;
   createdBy: string;
   retryOf: string;
+  /** The deployment whose Redis holds this request's jobs (config.systemId). "" on requests made before 2026-11-24 — the request log closes a request nothing is behind only when it is this deployment's. */
+  systemId: string;
+  /** "" = the dashboard user's own request; "system-retry" when Batch requests → Retry made it. */
+  source: string;
+  /** Set by Batch requests → Cancel (services/syncActions.ts): the request ends "cancelled" once nothing of it is running. */
+  stoppedBy: string;
+  stoppedAt: Date | null;
   /** Whether the worker may press Flipkart's confirm (RESCHEDULE_CONFIRM at submit time). */
   confirm: boolean;
   status: "queued" | "running" | "done";
@@ -77,6 +84,10 @@ const RescheduleRequestSchema = new Schema<IRescheduleRequest>(
     date: { type: String, required: true },
     createdBy: { type: String, default: "" },
     retryOf: { type: String, default: "" },
+    systemId: { type: String, default: "" },
+    source: { type: String, default: "" },
+    stoppedBy: { type: String, default: "" },
+    stoppedAt: { type: Date, default: null },
     confirm: { type: Boolean, default: false },
     status: { type: String, enum: ["queued", "running", "done"], default: "queued" },
     units: { type: [UnitSchema], default: [] },

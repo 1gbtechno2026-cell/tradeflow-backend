@@ -51,6 +51,13 @@ export interface ICancelRequest {
   createdBy: string;
   /** Set when this request was made by "Retry failed" on another one. */
   retryOf: string;
+  /** The deployment whose Redis holds this request's jobs (config.systemId). "" on requests made before 2026-11-24 — the request log closes a request nothing is behind only when it is this deployment's. */
+  systemId: string;
+  /** "" = the dashboard user's own request; "system-retry" when Batch requests → Retry made it. */
+  source: string;
+  /** Set by Batch requests → Cancel (services/syncActions.ts): the request ends "cancelled" once nothing of it is running. */
+  stoppedBy: string;
+  stoppedAt: Date | null;
   status: "queued" | "running" | "done";
   units: ICancelUnit[];
   /** Urgent-mode orders still to be read (or that could not be read). */
@@ -98,6 +105,10 @@ const CancelRequestSchema = new Schema<ICancelRequest>(
     urgent: { type: Boolean, default: false },
     createdBy: { type: String, default: "" },
     retryOf: { type: String, default: "" },
+    systemId: { type: String, default: "" },
+    source: { type: String, default: "" },
+    stoppedBy: { type: String, default: "" },
+    stoppedAt: { type: Date, default: null },
     status: { type: String, enum: ["queued", "running", "done"], default: "queued" },
     units: { type: [UnitSchema], default: [] },
     orders: { type: [OrderSchema], default: [] },

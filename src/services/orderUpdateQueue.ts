@@ -1,5 +1,5 @@
 import { DelayedError, type Job } from "bullmq";
-import { Types } from "mongoose";
+import { Types, type Model } from "mongoose";
 import type { APIRequestContext, Browser, BrowserContext, Page } from "playwright";
 import { config } from "../config.js";
 import { isDestroyedContext } from "../lib/evalOnPage.js";
@@ -13,10 +13,12 @@ import { blockFlipkartLogout, closeBrowser, flipkartLoginUrl, launchStealthConte
 import { openOrderApiSession, OrderApiSessionError } from "./orderApi.js";
 import { apiScrapeAndSave, scrapeAndSave, type OrderAccount } from "./orderFetch.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
-import { DEFAULT_UPDATE_STATUSES } from "./orderLifecycle.js";
+import { DEFAULT_UPDATE_STATUSES, stageOf } from "./orderLifecycle.js";
 import { resolveTargets, type UpdateTriggerInput } from "./orderUpdate.js";
 import { recordUnitChanges, snapshotUnit } from "./orderUnitEvents.js";
 import { resolveLoggedInSession, workspaceUserId } from "./sessionStore.js";
+import { noteDeliveredOrder, queueInvoicesAfterUpdate } from "./requestChains.js";
+import { closeUpdateAccountRows, openRequestTasksQuietly, syncRequestTasksQuietly, taskLog, updateTaskKey } from "./syncTaskLog.js";
 
 /**
  * "Update Order Units" on the worker.
@@ -108,13 +110,41 @@ async function pushLog(requestId: Types.ObjectId | string, level: "info" | "warn
   await OrderUpdateRequest.updateOne({ _id: requestId }, { $push: { logs: { $each: [{ time: new Date(), level, message }], $slice: -LOG_KEEP } } }).catch(() => undefined);
 }
 
-export async function createUpdateRequest(userId: string, input: UpdateTriggerInput, opts: { source?: UpdateSource; by?: string; params?: Record<string, unknown>; parentId?: string } = {}) {
-  const targets = await resolveTargets(userId, input);
+/** One unit of an update that is already known — a retry takes the units of the request it retries, as that request stored them. */
+export interface PreparedUpdateUnit {
+  email: string;
+  platformId: Types.ObjectId | null;
+  orderId: string;
+  itemId: string;
+  unitId: string;
+  orderUrl: string;
+}
+
+/**
+ * `opts.units` (Batch requests → Retry): the request is made of exactly these
+ * units and the selection is not resolved again. Whether each account is
+ * still logged in is then the job's to find, as for any account that logs
+ * out between a request and its turn: its units fail "Session: … — re-login
+ * this ID".
+ */
+export async function createUpdateRequest(
+  userId: string,
+  input: UpdateTriggerInput,
+  opts: { source?: UpdateSource; by?: string; params?: Record<string, unknown>; parentId?: string; units?: PreparedUpdateUnit[] } = {}
+) {
+  const resolved = opts.units ? null : await resolveTargets(userId, input);
+  const targets = opts.units
+    ? opts.units.map((u) => ({ account: { email: u.email, id: u.platformId }, card: { orderId: u.orderId, itemId: u.itemId, unitId: u.unitId, orderUrl: u.orderUrl } }))
+    : (resolved || []).map((t) => ({ account: { email: t.account.email, id: t.account.id as Types.ObjectId | null }, card: t.card }));
   if (!targets.length) throw new Error("No active order units to update. Fetch first, or paste a logged-in email + order id.");
 
   const byAccount = new Map<string, IUpdateAccount>();
+  const taken = new Set<string>();
   for (const t of targets) {
     const key = t.account.email.toLowerCase();
+    // resolveTargets never names a unit twice; a prepared list might.
+    if (taken.has(`${key}|${t.card.unitId}`)) continue;
+    taken.add(`${key}|${t.card.unitId}`);
     const acc = byAccount.get(key) || {
       email: key,
       platformId: t.account.id,
@@ -141,23 +171,52 @@ export async function createUpdateRequest(userId: string, input: UpdateTriggerIn
     selectionMethod: input.selectionMethod || (input.orderIds?.length ? "order_ids" : input.emails?.length ? "emails" : input.csvRows?.length ? "csv" : input.orderStatus?.length ? "order_status" : "active"),
     params: opts.params || {},
     parentId: String(opts.parentId || "").trim(),
+    systemId: config.systemId,
     createdBy: String(opts.by || "").trim(),
     status: "queued",
     mode: mode.mode,
     windows: speed.windows,
     accounts: [...byAccount.values()],
-    logs: [{ time: new Date(), level: "info", message: `Update ${targets.length} unit(s) across ${byAccount.size} account(s) · ${speed.windows} window(s) · ${mode.mode === "api" ? "API mode (Chrome only on fallback)" : "Chrome"} · ${opts.source || "manual"}` }],
+    logs: [{ time: new Date(), level: "info", message: `Update ${taken.size} unit(s) across ${byAccount.size} account(s) · ${speed.windows} window(s) · ${mode.mode === "api" ? "API mode (Chrome only on fallback)" : "Chrome"} · ${opts.source || "manual"}` }],
   });
   const requestId = String(request._id);
+  // The task log: a row per unit, queued — written before a job can take one (services/syncTaskLog.ts).
+  await openRequestTasksQuietly("update", request.toObject());
   await getUpdateQueue().addBulk([...byAccount.keys()].map((email) => ({ name: "update", data: { requestId, email }, opts: { jobId: `${requestId}-${email}` } })));
-  console.log(`[orders-update] request ${requestId}: ${targets.length} unit(s) on ${byAccount.size} account(s) queued (${opts.source || "manual"})`);
+  console.log(`[orders-update] request ${requestId}: ${taken.size} unit(s) on ${byAccount.size} account(s) queued (${opts.source || "manual"})`);
   return publicUpdateRequest(request.toObject());
 }
 
+/**
+ * Requests the system queues by itself after other work, many times a day:
+ * the after-order update (services/afterOrderChain.ts) follows every checkout
+ * burst. A control that names no request — Force kill, POST /update/stop
+ * without an id, the sync panel's Update row, GET /update/status and the
+ * Force clear that acts on its requestId — never means one of these while a
+ * request a person or a schedule started is open, or was the last such.
+ */
+const AUTOMATIC_UPDATE_SOURCES: UpdateSource[] = ["system-order"];
+
+/**
+ * The update a control means when it names none: the newest OPEN request a
+ * person or a schedule started; else the newest open one of any source (an
+ * after-order update running alone); else, unless `openOnly`, the newest
+ * request a person or a schedule started, then the newest of any. "" = none.
+ */
+export async function currentUpdateRequestId(userId: string, openOnly = false, Update: Model<IOrderUpdateRequest> = OrderUpdateRequest): Promise<string> {
+  const open = { $in: ["queued", "running"] };
+  const started = { $nin: AUTOMATIC_UPDATE_SOURCES };
+  const tries: Array<Record<string, unknown>> = [{ userId, status: open, source: started }, { userId, status: open }, ...(openOnly ? [] : [{ userId, source: started }, { userId }])];
+  for (const filter of tries) {
+    const row = await Update.findOne(filter).sort({ createdAt: -1 }).select("_id").lean();
+    if (row) return String(row._id);
+  }
+  return "";
+}
+
 export async function cancelUpdateRequest(userId: string, requestId?: string) {
-  const row = requestId
-    ? await OrderUpdateRequest.findOne({ _id: requestId, userId })
-    : await OrderUpdateRequest.findOne({ userId, status: { $in: ["queued", "running"] } }).sort({ createdAt: -1 });
+  const current = requestId ? "" : await currentUpdateRequestId(userId, true);
+  const row = requestId || current ? await OrderUpdateRequest.findOne({ _id: requestId || current, userId }) : null;
   if (!row) return null;
   const queue = getUpdateQueue();
   let removed = 0;
@@ -175,6 +234,7 @@ export async function cancelUpdateRequest(userId: string, requestId?: string) {
     { arrayFilters: [{ "a.status": "queued" }] }
   );
   await pushLog(row._id, "warn", `Stopped by request — ${removed} account(s) removed from the queue; accounts already running finish their current unit`);
+  await syncRequestTasksQuietly("update", String(row._id));
   return { id: String(row._id), removed };
 }
 
@@ -229,6 +289,7 @@ export async function abortUpdateRequest(userId: string, requestId: string, by: 
   );
   await pushLog(requestId, "warn", `Force-cleared by ${by || "admin"} — ${removed} queue job(s) dropped, ${stuckAccounts} stuck account(s) closed`);
   console.log(`[orders-update ${requestId}] force-cleared by ${by || "admin"} (mode=${mode}, ${removed} job(s) dropped, ${stuckAccounts} account(s) closed)`);
+  await syncRequestTasksQuietly("update", requestId);
   const updated = await OrderUpdateRequest.findById(requestId).lean();
   return updated ? { ...publicUpdateRequest(updated), removed, stuckAccounts } : null;
 }
@@ -293,11 +354,13 @@ export function publicUpdateRequest(r: Partial<IOrderUpdateRequest> & { _id: unk
 
 /**
  * The dashboard's status panel polls GET /update/status and expects the old
- * in-process shape; this builds it from the newest request so nothing in
- * that panel changes.
+ * in-process shape; this builds it from the request the panel follows
+ * (currentUpdateRequestId — the newest, unless that is an automatic one while
+ * another matters more) so nothing in that panel changes.
  */
 export async function legacyStatusView(userId: string) {
-  const row = await OrderUpdateRequest.findOne({ userId }).sort({ createdAt: -1 }).lean();
+  const current = await currentUpdateRequestId(userId);
+  const row = current ? await OrderUpdateRequest.findById(current).lean() : null;
   const [mode, speed] = await Promise.all([resolveOrderFetchMode(userId).catch(() => null), resolveUpdateWindows(userId).catch(() => null)]);
   if (!row) {
     return { running: false, cancelled: false, currentEmail: null, logs: [], total: 0, done: 0, failed: 0, skipped: 0, savedOrders: 0, windows: speed?.windows || 1, startedAt: null, finishedAt: null, elapsedMs: 0, mode: mode?.mode || config.orderFetchMode, modeSource: mode?.source || "env", requestId: "", source: "" };
@@ -357,6 +420,10 @@ async function settleRequest(requestId: Types.ObjectId | string) {
       const pub = publicUpdateRequest(row);
       await pushLog(requestId, "info", `Update finished. ok ${pub.counts.done}, failed ${pub.counts.failed}, status changed ${pub.counts.statusChanged}, new OTP ${pub.counts.otpNew}`);
     }
+    // The request has ended: its task rows are brought in line with it once, whole.
+    await syncRequestTasksQuietly("update", String(requestId));
+    // The reference's "Delivered check": one invoice fetch for the orders this update saw arrive at Delivered.
+    await queueInvoicesAfterUpdate(String(requestId)).catch((err) => console.warn(`[chain] invoice fetch after update ${String(requestId).slice(-8)} failed: ${err instanceof Error ? err.message.split("\n")[0] : err}`));
   }
 }
 
@@ -383,12 +450,15 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
   const log = (level: "info" | "warn" | "error", msg: string) => pushLog(requestId, level, `${me}: ${msg}`);
   let launched: { browser: Browser; context: BrowserContext } | null = null;
   let chromeHeld = false; // true once this account has taken a slot from the Chrome gate
+  // How this account ended, for the task log: the units it never got to end the same way.
+  let ended: { status: string; message: string } | null = null;
   try {
     await OrderUpdateRequest.updateOne({ _id: requestId, status: "queued" }, { $set: { status: "running", startedAt: new Date() } });
     await setAccount(requestId, me, { status: "running", startedAt: new Date(), done: 0, failed: 0, statusChanged: 0, otpNew: 0, message: "" });
 
     const session = await resolveLoggedInSession(me);
     if (!session.ok) {
+      ended = { status: "failed", message: `Session: ${session.reason} — re-login this ID` };
       await setAccount(requestId, me, { status: "failed", finishedAt: new Date(), message: `Session: ${session.reason} — re-login this ID` });
       await markSessionEligibleForRelogin({ userId: request.userId, platformId: account.platformId, email: me, reason: `Update: ${session.reason} — re-login this ID`, via: "worker", requestId });
       await log("warn", `session: ${session.reason} — re-login this ID`);
@@ -434,10 +504,13 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
       for (let n = 0; n < account.units.length; n++) {
         const fresh = await OrderUpdateRequest.findById(requestId).select("status").lean();
         if (!fresh || fresh.status === "cancelled") {
+          ended = { status: "cancelled", message: `Stopped after ${n} unit(s)` };
           await setAccount(requestId, me, { status: "cancelled", finishedAt: new Date(), message: `Stopped after ${n} unit(s)` });
           return;
         }
         const u = account.units[n];
+        const taskKey = updateTaskKey(me, u.unitId);
+        taskLog.mark(requestId, taskKey, { status: "in_progress" });
         const card = { orderId: u.orderId, itemId: u.itemId, unitId: u.unitId, orderUrl: u.orderUrl, amount: "" };
         const before = await snapshotUnit(userId, u.unitId);
         try {
@@ -472,7 +545,9 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           // "Order Confirmed"), new OTPs and address changes become order_unit_events rows
           // — the dashboard's alerts read those.
           const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
+          if (changes.stageChanged && stageOf(after?.status_key) === "delivered") await noteDeliveredOrder(requestId, u.orderId);
           await bumpAccount(requestId, me, { done: 1, ...(changes.stageChanged ? { statusChanged: 1 } : {}), ...(changes.otpNew ? { otpNew: 1 } : {}) });
+          taskLog.mark(requestId, taskKey, { status: "success" });
           if (changes.stageChanged || changes.otpNew || changes.addressChanged) {
             await log(
               "info",
@@ -483,6 +558,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           if (isDestroyedContext(err)) throw err;
           await bumpAccount(requestId, me, { failed: 1 });
           const text = err instanceof Error ? err.message.split("\n")[0] : String(err);
+          taskLog.mark(requestId, taskKey, { status: "failed", message: text });
           if (/gave no data/.test(text)) noData++;
           await log("warn", `${u.orderId}/${u.unitId}: ${text.slice(0, 200)}`);
         }
@@ -502,6 +578,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
             await scrapeAndSave(await openPage(), userId, acct, card, { applyCalendar: false });
             const after = await snapshotUnit(userId, u.unitId);
             const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
+            if (changes.stageChanged && stageOf(after?.status_key) === "delivered") await noteDeliveredOrder(requestId, u.orderId);
             if (changes.otpNew || changes.stageChanged) {
               await bumpAccount(requestId, me, { ...(changes.stageChanged ? { statusChanged: 1 } : {}), ...(changes.otpNew ? { otpNew: 1 } : {}) });
             }
@@ -525,6 +602,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
         await markSessionEligibleForRelogin({ userId: request.userId, platformId: acct.id, email: me, reason, via, requestId });
         await log("warn", `every order page rendered nothing (${noData}) — Platform ID set eligible for re-login`);
       }
+      ended = { status: "done", message: "" };
       await setAccount(requestId, me, {
         status: "done",
         via,
@@ -536,6 +614,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
     }
   } catch (err) {
     const message = err instanceof Error ? err.message.split("\n")[0].slice(0, 300) : String(err);
+    ended = { status: "failed", message };
     await setAccount(requestId, me, { status: "failed", finishedAt: new Date(), message });
     await log("error", `failed: ${message}`);
   } finally {
@@ -545,6 +624,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
     }
     if (chromeHeld) releaseChrome();
     await unlock();
+    if (ended) await closeUpdateAccountRows(requestId, me, ended);
     await settleRequest(requestId);
     await sleep(300);
   }

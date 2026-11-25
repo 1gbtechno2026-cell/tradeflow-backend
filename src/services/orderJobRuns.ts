@@ -5,7 +5,7 @@ import { RescheduleRequest } from "../models/RescheduleRequest.js";
 import { OrderJobRun, type IOrderJobRun, type JobRunStatus, type JobRunTrigger, type JobRunType } from "../models/OrderJobRun.js";
 import { OrderUpdateRequest } from "../models/OrderUpdateRequest.js";
 import { getOrderFetchJob } from "./orderFetch.js";
-import { publicUpdateRequest } from "./orderUpdateQueue.js";
+import { currentUpdateRequestId, publicUpdateRequest } from "./orderUpdateQueue.js";
 
 /**
  * "Sync Order Units From Platform" — the rows.
@@ -264,7 +264,9 @@ async function fetchRow(userId: string): Promise<PanelRow> {
 }
 
 async function updateRow(userId: string): Promise<PanelRow> {
-  const doc = await OrderUpdateRequest.findOne({ userId }).sort({ createdAt: -1 }).lean();
+  // The request the panel follows: an after-order update never hides the one a person or a schedule started (orderUpdateQueue.ts).
+  const current = await currentUpdateRequestId(userId);
+  const doc = current ? await OrderUpdateRequest.findById(current).lean() : null;
   if (!doc) return idleRow("update");
   const p = publicUpdateRequest(doc);
   const running = p.status === "queued" || p.status === "running";

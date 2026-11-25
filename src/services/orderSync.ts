@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import { getSyncQueue, SYNC_QUEUE, type SyncJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
+import { afterOrderChain } from "./afterOrderChain.js";
 import { openOrderApiSession } from "./orderApi.js";
 import { releaseBatchReservation } from "./batchCounters.js";
 import { walkOrderList } from "./orderApiSync.js";
@@ -214,6 +215,8 @@ export async function runOrderSyncJob(job: Job<SyncJobData>, token: string | und
         }
       );
       console.log(`${tag} synced ${saved.size} unit(s)${orderIds.size ? ` of ${[...orderIds].join(", ")}` : " — no order on Flipkart for this attempt"}${listingPending ? " · listing confirmed" : ""}`);
+      // The reference's "After order": the placed orders of one burst get ONE update request (services/afterOrderChain.ts).
+      for (const orderId of orderIds) afterOrderChain.note(cj.userId, orderId, cj.batchId || "");
     } finally {
       await ctx.dispose().catch(() => undefined);
     }

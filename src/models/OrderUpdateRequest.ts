@@ -8,7 +8,15 @@ import mongoose, { Schema, type Types } from "mongoose";
  * dashboard's status panel and the morning email read it rather than a
  * process-local state that dies with the API.
  */
-export type UpdateSource = "manual" | "schedule" | "ofd" | "cancel";
+/**
+ * Who asked. The first four are this app's own words (the request log reads
+ * manual / cancel as "user", schedule / ofd as "system-cron"); the last two are
+ * the reference's: "system-order" — queued by itself after our checkout placed
+ * an order (services/requestChains.ts) — and "system-retry" — made by Batch
+ * requests → Retry (services/syncActions.ts).
+ */
+export type UpdateSource = "manual" | "schedule" | "ofd" | "cancel" | "system-order" | "system-retry";
+export const UPDATE_SOURCES: UpdateSource[] = ["manual", "schedule", "ofd", "cancel", "system-order", "system-retry"];
 export type UpdateAccountStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 
 export interface IUpdateUnitCard {
@@ -58,6 +66,15 @@ export interface IOrderUpdateRequest {
   params: Record<string, unknown>;
   /** The request this one follows — the fetch's ledger run id for `after_fetch`. */
   parentId: string;
+  /** The deployment whose Redis holds this request's jobs (config.systemId). "" on requests made before 2026-11-24 — the request log closes a request nothing is behind only when it is this deployment's. */
+  systemId: string;
+  /**
+   * Orders this update saw arrive at Delivered (the stage changed to it during
+   * this request). When the request finishes, ONE invoice fetch is queued for
+   * those of them that have no stored invoice — the reference's "Delivered
+   * check" (services/requestChains.ts).
+   */
+  deliveredOrderIds: string[];
   createdBy: string;
   status: "queued" | "running" | "done" | "cancelled";
   mode: "scrape" | "api";
@@ -111,10 +128,12 @@ const LogSchema = new Schema<IUpdateLog>(
 const OrderUpdateRequestSchema = new Schema<IOrderUpdateRequest>(
   {
     userId: { type: Schema.Types.ObjectId, required: true, index: true },
-    source: { type: String, enum: ["manual", "schedule", "ofd", "cancel"], default: "manual" },
+    source: { type: String, enum: UPDATE_SOURCES, default: "manual" },
     selectionMethod: { type: String, default: "" },
     params: { type: Schema.Types.Mixed, default: () => ({}) },
     parentId: { type: String, default: "" },
+    systemId: { type: String, default: "" },
+    deliveredOrderIds: { type: [String], default: [] },
     createdBy: { type: String, default: "" },
     status: { type: String, enum: ["queued", "running", "done", "cancelled"], default: "queued" },
     mode: { type: String, enum: ["scrape", "api"], default: "api" },

@@ -24,9 +24,16 @@ export interface IOrderCouponRequest {
   status: RequestStatus;
   message: string;
   links: string[];
-  params: { coupon_links_count: number; email_ids_count: number; selection_method: "email_ids" | "all_accounts"; accounts_count: number };
+  params: { coupon_links_count: number; email_ids_count: number; selection_method: "email_ids" | "all_accounts"; accounts_count: number } & Record<string, unknown>;
   /** A snapshot recounted from the tasks while the request runs; exact once it has ended. */
   counts: RequestCounts;
+  /**
+   * How many accounts had their coupons compared before and after the links
+   * were opened, and what the comparison said (services/couponRequests.ts
+   * readLiveOffers). `not_checked` = the links were opened but the coupons
+   * could not be read, so the task keeps the unverified wording.
+   */
+  verification: { activated: number; no_change: number; not_checked: number };
   retryOf: string;
   parentId: string;
   queue: string;
@@ -51,6 +58,10 @@ const OrderCouponRequestSchema = new Schema<IOrderCouponRequest>(
     links: { type: [String], default: [] },
     params: { type: Schema.Types.Mixed, default: () => ({}) },
     counts: { type: RequestCountsSchema, default: () => ({}) },
+    verification: {
+      type: new Schema({ activated: { type: Number, default: 0 }, no_change: { type: Number, default: 0 }, not_checked: { type: Number, default: 0 } }, { _id: false }),
+      default: () => ({}),
+    },
     retryOf: { type: String, default: "" },
     parentId: { type: String, default: "" },
     queue: { type: String, default: "" },
@@ -87,6 +98,29 @@ export interface ICouponLinkResult {
   ms: number;
 }
 
+/** One coupon as an account's My Coupons lists it (GET <dc>.rome.api.flipkart.com/api/1/user/rewards → RESPONSE.liveOffers[]). */
+export interface ICouponOffer {
+  offerId: string;
+  title: string;
+  endDate: string;
+}
+
+/**
+ * The account's coupons compared before and after its links were opened.
+ * `ran` false = one of the two reads failed (`reason` says which and why) and
+ * nothing is claimed. `activated` = at least one coupon is new, or one the
+ * account already had changed (its userOfferMeta: mapped / remaining counts).
+ */
+export interface ICouponVerification {
+  ran: boolean;
+  activated: boolean;
+  reason: string;
+  beforeCount: number;
+  afterCount: number;
+  newOffers: ICouponOffer[];
+  changedOffers: Array<ICouponOffer & { before: string; after: string }>;
+}
+
 export interface IOrderCouponTask {
   requestId: Types.ObjectId;
   userId: Types.ObjectId;
@@ -98,6 +132,8 @@ export interface IOrderCouponTask {
   /** On success: what is known — "Link opened with the account's session (HTTP 200)". */
   note: string;
   results: ICouponLinkResult[];
+  /** null = the comparison was never attempted (no link opened, or a worker from before 2026-11-24 ran it). */
+  verification: ICouponVerification | null;
   startedAt: Date | null;
   finishedAt: Date | null;
   createdAt: Date;
@@ -132,6 +168,7 @@ const OrderCouponTaskSchema = new Schema<IOrderCouponTask>(
     error: { type: String, default: "" },
     note: { type: String, default: "" },
     results: { type: [LinkResultSchema], default: [] },
+    verification: { type: Schema.Types.Mixed, default: null },
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null },
   },

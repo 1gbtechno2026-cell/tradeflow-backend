@@ -4,7 +4,11 @@
  * A local fake plays Flipkart's part: a coupon page that answers 200 to a
  * live session and 302 → /account/login to a dead one, a redirect chain, a
  * 404, a page that says "expired", a redirect off the site, a 503 and a
- * redirect loop. The worker (a separate process) opens the links through the
+ * redirect loop — and the account's coupons (GET …/api/1/user/rewards →
+ * RESPONSE.liveOffers[]), which the runner reads before and after the links:
+ * a link that adds a coupon, one that changes a coupon the account has, one
+ * that changes nothing, a read that fails (503), a dead session (401) and an
+ * account on the other data centre (406 "DC Change"). The worker (a separate process) opens the links through the
  * REAL request context the order API uses (openOrderApiSession) and the real
  * runner, queue, per-account lock, counts, ledger row, stop and resume.
  *
@@ -15,7 +19,8 @@
  * for 127.0.0.1), and where a flipkart.com link is really requested (the
  * fake). The ledger goes to a throwaway collection with the real schema.
  *
- * What this cannot show: that opening a real coupon link activates a coupon.
+ * What this cannot show: that opening a real coupon link activates a coupon —
+ * only that, when it does, the before / after comparison says so.
  *
  *   npm run test:coupons
  */
@@ -41,7 +46,9 @@ import {
   stopCouponRequest,
   type CouponDeps,
 } from "../services/couponRequests.js";
-import { clearWorkerHeartbeat, RequestInputError, startWorkerHeartbeat, WORKER_NOT_PICKED_UP, workerAlive } from "../services/requestCommon.js";
+import { clearWorkerHeartbeat, emptyCounts, RequestInputError, startWorkerHeartbeat, WORKER_NOT_PICKED_UP, workerAlive } from "../services/requestCommon.js";
+import { OrderSyncTask } from "../models/OrderSyncTask.js";
+import { logCounts } from "../services/syncTaskLog.js";
 
 const MODE = process.argv.includes("--worker") ? "worker" : process.argv.includes("--switched-off") ? "switched-off" : "driver";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -49,10 +56,19 @@ const SITE = "https://www.flipkart.com";
 
 // ── the stubs (both processes) ──────────────────────────────────────────────
 
-/** good… and dead… are logged-in Platform IDs (a dead one's session bounces to login); nosess… lost its session after the request was made; anything else is not an account. */
-const kindOf = (email: string) => (email.match(/^(good|dead|nosess)\d+@verify\.invalid$/) || [])[1] || "";
+/**
+ * Logged-in Platform IDs, by what their saved session is worth:
+ *   good…    live everywhere
+ *   bounce…  the coupons API takes it, the site sends it to login
+ *   dead…    dead everywhere: the coupons API answers 401
+ *   stale…   live, but the coupons API answers 503 — the comparison cannot run
+ *   dcone…   live, on data centre 1: the first read answers 406 "DC Change"
+ *   nosess…  lost its session after the request was made
+ * Anything else is not an account.
+ */
+const kindOf = (email: string) => (email.match(/^(good|bounce|dead|stale|dcone|nosess)\d+@verify\.invalid$/) || [])[1] || "";
 
-function stubs(queueName: string, ledgerCollection: string, origin: string, all: string[], linkPauseMs = 0): Partial<CouponDeps> {
+function stubs(queueName: string, ledgerCollection: string, origin: string, all: string[], linkPauseMs = 0, verify = true): Partial<CouponDeps> {
   const ledger = (mongoose.models.OrderJobRunVerify as mongoose.Model<IOrderJobRun>) || mongoose.model<IOrderJobRun>("OrderJobRunVerify", OrderJobRun.schema, ledgerCollection);
   return {
     queueName,
@@ -70,6 +86,11 @@ function stubs(queueName: string, ledgerCollection: string, origin: string, all:
     // openContext is NOT stubbed: the links are opened through openOrderApiSession, as in production.
     resolveUrl: (link) => (link.startsWith(SITE) ? origin + link.slice(SITE.length) : link),
     allowHost: (host) => host === "127.0.0.1",
+    // The coupons are read through the real romeCall (its "DC Change" switch included); only the host is the fake's,
+    // which is told the data-centre prefix the session is on.
+    verify,
+    verifyPauseMs: 0,
+    rewardsUrl: (romeHost) => `${origin}/rewards?dc=${(romeHost.match(/\/\/(\d+)\./) || [])[1] || ""}`,
   };
 }
 
@@ -78,7 +99,7 @@ function stubs(queueName: string, ledgerCollection: string, origin: string, all:
 async function workerMain() {
   const queueName = String(process.env.VERIFY_QUEUE);
   await mongoose.connect(config.mongoUri, { serverSelectionTimeoutMS: 15_000 });
-  const deps = stubs(queueName, String(process.env.VERIFY_LEDGER), String(process.env.VERIFY_ORIGIN), [], Number(process.env.VERIFY_LINK_PAUSE) || 0);
+  const deps = stubs(queueName, String(process.env.VERIFY_LEDGER), String(process.env.VERIFY_ORIGIN), [], Number(process.env.VERIFY_LINK_PAUSE) || 0, process.env.VERIFY_COMPARE !== "0");
   const worker = createCouponWorker(Number(process.env.VERIFY_CONCURRENCY) || 4, (job, token) => runCouponJob(job, token, deps), { queueName, lockDuration: 4000, stalledInterval: 2000 });
   worker.on("failed", (job, err) => {
     if (err.name !== "DelayedError") console.log(`job ${job?.id} failed: ${err.message}`);
@@ -138,6 +159,19 @@ async function driverMain() {
   let inFlight = 0;
   let maxInFlight = 0;
   const page = (title: string, body: string) => `<!doctype html><html><head><title>${title}</title><script>var state = {"invalid":false,"expired":0};</script></head><body>${body}</body></html>`;
+  // Each account's coupons, as My Coupons lists them (the fields of docs/company-coupons-discovery.md). Every account starts with two.
+  type FakeOffer = { offerId: string; displayInfo: { OFFER_TITLE: string }; endDate: string; status: string; userOfferMeta: { mappedCount: number; mappedTs: number; remainingRedemption: number; totalRedemption: number } };
+  const wallets = new Map<string, FakeOffer[]>();
+  const walletOf = (email: string) => {
+    if (!wallets.has(email)) {
+      wallets.set(email, [
+        { offerId: "nb:mp:base1", displayInfo: { OFFER_TITLE: "Flat 5% Off upto ₹50" }, endDate: "27 Nov, 2026, 11:59 PM", status: "LIVE", userOfferMeta: { mappedCount: 1, mappedTs: 1795000000, remainingRedemption: 1, totalRedemption: 1 } },
+        { offerId: "nb:mp:base2", displayInfo: { OFFER_TITLE: "GET 7% OFF ON BASKET" }, endDate: "30 Nov, 2026, 11:59 PM", status: "LIVE", userOfferMeta: { mappedCount: 1, mappedTs: 1795000001, remainingRedemption: 20, totalRedemption: 20 } },
+      ]);
+    }
+    return wallets.get(email)!;
+  };
+  const rewardsCalls: Array<{ email: string; dc: string; status: number }> = [];
   const server = http.createServer((req, res) => {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     const cookie = /(?:^|;\s*)T=([^;]+)/.exec(String(req.headers.cookie || ""))?.[1] || "";
@@ -145,9 +179,30 @@ async function driverMain() {
     hits.push({ path: url.pathname, email, at: Date.now(), ua: String(req.headers["user-agent"] || ""), accept: String(req.headers.accept || "") });
     const send = (status: number, headers: Record<string, string>, body = "") => res.writeHead(status, headers).end(body);
     const html = { "content-type": "text/html; charset=utf-8" };
-    // Every coupon page needs a live session: anything else is sent to login, as Flipkart does.
-    if (url.pathname.startsWith("/coupon/") && session !== "good") return send(302, { location: `/account/login?ret=${encodeURIComponent(url.pathname)}` });
+    // The account's coupons — what GET <dc>.rome.api.flipkart.com/api/1/user/rewards answers.
+    if (url.pathname === "/rewards") {
+      const dc = url.searchParams.get("dc") || "";
+      const json = (status: number, body: unknown) => (rewardsCalls.push({ email, dc, status }), send(status, { "content-type": "application/json" }, JSON.stringify(body)));
+      if (session === "dead" || !session) return json(401, { ERROR_MESSAGE: "Unauthorized" });
+      if (session === "stale") return json(503, { ERROR_MESSAGE: "Service Unavailable" });
+      if (session === "dcone" && dc !== "1") return json(406, { ERROR_MESSAGE: "DC Change", RESPONSE: { id: "1" } });
+      return json(200, { RESPONSE: { liveOffers: walletOf(email), expiredOffers: [], hasMore: false, totalCount: walletOf(email).length } });
+    }
+    // Every coupon page needs a session the site takes: anything else is sent to login, as Flipkart does.
+    if (url.pathname.startsWith("/coupon/") && !["good", "stale", "dcone"].includes(session)) return send(302, { location: `/account/login?ret=${encodeURIComponent(url.pathname)}` });
     switch (url.pathname) {
+      case "/coupon/claim": {
+        // A link that activates: the coupon is mapped to the account and shows in its liveOffers from now on.
+        const wallet = walletOf(email);
+        if (!wallet.some((o) => o.offerId === "nb:mp:company1")) wallet.push({ offerId: "nb:mp:company1", displayInfo: { OFFER_TITLE: "Company coupon ₹500 off" }, endDate: "31 Dec, 2026, 11:59 PM", status: "LIVE", userOfferMeta: { mappedCount: 1, mappedTs: 1795009999, remainingRedemption: 5, totalRedemption: 5 } });
+        return send(200, html, page("Company coupon | Flipkart", "<h1>Coupon added to your account</h1>"));
+      }
+      case "/coupon/again": {
+        // A link for a coupon the account already holds: nothing new appears, its mapping count goes up.
+        const held = walletOf(email).find((o) => o.offerId === "nb:mp:base1")!;
+        held.userOfferMeta = { ...held.userOfferMeta, mappedCount: held.userOfferMeta.mappedCount + 1, remainingRedemption: held.userOfferMeta.remainingRedemption + 1, totalRedemption: held.userOfferMeta.totalRedemption + 1 };
+        return send(200, html, page("Company coupon | Flipkart", "<h1>Coupon added to your account</h1>"));
+      }
       case "/coupon/ok":
         return send(200, html, page("Company coupon | Flipkart", "<h1>Coupon added to your account</h1><p>Use it at checkout.</p>"));
       case "/coupon/slow":
@@ -195,9 +250,9 @@ async function driverMain() {
   const link = (name: string) => `${SITE}/coupon/${name}`;
 
   let child: ChildProcess | null = null;
-  const startWorker = async (concurrency: number, linkPauseMs = 0) => {
+  const startWorker = async (concurrency: number, linkPauseMs = 0, compare = true) => {
     const p = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), "--worker"], {
-      env: { ...process.env, VERIFY_QUEUE: queueName, VERIFY_LEDGER: ledgerCollection, VERIFY_ORIGIN: origin, VERIFY_CONCURRENCY: String(concurrency), VERIFY_LINK_PAUSE: String(linkPauseMs) },
+      env: { ...process.env, VERIFY_QUEUE: queueName, VERIFY_LEDGER: ledgerCollection, VERIFY_ORIGIN: origin, VERIFY_CONCURRENCY: String(concurrency), VERIFY_LINK_PAUSE: String(linkPauseMs), VERIFY_COMPARE: compare ? "1" : "0" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     child = p;
@@ -292,7 +347,7 @@ async function driverMain() {
     console.log("\nB — a worker process opens the links (4 accounts at once, 150 ms between an account's links)");
     await startWorker(4, 150);
     const names = ["ok", "hop", "gone", "expired", "away", "boom", "loop"];
-    const b = await createCouponRequest(userId, { links: names.map(link), emails: ["good01@verify.invalid", "good02@verify.invalid", "dead01@verify.invalid", "nosess01@verify.invalid"], by: "verify" }, deps);
+    const b = await createCouponRequest(userId, { links: names.map(link), emails: ["good01@verify.invalid", "good02@verify.invalid", "bounce01@verify.invalid", "dead01@verify.invalid", "nosess01@verify.invalid"], by: "verify" }, deps);
     await completed(b.request_id);
     const good = await taskOf(b.request_id, "good01@verify.invalid");
     const by = (name: string) => good.results.find((r) => r.link === link(name))!;
@@ -326,19 +381,26 @@ async function driverMain() {
       const loop = by("loop");
       assert.deepEqual({ outcome: loop.outcome, errorClass: loop.errorClass, hops: loop.hops.length }, { outcome: "failed", errorClass: "unexpected_response", hops: 11 });
     });
-    await check("the account's task: some links opened, some failed → failed partially_failed", () => {
+    await check("the account's task: some links opened, some failed → failed partially_failed — it keeps its reason, and the comparison is on record beside it", () => {
       assert.deepEqual({ status: good.status, errorClass: good.errorClass, error: good.error, note: good.note, results: good.results.length }, { status: "failed", errorClass: "partially_failed", error: "Some items in this task failed", note: "2 of 7 link(s) opened", results: 7 });
       assert.ok(good.startedAt instanceof Date && good.finishedAt instanceof Date);
+      assert.deepEqual({ ran: good.verification?.ran, activated: good.verification?.activated, beforeCount: good.verification?.beforeCount, afterCount: good.verification?.afterCount }, { ran: true, activated: false, beforeCount: 2, afterCount: 2 });
     });
-    await check("a dead session: 302 → login is the answer — failed not_logged_in, the login page never loaded, the other links not tried", async () => {
-      const t = await taskOf(b.request_id, "dead01@verify.invalid");
+    await check("a session the site no longer takes: 302 → login is the answer — failed not_logged_in, the login page never loaded, the other links not tried", async () => {
+      const t = await taskOf(b.request_id, "bounce01@verify.invalid");
       assert.deepEqual({ status: t.status, errorClass: t.errorClass, error: t.error }, { status: "failed", errorClass: "not_logged_in", error: "Account is not logged in" });
       const first = t.results[0];
       assert.deepEqual({ outcome: first.outcome, errorClass: first.errorClass, loginBounce: first.loginBounce, httpStatus: first.httpStatus, finalUrl: first.finalUrl }, { outcome: "failed", errorClass: "not_logged_in", loginBounce: true, httpStatus: 302, finalUrl: `${origin}/account/login?ret=%2Fcoupon%2Fok` });
       assert.deepEqual(first.hops.map((h) => `${h.status} ${h.url.replace(origin, "")}`), ["302 /coupon/ok"]);
       assert.deepEqual(t.results.slice(1).map((r) => r.outcome), ["skipped", "skipped", "skipped", "skipped", "skipped", "skipped"]);
-      assert.equal(hitsOf("dead01@verify.invalid").length, 1);
+      assert.equal(hits.filter((h) => h.email === "bounce01@verify.invalid" && h.path.startsWith("/coupon/")).length, 1);
       assert.equal(hits.filter((h) => h.path === "/account/login").length, 0);
+      assert.equal(t.verification, null, "no link opened: there is nothing a change could be put down to, so nothing was compared");
+    });
+    await check("a dead session: the coupons API answers 401 — failed not_logged_in before any link is opened", async () => {
+      const t = await taskOf(b.request_id, "dead01@verify.invalid");
+      assert.deepEqual({ status: t.status, errorClass: t.errorClass, error: t.error, note: t.note, results: t.results.length }, { status: "failed", errorClass: "not_logged_in", error: "Account is not logged in", note: "the coupons API answered HTTP 401 — the session is not logged in", results: 0 });
+      assert.deepEqual(hitsOf("dead01@verify.invalid").map((h) => h.path), ["/rewards"], "one read of the coupons, no coupon link");
     });
     await check("an account with no saved session: failed not_logged_in, nothing requested", async () => {
       const t = await taskOf(b.request_id, "nosess01@verify.invalid");
@@ -348,21 +410,24 @@ async function driverMain() {
     await check("the session's cookie and a desktop User-Agent go out; links of one account are paced", () => {
       const mine = hitsOf("good01@verify.invalid");
       assert.ok(mine.length >= 7);
-      assert.match(mine[0].ua, /^Mozilla\/5\.0 \(Windows NT 10\.0; Win64; x64\).*Chrome\/\d+/);
-      assert.match(mine[0].accept, /^text\/html/);
+      const firstLink = mine.find((h) => h.path.startsWith("/coupon/"))!;
+      assert.match(firstLink.ua, /^Mozilla\/5\.0 \(Windows NT 10\.0; Win64; x64\).*Chrome\/\d+/);
+      assert.match(firstLink.accept, /^text\/html/);
+      assert.deepEqual([mine[0].path, mine[mine.length - 1].path], ["/rewards", "/rewards"], "the coupons are read before the first link and after the last");
       const firstOf = (name: string) => mine.find((h) => h.path === `/coupon/${name}`)!.at;
       assert.ok(firstOf("hop") - firstOf("ok") >= 140, `second link ${firstOf("hop") - firstOf("ok")} ms after the first`);
       assert.ok(firstOf("gone") - firstOf("hop") >= 140);
     });
     await check("counts, the ledger row and the reference shape (GET …/company-coupon/requests/:id)", async () => {
       const r = await reqOf(b.request_id);
-      assert.deepEqual({ ...r.counts }, { total: 4, queued: 0, in_progress: 0, success: 0, failed: 4, cancelled: 0, aborted: 0, timed_out: 0 });
+      assert.deepEqual({ ...r.counts }, { total: 5, queued: 0, in_progress: 0, success: 0, failed: 5, cancelled: 0, aborted: 0, timed_out: 0 });
       assert.ok(r.startedAt instanceof Date && r.finishedAt instanceof Date && r.workerHost);
       const l = await ledgerClosed(b.request_id);
-      assert.deepEqual({ status: l.status, total: l.total, processed: l.processed, success: l.success, failed: l.failed }, { status: "completed", total: 4, processed: 4, success: 0, failed: 4 });
-      assert.equal(l.failedItems.length, 4);
+      assert.deepEqual({ status: l.status, total: l.total, processed: l.processed, success: l.success, failed: l.failed }, { status: "completed", total: 5, processed: 5, success: 0, failed: 5 });
+      assert.equal(l.failedItems.length, 5);
       const pub = (await getCouponRequest(userId, b.request_id, { status: "failed", limit: 2 }))!;
-      assert.deepEqual({ status: pub.status, finished_count: pub.finished_count, progress_percent: pub.progress_percent, can_cancel: pub.can_cancel, activation_verified: pub.activation_verified }, { status: "completed", finished_count: 4, progress_percent: 100, can_cancel: false, activation_verified: false });
+      // The two good accounts opened some links, so their coupons were compared: the request says how many comparisons ran and what they said.
+      assert.deepEqual({ status: pub.status, finished_count: pub.finished_count, progress_percent: pub.progress_percent, can_cancel: pub.can_cancel, activation_verified: pub.activation_verified, verification: pub.verification }, { status: "completed", finished_count: 5, progress_percent: 100, can_cancel: false, activation_verified: true, verification: { activated: 0, no_change: 2, not_checked: 0 } });
       assert.deepEqual(pub.tasks_page, { limit: 2, skip: 0, returned: 2 });
       const t = pub.tasks[0];
       assert.deepEqual({ task_type: t.task_type, platform: t.platform, source: t.source, triggered_by: t.triggered_by, order_id: t.order_id }, { task_type: "company_coupon_apply", platform: "FLIPKART", source: "user", triggered_by: "verify", order_id: null });
@@ -374,15 +439,78 @@ async function driverMain() {
     await completed(b2.request_id);
     const one = await createCouponRequest(userId, { links: link("ok"), emails: ["good03@verify.invalid"], by: "verify" }, deps);
     await completed(one.request_id);
-    await check("every link opened → the task succeeds, worded as what is known", async () => {
+    await check("every link opened and the coupons the same before and after → the task succeeds and says 'No change seen'", async () => {
       const tasks = await tasksOf(b2.request_id);
       assert.equal(tasks.length, 6);
-      for (const t of tasks) assert.deepEqual({ status: t.status, errorClass: t.errorClass, error: t.error, note: t.note }, { status: "success", errorClass: "", error: "", note: "2 links opened with the account's session (HTTP 200)" }, t.email);
+      for (const t of tasks) assert.deepEqual({ status: t.status, errorClass: t.errorClass, error: t.error, note: t.note }, { status: "success", errorClass: "", error: "", note: "No change seen — the account's 2 coupon(s) are the same before and after" }, t.email);
       assert.deepEqual({ ...(await reqOf(b2.request_id)).counts }, { total: 6, queued: 0, in_progress: 0, success: 6, failed: 0, cancelled: 0, aborted: 0, timed_out: 0 });
+      assert.deepEqual({ ...(await reqOf(b2.request_id)).verification }, { activated: 0, no_change: 6, not_checked: 0 });
       const l = await ledgerClosed(b2.request_id);
       assert.deepEqual({ status: l.status, success: l.success, failed: l.failed }, { status: "completed", success: 6, failed: 0 });
-      assert.equal((await taskOf(one.request_id, "good03@verify.invalid")).note, "Link opened with the account's session (HTTP 200)");
+      const single = await taskOf(one.request_id, "good03@verify.invalid");
+      assert.equal(single.note, "No change seen — the account's 2 coupon(s) are the same before and after");
+      assert.equal(single.results[0].message, "Link opened with the account's session (HTTP 200)", "what the link itself answered stays on its result");
     });
+
+    // ── V: the account's coupons before and after ───────────────────────────
+    console.log("\nV — the coupons are read before and after the links (GET …/api/1/user/rewards → liveOffers)");
+    rewardsCalls.length = 0;
+    const v1 = await createCouponRequest(userId, { links: link("claim"), emails: ["good05@verify.invalid", "stale01@verify.invalid", "dcone01@verify.invalid", "dead02@verify.invalid"], by: "verify" }, deps);
+    const v2 = await createCouponRequest(userId, { links: link("again"), emails: ["good06@verify.invalid"], by: "verify" }, deps);
+    await completed(v1.request_id);
+    await completed(v2.request_id);
+    await check("a new coupon appears after the link → 'Activated', with the coupon named", async () => {
+      const t = await taskOf(v1.request_id, "good05@verify.invalid");
+      assert.deepEqual({ status: t.status, note: t.note }, { status: "success", note: 'Activated — 1 new coupon: "Company coupon ₹500 off" (nb:mp:company1)' });
+      assert.deepEqual(t.verification, { ran: true, activated: true, reason: "", beforeCount: 2, afterCount: 3, newOffers: [{ offerId: "nb:mp:company1", title: "Company coupon ₹500 off", endDate: "31 Dec, 2026, 11:59 PM" }], changedOffers: [] });
+      assert.deepEqual(rewardsCalls.filter((c) => c.email === "good05@verify.invalid").map((c) => c.status), [200, 200], "read once before and once after");
+    });
+    await check("a coupon the account already had changed (its userOfferMeta) → 'Activated', with what changed", async () => {
+      const t = await taskOf(v2.request_id, "good06@verify.invalid");
+      assert.equal(t.note, 'Activated — 1 coupon changed: "Flat 5% Off upto ₹50" (nb:mp:base1)');
+      assert.deepEqual({ ran: t.verification?.ran, activated: t.verification?.activated, newOffers: t.verification?.newOffers, beforeCount: t.verification?.beforeCount, afterCount: t.verification?.afterCount }, { ran: true, activated: true, newOffers: [], beforeCount: 2, afterCount: 2 });
+      assert.deepEqual(t.verification?.changedOffers.map((o) => [o.offerId, o.before, o.after]), [["nb:mp:base1", "mappedCount=1 mappedTs=1795000000 remainingRedemption=1 totalRedemption=1", "mappedCount=2 mappedTs=1795000000 remainingRedemption=2 totalRedemption=2"]]);
+    });
+    await check("the coupons could not be read (503) → nothing is claimed: the task keeps 'Link opened…' and says why the comparison did not run", async () => {
+      const t = await taskOf(v1.request_id, "stale01@verify.invalid");
+      assert.deepEqual({ status: t.status, note: t.note }, { status: "success", note: "Link opened with the account's session (HTTP 200)" });
+      assert.deepEqual({ ran: t.verification?.ran, activated: t.verification?.activated, reason: t.verification?.reason }, { ran: false, activated: false, reason: "before the links: the coupons API answered HTTP 503" });
+      assert.equal(hitsOf("stale01@verify.invalid", "/coupon/claim").length, 1, "the link was still opened");
+    });
+    await check('an account on the other data centre: 406 "DC Change" → the read is made again on its own host, and the comparison runs', async () => {
+      const t = await taskOf(v1.request_id, "dcone01@verify.invalid");
+      assert.equal(t.note, 'Activated — 1 new coupon: "Company coupon ₹500 off" (nb:mp:company1)');
+      assert.deepEqual(rewardsCalls.filter((c) => c.email === "dcone01@verify.invalid").map((c) => `${c.dc}:${c.status}`), ["2:406", "1:200", "1:200"]);
+    });
+    await check("401 from the coupons API → failed not_logged_in, and the link is never opened", async () => {
+      const t = await taskOf(v1.request_id, "dead02@verify.invalid");
+      assert.deepEqual({ status: t.status, errorClass: t.errorClass, results: t.results.length, verification: t.verification }, { status: "failed", errorClass: "not_logged_in", results: 0, verification: null });
+      assert.equal(hitsOf("dead02@verify.invalid", "/coupon/claim").length, 0);
+    });
+    await check("the request counts what the comparisons said; the public task carries it", async () => {
+      assert.deepEqual({ ...(await reqOf(v1.request_id)).verification }, { activated: 2, no_change: 0, not_checked: 1 });
+      const pub = (await getCouponRequest(userId, v1.request_id))!;
+      assert.deepEqual([pub.activation_verified, pub.verification], [true, { activated: 2, no_change: 0, not_checked: 1 }]);
+      const task = pub.tasks.find((t) => t.email === "good05@verify.invalid")!;
+      assert.deepEqual(task.verification, { ran: true, activated: true, reason: "", before_count: 2, after_count: 3, new_offers: [{ offer_id: "nb:mp:company1", title: "Company coupon ₹500 off", end_date: "31 Dec, 2026, 11:59 PM" }], changed_offers: [] });
+      const row = await OrderSyncTask.findOne({ requestId: v1.request_id, key: "good05@verify.invalid" }).lean();
+      assert.equal(row?.detail, 'Activated — 1 new coupon: "Company coupon ₹500 off" (nb:mp:company1)', "All tasks shows the same words");
+    });
+    for (const id of [v1.request_id, v2.request_id]) await ledgerClosed(id);
+    await killWorker();
+    await clearWorkerHeartbeat(queueName);
+    await startWorker(4, 0, false);
+    rewardsCalls.length = 0;
+    const v3 = await createCouponRequest(userId, { links: link("claim"), emails: ["good04@verify.invalid"], by: "verify" }, deps);
+    await completed(v3.request_id);
+    await check("COUPON_VERIFY=0: the links are opened, the coupons are not read, and the wording stays 'Link opened…'", async () => {
+      const t = await taskOf(v3.request_id, "good04@verify.invalid");
+      assert.deepEqual({ status: t.status, note: t.note, verification: t.verification }, { status: "success", note: "Link opened with the account's session (HTTP 200)", verification: null });
+      assert.equal(rewardsCalls.length, 0);
+      assert.equal((await getCouponRequest(userId, v3.request_id))!.activation_verified, false);
+    });
+    // The worker closes a request's ledger row just after the request itself: let it, before it is killed.
+    for (const id of [v1.request_id, v2.request_id, v3.request_id]) await ledgerClosed(id);
     await killWorker();
 
     // ── C: stop ─────────────────────────────────────────────────────────────
@@ -406,7 +534,7 @@ async function driverMain() {
       assert.ok(stopped.removed >= 8, `removed ${stopped.removed}`);
       for (const t of tasks) {
         if (t.status === "cancelled") assert.deepEqual([t.error, t.startedAt, hitsOf(t.email).length], ["Cancelled before it started", null, 0], t.email);
-        else assert.equal(hitsOf(t.email).length, 1, t.email);
+        else assert.equal(hitsOf(t.email, "/coupon/slow").length, 1, t.email);
       }
       assert.ok(maxInFlight >= 2 && maxInFlight <= 4, `${maxInFlight} at once`);
       const r = await reqOf(c.request_id);
@@ -459,11 +587,27 @@ async function driverMain() {
       assert.deepEqual({ status: l.status, success: l.success, processed: l.processed }, { status: "completed", success: 12, processed: 12 });
       assert.equal(await Ledger.countDocuments({ userId, status: { $in: ["queued", "running"] } }), 0, "no ledger row is left open");
     });
+
+    console.log("\nTHE TASK LOG — written by the request's own code, in both processes");
+    await check("every request of this run: a row per account, and its counters = its rows", async () => {
+      const requests = await OrderCouponRequest.find({ userId: new Types.ObjectId(userId) }).select("counts status").lean();
+      assert.ok(requests.length >= 6, `${requests.length} request(s)`);
+      for (const r of requests) {
+        const want = { ...emptyCounts(0), ...r.counts };
+        await waitFor(`the rows of ${String(r._id)} (${r.status}) to equal its counters`, async () => JSON.stringify(await logCounts(String(r._id))) === JSON.stringify(want), 8000);
+      }
+      const rows = await OrderSyncTask.find({ userId: new Types.ObjectId(userId) }).select("taskType kind email orderId unitId status error errorCode").lean();
+      assert.ok(rows.length && rows.every((t) => t.taskType === "company_coupon_apply" && t.kind === "coupons" && t.email && !t.orderId && !t.unitId), "a coupon task is one account, no order");
+      assert.ok(rows.some((t) => t.status === "success"));
+      assert.ok(rows.some((t) => t.status === "failed" && t.errorCode === "not_logged_in" && t.error === "Account is not logged in"));
+      console.log(`        ${rows.length} task row(s) across ${requests.length} request(s)`);
+    });
   } finally {
-    // Everything this run made: the invented workspace's requests and tasks, the throwaway ledger and queue, the invented accounts' locks.
+    // Everything this run made: the invented workspace's requests, tasks and task-log rows, the throwaway ledger and queue, the invented accounts' locks.
     await killWorker();
     server.close();
     const uid = new Types.ObjectId(userId);
+    const removedRows = await OrderSyncTask.deleteMany({ userId: uid });
     const removedTasks = await OrderCouponTask.deleteMany({ userId: uid });
     const removed = await OrderCouponRequest.deleteMany({ userId: uid });
     await mongoose.connection.db!.dropCollection(ledgerCollection).catch(() => undefined);
@@ -472,9 +616,9 @@ async function driverMain() {
     await queue.close().catch(() => undefined);
     const locks = await getRedis().keys("account:lock:*@verify.invalid");
     if (locks.length) await getRedis().del(...locks);
-    const left = (await OrderCouponRequest.countDocuments({ userId: uid })) + (await OrderCouponTask.countDocuments({ userId: uid }));
+    const left = (await OrderCouponRequest.countDocuments({ userId: uid })) + (await OrderCouponTask.countDocuments({ userId: uid })) + (await OrderSyncTask.countDocuments({ userId: uid }));
     const stray = (await getRedis().keys(`bull:${queueName}:*`)).length;
-    console.log(`\ncleanup: ${removed.deletedCount} request(s) and ${removedTasks.deletedCount} task(s) of the invented workspace deleted (${left} left), ledger collection dropped, queue obliterated (${stray} key(s) left), ${locks.length} lock(s) of invented accounts released`);
+    console.log(`\ncleanup: ${removed.deletedCount} request(s), ${removedTasks.deletedCount} task(s) and ${removedRows.deletedCount} task-log row(s) of the invented workspace deleted (${left} left), ledger collection dropped, queue obliterated (${stray} key(s) left), ${locks.length} lock(s) of invented accounts released`);
     if (left || stray) failures.push("cleanup");
     await mongoose.disconnect();
   }

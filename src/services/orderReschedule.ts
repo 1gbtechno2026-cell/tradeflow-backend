@@ -13,6 +13,8 @@ import { lockAccount } from "./accountLock.js";
 import { blockFlipkartLogout, desktopContext, flipkartLoginUrl, launchStealthBrowser, restoreFlipkartSession, sleep } from "./browser.js";
 import { claimEgress } from "./proxyPool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
+import { clearedByStop } from "./requestCommon.js";
+import { openRequestTasksQuietly, syncRequestTasksQuietly, syncRequestTasksSoon } from "./syncTaskLog.js";
 
 /**
  * Reschedule Order Units — Flipkart's "Change Date", driven per unit in the
@@ -64,6 +66,8 @@ export interface RescheduleRequestInput {
   by?: string;
   retryOf?: string;
   failIfEmpty?: boolean;
+  /** Internal: "system-retry" when Batch requests → Retry makes the request ("" = the user's own). */
+  source?: string;
 }
 
 function normaliseIds(type: "unit" | "order", ids: string[]): string[] {
@@ -167,6 +171,8 @@ export async function requestReschedule(userId: string, input: RescheduleRequest
     date,
     createdBy: String(input.by || "").trim(),
     retryOf: String(input.retryOf || ""),
+    source: String(input.source || ""),
+    systemId: config.systemId,
     confirm: rescheduleConfirmEnabled(),
     status: open ? "queued" : "done",
     units,
@@ -174,6 +180,8 @@ export async function requestReschedule(userId: string, input: RescheduleRequest
     finishedAt: open ? null : new Date(),
   });
   const requestId = String(request._id);
+  // The task log: a row per unit, written before a job can take one.
+  await openRequestTasksQuietly("reschedule", request.toObject());
   if (open) {
     await Order.updateMany(
       { userId, unit_id: { $in: units.map((u) => u.unitId) } },
@@ -237,6 +245,7 @@ export async function abortRescheduleRequest(userId: string, requestId: string, 
   );
 
   console.log(`[reschedule ${requestId}] force-cleared by ${by || "admin"} (mode=${mode}, freed ${freedRows} order row(s))`);
+  await syncRequestTasksQuietly("reschedule", requestId);
   const updated = await RescheduleRequest.findById(requestId).lean();
   return updated ? { ...publicRequest(updated), freedRows } : null;
 }
@@ -381,6 +390,18 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
       const needles = dateNeedles(request.date);
 
       for (const u of units) {
+        // Batch requests → Cancel (services/syncActions.ts) marks the request; a unit this job has not started is
+        // left as it is on Flipkart, closed "Cleared by …" and its Order row freed.
+        const mark = await RescheduleRequest.findById(requestId).select("stoppedAt stoppedBy").lean();
+        if (mark?.stoppedAt) {
+          await setUnit(requestId, u.unitId, { status: "failed", message: clearedByStop(mark.stoppedBy || ""), finishedAt: new Date() });
+          await Order.updateOne(
+            { userId: request.userId, unit_id: u.unitId, reschedule_request_id: requestId, reschedule_status: { $in: ["queued", "running"] } },
+            { $set: { reschedule_status: "", reschedule_request_id: "", reschedule_date: "", reschedule_message: "" } }
+          );
+          log(`${u.orderId}/${u.unitId} left as it is — the request was cancelled`);
+          continue;
+        }
         if (sessionDead) {
           await finish(u, "failed", "Session expired — re-login this ID");
           continue;
@@ -478,10 +499,13 @@ export async function runRescheduleJob(job: Job<RescheduleJobData>, token: strin
   } finally {
     await unlock();
     const fresh = await RescheduleRequest.findById(requestId).select("units status").lean();
-    if (fresh && !fresh.units.some((u) => u.status === "queued" || u.status === "running")) {
+    const done = Boolean(fresh && !fresh.units.some((u) => u.status === "queued" || u.status === "running"));
+    if (done) {
       await RescheduleRequest.updateOne({ _id: requestId }, { $set: { status: "done", finishedAt: new Date() } });
       console.log(`[reschedule ${requestId}] done`);
     }
+    // The task log follows what this account's job wrote on the request — at once when that ended the request.
+    await syncRequestTasksSoon("reschedule", requestId, done);
   }
 }
 

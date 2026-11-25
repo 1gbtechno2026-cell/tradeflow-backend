@@ -1,5 +1,6 @@
 import os from "node:os";
 import { Types, type Model } from "mongoose";
+import { config } from "../config.js";
 import { getRedis } from "../lib/redis.js";
 import { OrderJobRun, type IOrderJobRun, type JobRunStatus, type JobRunTrigger, type JobRunType } from "../models/OrderJobRun.js";
 import { countKeyOf, type RequestCounts, type RequestStatus, type RequestTaskStatus } from "../models/OrderInvoiceRequest.js";
@@ -139,11 +140,55 @@ export function classifyPlatformError(err: unknown): ClassifiedError {
   return classified(message ? "internal_error" : "unknown", message);
 }
 
+const OUR_SIDE_RE = /mongodb|Connection pool|<monitor>|MongoServer|MongoNetwork|not configured|INVOICE_S3_BUCKET|Redis|BullMQ|S3 (upload|put)/i;
+const SESSION_RE = /not logged[ _-]?in|^Session:|session (has )?expired|re-?login this ID|no_session|API refused the session|no usable saved session|login page|Refresh this ID/i;
+const BLOCKED_RE = /blocked|needs verification|too many attempts|account is locked/i;
+const NO_ORDER_RE = /no such order|Not found in Order Units|unknown_order|no longer in Order Units|is it the account/i;
+const NOT_ALLOWED_RE = /not eligible for cancellation|not_cancellable|This option is not available|does not allow a date change|cannot be cancelled/i;
+const NO_SLOTS_RE = /did not offer|no dates? (recognised|available|offered)/i;
+const HTTP_STATUS_RE = /\b(?:HTTP|status)\s*(\d{3})\b/i;
+
+/**
+ * The class of a failure kept only as a sentence — what cancel, reschedule,
+ * update and fetch store (units[].message, accounts[].message, failedItems[].reason).
+ * The sentence itself stays with the task as its `detail`; the class is read
+ * beside it, never instead of it. `platformAction` = the task asks Flipkart to
+ * change something (cancel, reschedule): a refusal nothing else explains is
+ * then the platform's, not ours.
+ */
+export function classifyMessage(message: unknown, platformAction = false): ClassifiedError {
+  const text = String(message ?? "").trim();
+  if (!text) return classified("unknown");
+  if (OUR_SIDE_RE.test(text)) return classified("internal_error", text);
+  if (SESSION_RE.test(text)) return classified("not_logged_in", text);
+  if (BLOCKED_RE.test(text)) return classified("account_blocked", text);
+  if (NO_ORDER_RE.test(text)) return classified("order_not_found", text);
+  if (NO_SLOTS_RE.test(text)) return classified("no_slots", text);
+  if (NOT_ALLOWED_RE.test(text)) return classified("not_allowed_now", text);
+  if (/\b429\b|too many requests|rate.?limit/i.test(text)) return classified("rate_limited", text);
+  if (UNREADABLE_RE.test(text) || /gave no data|rendered nothing|could not read|unexpected (answer|response)/i.test(text)) return classified("unexpected_response", text);
+  const status = Number(text.match(HTTP_STATUS_RE)?.[1] || 0);
+  const byStatus = status ? classOfHttpStatus(status) : null;
+  if (byStatus) return classified(byStatus, text);
+  if (NETWORK_RE.test(text) || /timed? ?out|Timeout/i.test(text)) return classified("platform_unavailable", text);
+  return classified(platformAction ? "platform_declined" : "internal_error", text);
+}
+
 // ── counts ──────────────────────────────────────────────────────────────────
 
 export const CANCELLED_BEFORE_START = "Cancelled before it started";
 export const ABORTED_WHILE_RUNNING = "Stopped while running: the request was cancelled";
+/** The reference's sentence for a task whose worker went away, or that never came back. */
+export const TIMED_OUT = "Timed out: the agent went offline or the task ran too long";
 export const WORKER_NOT_PICKED_UP = "The worker has not picked this up — restart the worker";
+
+/**
+ * What a cancel / reschedule unit carries when Batch requests → Cancel closed
+ * it. It starts with "Cleared by", as a Force-clear's note does, so the task
+ * log reads it the same way: cancelled "Cancelled before it started" when the
+ * unit had not been taken, aborted when it had.
+ */
+export const clearedByStop = (by: string) => `Cleared by ${by || "a user"} — the request was cancelled`;
 
 export function emptyCounts(total = 0): RequestCounts {
   return { total, queued: total, in_progress: 0, success: 0, failed: 0, cancelled: 0, aborted: 0, timed_out: 0 };
@@ -350,6 +395,7 @@ export async function writeRequestRun(
   ).catch(() => undefined);
 }
 
+/** This machine, as its rows and the request log's checks name it: TRADEFLOW_HOST_ID, else the machine name when the process started (config.hostId). */
 export function hostName(): string {
-  return os.hostname().split(".")[0] || "host";
+  return config.hostId;
 }

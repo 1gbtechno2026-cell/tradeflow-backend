@@ -18,6 +18,8 @@ import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { fallbackUnitId, saveMappedUnit, type OrderAccount } from "./orderFetch.js";
 import { claimEgress } from "./proxyPool.js";
 import { resolveLoggedInSession } from "./sessionStore.js";
+import { clearedByStop } from "./requestCommon.js";
+import { openRequestTasksQuietly, syncRequestTasksQuietly, syncRequestTasksSoon } from "./syncTaskLog.js";
 
 /**
  * "Cancel Order Units" — the dashboard's popup (Unit IDs or Order IDs) and the
@@ -106,6 +108,8 @@ export interface CancelRequestInput {
   extraOrders?: Array<{ orderId: string; email: string }>;
   /** Internal (retry): when nothing would be queued, throw instead of recording an empty request. */
   failIfEmpty?: boolean;
+  /** Internal: "system-retry" when Batch requests → Retry makes the request ("" = the user's own). */
+  source?: string;
 }
 
 /** Seconds one unit takes in the cancel browser, from measured runs. */
@@ -313,6 +317,8 @@ export async function requestCancellation(userId: string, input: CancelRequestIn
     urgent: Boolean(input.urgent) || urgentOrders.length > 0,
     createdBy: String(input.by || "").trim(),
     retryOf: String(input.retryOf || ""),
+    source: String(input.source || ""),
+    systemId: config.systemId,
     status: open ? "queued" : "done",
     units,
     orders: urgentOrders,
@@ -320,6 +326,8 @@ export async function requestCancellation(userId: string, input: CancelRequestIn
     finishedAt: open ? null : new Date(),
   });
   const requestId = String(request._id);
+  // The task log: a row per unit (and per urgent order page), written before a job can take one.
+  await openRequestTasksQuietly("cancel", request.toObject());
 
   if (open) {
     if (units.length) {
@@ -516,6 +524,7 @@ export async function abortCancelRequest(
   );
 
   console.log(`[cancel ${requestId}] force-cleared by ${by || "admin"} (mode=${mode}, freed ${freedRows} order row(s))`);
+  await syncRequestTasksQuietly("cancel", requestId);
   const updated = await CancelRequest.findById(requestId).lean();
   return updated ? { ...publicRequest(updated), freedRows } : null;
 }
@@ -785,6 +794,28 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
       await setOrder(requestId, o.orderId, { status, message, unitsFound, finishedAt: new Date() });
       log(`${o.orderId} order page → ${status}${message ? `: ${message}` : ""}`);
     };
+    // Batch requests → Cancel (services/syncActions.ts) marks the request; this job reads the mark before every unit
+    // it has not started. Such a unit is left as it is on Flipkart, closed "Cleared by …" and its Order row freed.
+    let stoppedBy: string | null = null;
+    const stopAsked = async () => {
+      if (stoppedBy === null) {
+        const mark = await CancelRequest.findById(requestId).select("stoppedAt stoppedBy").lean();
+        if (mark?.stoppedAt) stoppedBy = mark.stoppedBy || "a user";
+      }
+      return stoppedBy !== null;
+    };
+    const leave = async (u: ICancelUnit) => {
+      await CancelRequest.updateOne(
+        { _id: requestId },
+        { $set: { "units.$[u].status": "failed", "units.$[u].message": clearedByStop(stoppedBy || ""), "units.$[u].finishedAt": new Date() } },
+        { arrayFilters: [{ "u.unitId": u.unitId, "u.status": { $in: ["queued", "running"] } }] }
+      );
+      await Order.updateOne(
+        { userId: request.userId, unit_id: u.unitId, cancel_request_id: requestId, cancel_status: { $in: ["queued", "running"] } },
+        { $set: { cancel_status: "", cancel_request_id: "", cancel_requested_at: null, cancel_requested_by: "", cancel_error: "" } }
+      );
+      log(`${u.orderId}/${u.unitId} left as it is — the request was cancelled`);
+    };
 
     const session = await resolveLoggedInSession(email);
     if (!session.ok) {
@@ -809,6 +840,10 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
         log(`API mode: ${units.length} unit(s) over the cancel API${egress ? ` via ${egress.label}` : ""}`);
         for (let i = 0; i < units.length; i++) {
           const u = units[i];
+          if (await stopAsked()) {
+            await leave(u);
+            continue;
+          }
           await setUnit(requestId, u.unitId, { status: "running", startedAt: new Date() });
           await Order.updateOne({ userId: request.userId, unit_id: u.unitId }, { $set: { cancel_status: "running" } });
           try {
@@ -870,6 +905,10 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
       // what Flipkart showed at that moment.
       const freshUnits = new Set<string>();
       for (const o of orders) {
+        if (await stopAsked()) {
+          await finishOrder(o, "failed", clearedByStop(stoppedBy || ""));
+          continue;
+        }
         if (sessionDead) {
           await finishOrder(o, "failed", "Session expired — re-login this ID");
           continue;
@@ -952,6 +991,10 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
         for (;;) {
           const u = pending.shift();
           if (!u) return;
+          if (await stopAsked()) {
+            await leave(u);
+            continue;
+          }
           if (sessionDead) {
             await finish(u, "failed", "Session expired — re-login this ID");
             continue;
@@ -1023,9 +1066,11 @@ export async function runCancelJob(job: Job<CancelJobData>, token: string | unde
   } finally {
     await unlock();
     // Done once no unit — and no urgent order — anywhere in the request is still waiting or running.
-    await CancelRequest.updateOne(
+    const closed = await CancelRequest.updateOne(
       { _id: requestId, "units.status": { $nin: ["queued", "running"] }, "orders.status": { $nin: ["queued", "running"] } },
       { $set: { status: "done", finishedAt: new Date() } }
     );
+    // The task log follows what this account's job wrote on the request — at once when that ended the request.
+    await syncRequestTasksSoon("cancel", requestId, closed.modifiedCount > 0);
   }
 }

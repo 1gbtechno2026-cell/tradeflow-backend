@@ -10,6 +10,8 @@ import { rescheduleConcurrency, runRescheduleJob, startRescheduleReaper } from "
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
 import { ensureUpdateSchedules, resolveUpdateWindows, runOrderUpdateJob, startUpdateReaper } from "./services/orderUpdateQueue.js";
 import { runTrackedInvoiceSweep, INVOICE_SCHEDULE_ENABLED, INVOICE_SWEEP_MS } from "./services/invoiceSweep.js";
+import { closeInterruptedSweepRequests } from "./services/invoiceSweepRequest.js";
+import { CHAIN_AFTER_ORDER, CHAIN_DELIVERED_CHECK, CHAIN_INVOICE_SWEEP } from "./services/requestChains.js";
 import { INVOICE_BATCH_CONCURRENCY, runInvoiceBatchJob, startInvoiceRequestReaper } from "./services/invoiceRequests.js";
 import { COUPON_CONCURRENCY, runCouponJob, startCouponRequestReaper } from "./services/couponRequests.js";
 import { startWorkerHeartbeat } from "./services/requestCommon.js";
@@ -161,6 +163,8 @@ async function main() {
     setInterval(() => void follow(), 10_000).unref();
     // Re-enqueue cancel requests whose jobs were lost, so none sits stuck at 0/N.
     startCancelReaper();
+    // The API's request log reads this key beside BullMQ's list of workers: it outlives a restart (services/requestLogLive.ts).
+    startWorkerHeartbeat(CANCEL_QUEUE);
     names.push([CANCEL_QUEUE, cancelConcurrency]);
   }
   // Order reschedules: one job per account; RESCHEDULE_CONCURRENCY accounts at once (default 1).
@@ -176,6 +180,7 @@ async function main() {
     });
     rescheduleWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${RESCHEDULE_QUEUE}):`, err.message));
     startRescheduleReaper();
+    startWorkerHeartbeat(RESCHEDULE_QUEUE);
     names.push([RESCHEDULE_QUEUE, rescheduleWindows]);
   }
   // Order sync: finished checkouts' orders into Order Units, plus the sweep.
@@ -224,6 +229,7 @@ async function main() {
     setInterval(() => void followUpdate(), 10_000).unref();
     await ensureUpdateSchedules();
     startUpdateReaper();
+    startWorkerHeartbeat(UPDATE_QUEUE);
     names.push([UPDATE_QUEUE, windows]);
   }
 
@@ -240,6 +246,11 @@ async function main() {
       if (err.name !== "DelayedError") console.error(`[worker] FAILED ${INVOICE_QUEUE} job=${job?.id}:`, err.message);
     });
     invoiceWorker.on("error", (err) => console.error(`[worker] Redis/worker error (${INVOICE_QUEUE}):`, err.message));
+    // Each sweep run is also a request of the log (services/invoiceSweepRequest.ts). The heartbeat tells the API a
+    // worker is behind an open one (its Cancel then lets the order in flight finish); one an earlier worker of this
+    // machine left open is closed now — a sweep cannot be resumed.
+    startWorkerHeartbeat(INVOICE_QUEUE);
+    await closeInterruptedSweepRequests().catch((err) => console.warn("[worker] could not close interrupted sweep requests:", err instanceof Error ? err.message : err));
     if (INVOICE_SCHEDULE_ENABLED) {
       await getInvoiceQueue().upsertJobScheduler("order-invoice-sweep", { every: INVOICE_SWEEP_MS }, { name: "sweep", data: { sweep: "scheduled" }, opts: { attempts: 1 } });
     }
@@ -283,6 +294,10 @@ async function main() {
     console.error("[worker] WORKER_ROLES selected nothing to run");
     process.exit(2);
   }
+  // The requests nobody presses (services/requestChains.ts): each reacts only to work this process did.
+  console.log(
+    `[worker] chained requests — after order → update: ${CHAIN_AFTER_ORDER && roles.has("sync") ? "on" : "off"} · delivered → invoice fetch: ${CHAIN_DELIVERED_CHECK && roles.has("update") ? "on" : "off"} · invoice sweep as a request: ${CHAIN_INVOICE_SWEEP && roles.has("invoice") ? "on" : "off"}`
+  );
   console.log(
     `[worker] roles ${[...roles].join(",")} — listening on ${names.map(([n, c]) => `${n}×${c}`).join(", ")} — waiting for jobs (lock=10m)`
   );

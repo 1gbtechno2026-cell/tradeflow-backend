@@ -40,7 +40,9 @@ import {
 } from "../services/invoiceRequests.js";
 import type { InvoiceTarget } from "../services/invoiceOnDemand.js";
 import { OrderApiError } from "../services/orderApi.js";
-import { clearWorkerHeartbeat, RequestInputError, startWorkerHeartbeat, WORKER_NOT_PICKED_UP, workerAlive } from "../services/requestCommon.js";
+import { clearWorkerHeartbeat, emptyCounts, RequestInputError, startWorkerHeartbeat, WORKER_NOT_PICKED_UP, workerAlive } from "../services/requestCommon.js";
+import { OrderSyncTask } from "../models/OrderSyncTask.js";
+import { logCounts } from "../services/syncTaskLog.js";
 
 const IS_WORKER = process.argv.includes("--worker");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -485,18 +487,36 @@ async function driverMain() {
       assert.deepEqual({ status: l.status, success: l.success, failed: l.failed, processed: l.processed }, { status: "completed", success: 24, failed: 0, processed: 24 });
       assert.equal(await Ledger.countDocuments({ userId, status: { $in: ["queued", "running"] } }), 0, "no ledger row is left open");
     });
+
+    console.log("\nTHE TASK LOG — written by the request's own code, in both processes");
+    await check("every request of this run: a row per order, and its counters = its rows", async () => {
+      const requests = await OrderInvoiceRequest.find({ userId: new Types.ObjectId(userId) }).select("counts status").lean();
+      assert.ok(requests.length >= 8, `${requests.length} request(s)`);
+      for (const r of requests) {
+        const want = { ...emptyCounts(0), ...r.counts };
+        // The last write of a request (settle, stop) is followed by its rows; give that write a moment.
+        await waitFor(`the rows of ${String(r._id)} (${r.status}) to equal its counters`, async () => JSON.stringify(await logCounts(String(r._id))) === JSON.stringify(want), 8000);
+      }
+      const rows = await OrderSyncTask.find({ userId: new Types.ObjectId(userId) }).select("taskType kind orderId unitId status error errorCode").lean();
+      assert.ok(rows.length && rows.every((t) => t.taskType === "invoice_fetch" && t.kind === "invoices" && t.orderId && !t.unitId), "an invoice task carries its order and no unit");
+      assert.ok(rows.some((t) => t.status === "cancelled" && t.error === "Cancelled before it started"), "a stopped request's waiting orders");
+      assert.ok(rows.some((t) => t.status === "failed" && t.errorCode === "order_not_found"));
+      assert.ok(rows.some((t) => t.status === "failed" && t.errorCode === "rate_limited"));
+      console.log(`        ${rows.length} task row(s) across ${requests.length} request(s)`);
+    });
   } finally {
-    // Everything this run made: the invented workspace's requests, the throwaway ledger, the throwaway queue.
+    // Everything this run made: the invented workspace's requests and task rows, the throwaway ledger, the throwaway queue.
     await killWorker();
     server.close();
+    const removedRows = await OrderSyncTask.deleteMany({ userId: new Types.ObjectId(userId) });
     const removed = await OrderInvoiceRequest.deleteMany({ userId: new Types.ObjectId(userId) });
     await mongoose.connection.db!.dropCollection(ledgerCollection).catch(() => undefined);
     await clearWorkerHeartbeat(queueName);
     await queue.obliterate({ force: true }).catch(() => undefined);
     await queue.close().catch(() => undefined);
-    const left = await OrderInvoiceRequest.countDocuments({ userId: new Types.ObjectId(userId) });
+    const left = (await OrderInvoiceRequest.countDocuments({ userId: new Types.ObjectId(userId) })) + (await OrderSyncTask.countDocuments({ userId: new Types.ObjectId(userId) }));
     const stray = (await getRedis().keys(`bull:${queueName}:*`)).length;
-    console.log(`\ncleanup: ${removed.deletedCount} request(s) of the invented workspace deleted (${left} left), ledger collection dropped, queue obliterated (${stray} key(s) left)`);
+    console.log(`\ncleanup: ${removed.deletedCount} request(s) and ${removedRows.deletedCount} task-log row(s) of the invented workspace deleted (${left} left), ledger collection dropped, queue obliterated (${stray} key(s) left)`);
     if (left || stray) failures.push("cleanup");
     await mongoose.disconnect();
   }

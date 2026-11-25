@@ -209,6 +209,24 @@ export async function queueUpdateAfterFetch(
 
 // ── update ──────────────────────────────────────────────────────────────────
 
+/**
+ * Workspaces whose update request is being put together right now. Reading the
+ * units and their accounts normally takes 1-4 s, but has been seen to take
+ * minutes on a slow database; a second press (or a retry after the dashboard
+ * gave up waiting) must not queue the same update twice. The update trigger
+ * and Batch requests → Retry of an update share this one slot.
+ */
+const updatesBeingPrepared = new Set<string>();
+
+export const UPDATE_PREPARING_MESSAGE = "An update request is already being prepared — it will appear in a moment";
+
+/** Take the workspace's update-preparation slot. Returns the function that gives it back, or null when it is held. */
+export function holdUpdatePreparation(userId: string): (() => void) | null {
+  if (updatesBeingPrepared.has(userId)) return null;
+  updatesBeingPrepared.add(userId);
+  return () => void updatesBeingPrepared.delete(userId);
+}
+
 /** The selection method names the reference's mode banner shows. */
 export type UpdateSelection = "default" | "order_status" | "email_ids" | "order_status_and_email_ids" | "order_ids" | "order_email_pairs";
 

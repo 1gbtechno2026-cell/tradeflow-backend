@@ -2,14 +2,14 @@ import { DelayedError, type Job } from "bullmq";
 import { Types } from "mongoose";
 import type { APIRequestContext } from "playwright";
 import { config } from "../config.js";
-import { OrderCouponRequest, OrderCouponTask, type ICouponLinkResult, type IOrderCouponRequest, type IOrderCouponTask } from "../models/OrderCouponRequest.js";
+import { OrderCouponRequest, OrderCouponTask, type ICouponLinkResult, type ICouponOffer, type ICouponVerification, type IOrderCouponRequest, type IOrderCouponTask } from "../models/OrderCouponRequest.js";
 import { countKeyOf, type RequestTaskStatus } from "../models/OrderInvoiceRequest.js";
 import { OrderJobRun } from "../models/OrderJobRun.js";
 import { PlatformId } from "../models/PlatformId.js";
 import { COUPON_QUEUE, getCouponQueue, type CouponJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
 import { flipkartLoginUrl, sleep } from "./browser.js";
-import { openOrderApiSession } from "./orderApi.js";
+import { openOrderApiSession, OrderApiSessionError, romeCall } from "./orderApi.js";
 import {
   ABORTED_WHILE_RUNNING,
   assertValueLimit,
@@ -34,6 +34,7 @@ import {
   type LedgerModel,
 } from "./requestCommon.js";
 import { resolveLoggedInSession, type SessionLookup } from "./sessionStore.js";
+import { openRequestTasksQuietly, syncRequestTasksQuietly, taskLog } from "./syncTaskLog.js";
 
 /**
  * "Apply Company Coupons" — the reference's "Coupon apply" batch.
@@ -46,12 +47,17 @@ import { resolveLoggedInSession, type SessionLookup } from "./sessionStore.js";
  * what came back is recorded: each hop, the final URL, the HTTP status,
  * whether Flipkart bounced to login, the page title and its first words.
  *
- * A task that ends `success` therefore says "Link opened with the account's
- * session (HTTP 200)" and nothing more. Whether that request alone activates
- * a coupon — or the page needs a click, or makes an API call of its own — is
- * unverified until one real coupon link is tried on one account and the
- * account's coupons are looked at afterwards; the recorded hops and page text
- * of that first run are what will tell.
+ * WHAT CAN BE CHECKED (docs/company-coupons-discovery.md): an account's
+ * coupons are readable — GET <dc>.rome.api.flipkart.com/api/1/user/rewards →
+ * RESPONSE.liveOffers[] — and an activated coupon is one that got mapped to
+ * the account. So the runner reads liveOffers before the first link and again
+ * after the last, and records the difference on the task: "Activated — …"
+ * when a coupon is new or one the account had changed (its userOfferMeta),
+ * "No change seen — …" when the two reads are the same. Where either read
+ * failed nothing is claimed: the task keeps "Link opened with the account's
+ * session (HTTP 200)" and says why the comparison did not run. Whether a
+ * company link is activated by opening it at all is still to be seen on one
+ * real link — the comparison is what will tell.
  *
  *   createCouponRequest   links checked (https, a flipkart.com host), one task
  *                         per account — the emails given, or every logged-in
@@ -63,6 +69,8 @@ import { resolveLoggedInSession, type SessionLookup } from "./sessionStore.js";
  *                         as for the invoice batch (services/invoiceRequests.ts)
  *
  *   COMPANY_COUPONS_ENABLED=0   switches the trigger off (default: on)
+ *   COUPON_VERIFY=0             opens the links without reading the coupons before and after (default: on)
+ *   COUPON_VERIFY_PAUSE_MS=1500 wait between the last link and the second read
  *   COUPON_CONCURRENCY=4        accounts at once
  *   COUPON_LINK_PAUSE_MS=1500   pause between two links of one account
  */
@@ -85,6 +93,93 @@ const COUNTS_EVERY_MS = 2000;
 const OPEN = ["queued", "in_progress"] as const;
 
 export const LINK_OPENED = (status: number) => `Link opened with the account's session (HTTP ${status})`;
+
+// ── the account's coupons, before and after ─────────────────────────────────
+
+export const COUPON_VERIFY_ENABLED = !["0", "off", "false", "no"].includes(String(process.env.COUPON_VERIFY ?? "1").trim().toLowerCase());
+const VERIFY_PAUSE_MS = Math.max(0, Number(process.env.COUPON_VERIFY_PAUSE_MS ?? 1500));
+
+/** One live coupon, with what tells a change on it: its userOfferMeta as one stable string. */
+export interface OfferSnapshot extends ICouponOffer {
+  meta: string;
+}
+
+export type OffersRead = { ok: true; offers: Map<string, OfferSnapshot> } | { ok: false; status: number; sessionDead: boolean; reason: string };
+
+export interface CouponVerifyOptions {
+  /** Where the coupons are read, given the session's rome host — the checks point it at a local fake. */
+  rewardsUrl?: (romeHost: string) => string;
+  timeoutMs?: number;
+}
+
+/** The fields of userOfferMeta that move when a coupon is mapped or used, in a fixed order. */
+const OFFER_META_KEYS = ["mappedCount", "mappedTs", "redeemedTs", "remainingRedemption", "totalRedemption"];
+
+function offerMeta(meta: unknown): string {
+  const m = meta && typeof meta === "object" ? (meta as Record<string, unknown>) : {};
+  return OFFER_META_KEYS.filter((k) => m[k] !== undefined && m[k] !== null).map((k) => `${k}=${String(m[k])}`).join(" ");
+}
+
+/**
+ * The account's live coupons, as My Coupons loads them — one GET on the
+ * session's data-centre host (romeCall switches the prefix on "DC Change").
+ * Never throws: a failed read is an answer ("the comparison did not run").
+ * 401 is the one status that says the session itself is dead.
+ */
+export async function readLiveOffers(ctx: APIRequestContext, opts: CouponVerifyOptions = {}): Promise<OffersRead> {
+  const urlOf = opts.rewardsUrl || ((host: string) => `${host}/api/1/user/rewards`);
+  try {
+    const { res, text } = await romeCall(ctx, (host) => ctx.get(urlOf(host), { timeout: opts.timeoutMs ?? 30_000, failOnStatusCode: false, maxRedirects: 0 }));
+    const status = res.status();
+    if (status === 401) return { ok: false, status, sessionDead: true, reason: "the coupons API answered HTTP 401 — the session is not logged in" };
+    if (status !== 200) return { ok: false, status, sessionDead: false, reason: `the coupons API answered HTTP ${status}` };
+    let json: { RESPONSE?: { liveOffers?: unknown } } | null = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      /* not JSON */
+    }
+    const live = json?.RESPONSE?.liveOffers;
+    if (!Array.isArray(live)) return { ok: false, status, sessionDead: false, reason: "the coupons API answer carried no liveOffers" };
+    const offers = new Map<string, OfferSnapshot>();
+    for (const raw of live as Array<Record<string, unknown>>) {
+      const offerId = String(raw?.offerId || "").trim();
+      if (!offerId) continue;
+      const info = (raw.displayInfo && typeof raw.displayInfo === "object" ? raw.displayInfo : {}) as Record<string, unknown>;
+      offers.set(offerId, { offerId, title: String(info.OFFER_TITLE || "").replace(/\s+/g, " ").trim().slice(0, 160), endDate: String(raw.endDate || ""), meta: offerMeta(raw.userOfferMeta) });
+    }
+    return { ok: true, offers };
+  } catch (err) {
+    return { ok: false, status: 0, sessionDead: err instanceof OrderApiSessionError, reason: `the coupons API could not be read (${err instanceof Error ? err.message.split("\n")[0].slice(0, 120) : String(err)})` };
+  }
+}
+
+/** What is different between two reads of an account's coupons: the new ones, and the ones whose userOfferMeta changed. */
+export function compareOffers(before: Map<string, OfferSnapshot>, after: Map<string, OfferSnapshot>): ICouponVerification {
+  const pub = (o: OfferSnapshot): ICouponOffer => ({ offerId: o.offerId, title: o.title, endDate: o.endDate });
+  const newOffers: ICouponOffer[] = [];
+  const changedOffers: ICouponVerification["changedOffers"] = [];
+  for (const [id, now] of after) {
+    const was = before.get(id);
+    if (!was) newOffers.push(pub(now));
+    else if (was.meta !== now.meta) changedOffers.push({ ...pub(now), before: was.meta, after: now.meta });
+  }
+  return { ran: true, activated: newOffers.length + changedOffers.length > 0, reason: "", beforeCount: before.size, afterCount: after.size, newOffers: newOffers.slice(0, 50), changedOffers: changedOffers.slice(0, 50) };
+}
+
+const notCompared = (reason: string, beforeCount = 0): ICouponVerification => ({ ran: false, activated: false, reason, beforeCount, afterCount: 0, newOffers: [], changedOffers: [] });
+
+const offerLabel = (o: ICouponOffer) => `${o.title ? `"${o.title}" ` : ""}(${o.offerId})`;
+
+/** The task's note once the comparison has run — these words replace "Link opened…"; nothing else does. */
+export function verificationNote(v: ICouponVerification): string {
+  if (!v.ran) return "";
+  if (!v.activated) return `No change seen — the account's ${v.afterCount} coupon(s) are the same before and after`;
+  const parts: string[] = [];
+  if (v.newOffers.length) parts.push(`${v.newOffers.length} new coupon${v.newOffers.length === 1 ? "" : "s"}: ${v.newOffers.slice(0, 3).map(offerLabel).join(", ")}${v.newOffers.length > 3 ? ` and ${v.newOffers.length - 3} more` : ""}`);
+  if (v.changedOffers.length) parts.push(`${v.changedOffers.length} coupon${v.changedOffers.length === 1 ? "" : "s"} changed: ${v.changedOffers.slice(0, 3).map(offerLabel).join(", ")}${v.changedOffers.length > 3 ? ` and ${v.changedOffers.length - 3} more` : ""}`);
+  return `Activated — ${parts.join("; ")}`;
+}
 
 // ── links ───────────────────────────────────────────────────────────────────
 
@@ -227,7 +322,11 @@ export interface CouponAccount {
 }
 
 /** What the batch needs from outside. The worker and the API use `couponDefaults`; the checks swap parts of it. */
-export interface CouponDeps extends CouponOpenOptions {
+export interface CouponDeps extends CouponOpenOptions, CouponVerifyOptions {
+  /** Read the account's coupons before and after its links (COUPON_VERIFY). */
+  verify: boolean;
+  /** Wait between the last link and the second read: a mapping is not always there the same instant. */
+  verifyPauseMs: number;
   /** Every logged-in Flipkart Platform ID with a saved session, or those among `emails`. */
   listAccounts: (userId: string, emails?: string[]) => Promise<CouponAccount[]>;
   loadSession: (email: string) => Promise<SessionLookup>;
@@ -243,6 +342,8 @@ export interface CouponDeps extends CouponOpenOptions {
 }
 
 export const couponDefaults: CouponDeps = {
+  verify: COUPON_VERIFY_ENABLED,
+  verifyPauseMs: VERIFY_PAUSE_MS,
   listAccounts: async (userId, emails) => {
     const rows = await PlatformId.find({
       userId,
@@ -292,6 +393,18 @@ function publicCouponTask(r: CouponRequestRow, t: Partial<IOrderCouponTask> & { 
     error: t.error || "",
     error_code: t.errorClass || "",
     note: t.note || "",
+    // The account's coupons before and after its links: null = never compared.
+    verification: t.verification
+      ? {
+          ran: Boolean(t.verification.ran),
+          activated: Boolean(t.verification.activated),
+          reason: t.verification.reason || "",
+          before_count: t.verification.beforeCount || 0,
+          after_count: t.verification.afterCount || 0,
+          new_offers: (t.verification.newOffers || []).map((o) => ({ offer_id: o.offerId, title: o.title, end_date: o.endDate })),
+          changed_offers: (t.verification.changedOffers || []).map((o) => ({ offer_id: o.offerId, title: o.title, end_date: o.endDate, before: o.before, after: o.after })),
+        }
+      : null,
     results: (t.results || []).map((x) => ({
       link: x.link,
       outcome: x.outcome,
@@ -311,6 +424,7 @@ function publicCouponTask(r: CouponRequestRow, t: Partial<IOrderCouponTask> & { 
 /** The request in the reference's batch shape. */
 export function publicCouponRequest(r: CouponRequestRow) {
   const counts = { ...emptyCounts(0), ...(r.counts || {}) };
+  const verification = { activated: Number(r.verification?.activated) || 0, no_change: Number(r.verification?.no_change) || 0, not_checked: Number(r.verification?.not_checked) || 0 };
   return {
     request_id: String(r._id),
     platform: r.platform || "FLIPKART",
@@ -331,8 +445,13 @@ export function publicCouponRequest(r: CouponRequestRow) {
     can_cancel: r.status === "queued" || r.status === "in_progress",
     host: r.host || "",
     worker_host: r.workerHost || "",
-    /** Said on every answer: success here means the link opened, not that a coupon is known to be active. */
-    activation_verified: false,
+    /**
+     * How many accounts had their coupons compared before and after, and what that said. An account under
+     * `not_checked` (and every account of a request run before the comparison existed) only says "the link opened".
+     */
+    verification,
+    /** True once at least one account's coupons were compared — never a claim that every coupon is active. */
+    activation_verified: verification.activated + verification.no_change > 0,
   };
 }
 
@@ -379,13 +498,23 @@ async function syncCounts(requestId: string, deps: CouponDeps, opts: { final?: b
 
 // ── create / read / stop ────────────────────────────────────────────────────
 
-export async function createCouponRequest(userId: string, input: { links: unknown; emails?: unknown; by?: string; source?: string }, overrides: Partial<CouponDeps> = {}) {
+/**
+ * `retryOf` / `parentId` / `params` / `anyNumberOfEmails` are for Batch
+ * requests → Retry (services/syncActions.ts): a retry names the request it
+ * retries, and may carry more accounts than the 2000 a person may type — the
+ * failed accounts of an all-accounts request.
+ */
+export async function createCouponRequest(
+  userId: string,
+  input: { links: unknown; emails?: unknown; by?: string; source?: string; retryOf?: string; parentId?: string; params?: Record<string, unknown>; anyNumberOfEmails?: boolean },
+  overrides: Partial<CouponDeps> = {}
+) {
   const deps = { ...couponDefaults, ...overrides };
   if (!COMPANY_COUPONS_ENABLED) throw new RequestInputError("Company Coupons is switched off on this server (COMPANY_COUPONS_ENABLED=0)", 503, "coupons_disabled");
   const links = parseCouponLinks(input.links);
   assertCouponLinks(links);
   const emails = distinct(splitValues(input.emails).map((e) => e.toLowerCase()));
-  assertValueLimit("Email addresses", emails);
+  if (!input.anyNumberOfEmails) assertValueLimit("Email addresses", emails);
   const selection = emails.length ? ("email_ids" as const) : ("all_accounts" as const);
 
   const accounts = await deps.listAccounts(userId, emails.length ? emails : undefined);
@@ -403,20 +532,24 @@ export async function createCouponRequest(userId: string, input: { links: unknow
     status: accounts.length ? "queued" : "completed",
     message: accounts.length ? "" : "None of these accounts is logged in",
     links,
-    params: { coupon_links_count: links.length, email_ids_count: emails.length, selection_method: selection, accounts_count: accounts.length },
+    params: { coupon_links_count: links.length, email_ids_count: emails.length, selection_method: selection, accounts_count: accounts.length, ...(input.params || {}) },
     counts: countsOf([...accounts.map(() => "queued" as const), ...refused.map(() => "failed" as const)]),
+    retryOf: String(input.retryOf || ""),
+    parentId: String(input.parentId || input.retryOf || ""),
     queue: deps.queueName,
     systemId: config.systemId,
     host: hostName(),
     finishedAt: accounts.length ? null : now,
   });
   const requestId = String(request._id);
-  const base = { requestId: request._id, userId: request.userId, note: "", results: [], startedAt: null };
+  const base = { requestId: request._id, userId: request.userId, note: "", results: [], verification: null, startedAt: null };
   const tasks = [
     ...accounts.map((a) => ({ ...base, email: a.email, accountId: a.accountId, status: "queued" as const, errorClass: "", error: "", finishedAt: null })),
     ...refused.map((email) => ({ ...base, email, accountId: "", status: "failed" as const, errorClass: "not_logged_in", error: ERROR_CLASSES.not_logged_in, finishedAt: now })),
   ];
   for (let i = 0; i < tasks.length; i += 1000) await OrderCouponTask.insertMany(tasks.slice(i, i + 1000), { ordered: false });
+  // The task log: a row per account, written before a job can take one (services/syncTaskLog.ts).
+  await openRequestTasksQuietly("coupons", request.toObject(), { couponTasks: tasks });
 
   await openRequestRun(
     { userId, type: "coupons", refId: requestId, trigger: "user", by: String(input.by || "").trim(), total: tasks.length, message: `Coupon apply · ${accounts.length} account(s) waiting for the worker`, meta: { request: "company_coupon_apply", platform: "FLIPKART", params: request.params, queue: deps.queueName, activation_verified: false } },
@@ -435,6 +568,7 @@ export async function createCouponRequest(userId: string, input: { links: unknow
       const reason = `Could not queue the request: ${err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : String(err)}`;
       await endOpenTasks(request._id, { status: "failed", errorClass: "internal_error", error: ERROR_CLASSES.internal_error }, reason);
       await syncCounts(requestId, deps, { final: true });
+      await syncRequestTasksQuietly("coupons", requestId);
       throw new RequestInputError(reason, 503, "queue_unavailable");
     }
   }
@@ -508,6 +642,7 @@ export async function stopCouponRequest(userId: string, requestId: string, by = 
         removed += gone.filter(Boolean).length;
       }
       await syncCounts(requestId, deps, { final: true });
+      await syncRequestTasksQuietly("coupons", requestId);
       console.log(`[coupons] request ${requestId} stopped by ${by || "a user"} — ${removed} account job(s) removed from the queue`);
     }
   }
@@ -526,6 +661,8 @@ async function settleCouponRequest(requestId: string, deps: CouponDeps) {
   }
   const res = await OrderCouponRequest.updateOne({ _id: id, status: { $in: [...OPEN] } }, { $set: { status: "completed", finishedAt: new Date() } });
   await syncCounts(requestId, deps, { final: true });
+  // The request has ended: its task rows are brought in line with it once, whole (the accounts were marked as they went).
+  if (res.modifiedCount) await syncRequestTasksQuietly("coupons", requestId);
   if (res.modifiedCount) {
     const row = await OrderCouponRequest.findById(id).select("counts").lean();
     console.log(`[coupons] request ${requestId} finished: ${row?.counts.success ?? 0} account(s) opened every link, ${row?.counts.failed ?? 0} failed`);
@@ -545,7 +682,8 @@ export async function runCouponJob(job: Job<CouponJobData>, token: string | unde
   // The same lock checkout, cancel, update and the order sync take: one piece of work per account at a time.
   // Held only as long as these links can take (a minute, plus 45 s a link), not the lock's usual 15 minutes:
   // a worker that dies holding it must not keep the account from checkout that long.
-  const lockMs = Math.min(15 * 60 * 1000, 60_000 + request.links.length * 45_000);
+  // The two reads of the account's coupons (before and after) are a minute more at the very worst.
+  const lockMs = Math.min(15 * 60 * 1000, 60_000 + request.links.length * 45_000 + (deps.verify ? 60_000 : 0));
   const unlock = await deps.lock(email, `coupon:${requestId}:${config.workerId}`, lockMs);
   if (!unlock) {
     await job.moveToDelayed(Date.now() + deps.lockRetryMs, token);
@@ -554,16 +692,23 @@ export async function runCouponJob(job: Job<CouponJobData>, token: string | unde
   let ctx: APIRequestContext | null = null;
   try {
     // "in_progress" is also taken: a task left that way belongs to a run of this job that died.
-    const claimed = await OrderCouponTask.findOneAndUpdate({ requestId: id, email, status: { $in: [...OPEN] } }, { $set: { status: "in_progress", startedAt: new Date(), results: [], error: "", errorClass: "", note: "" } }, { new: true })
+    const claimed = await OrderCouponTask.findOneAndUpdate({ requestId: id, email, status: { $in: [...OPEN] } }, { $set: { status: "in_progress", startedAt: new Date(), results: [], verification: null, error: "", errorClass: "", note: "" } }, { new: true })
       .select("_id")
       .lean();
     if (!claimed) return; // cancelled, or ended by someone else
+    taskLog.mark(requestId, email, { status: "in_progress" });
     const started = new Date();
     await OrderCouponRequest.updateOne({ _id: id, status: "queued" }, { $set: { status: "in_progress", startedAt: started, workerHost: hostName() } });
     await syncCounts(requestId, deps, { throttle: true });
 
-    const end = async (patch: { status: "success" | "failed"; errorClass: string; error: string; note: string }, results: ICouponLinkResult[]) => {
-      await OrderCouponTask.updateOne({ _id: claimed._id, status: "in_progress" }, { $set: { ...patch, results, finishedAt: new Date() } });
+    const end = async (patch: { status: "success" | "failed"; errorClass: string; error: string; note: string }, results: ICouponLinkResult[], verification: ICouponVerification | null = null) => {
+      const res = await OrderCouponTask.updateOne({ _id: claimed._id, status: "in_progress" }, { $set: { ...patch, results, verification, finishedAt: new Date() } });
+      // The request's tally of what the comparisons said — once per task that really ended here.
+      if (verification && res.modifiedCount) {
+        const key = !verification.ran ? "not_checked" : verification.activated ? "activated" : "no_change";
+        await OrderCouponRequest.updateOne({ _id: id }, { $inc: { [`verification.${key}`]: 1 } }).catch(() => undefined);
+      }
+      taskLog.mark(requestId, email, patch.status === "success" ? { status: "success", detail: patch.note } : { status: "failed", errorCode: patch.errorClass, error: patch.error, detail: patch.note });
     };
 
     const session = await deps.loadSession(email);
@@ -575,6 +720,14 @@ export async function runCouponJob(job: Job<CouponJobData>, token: string | unde
       ctx = await deps.openContext(session.cookies);
     } catch (err) {
       await end({ status: "failed", errorClass: "not_logged_in", error: ERROR_CLASSES.not_logged_in, note: err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : String(err) }, []);
+      return;
+    }
+
+    // The account's coupons as they are now. A read that fails only means nothing will be claimed afterwards —
+    // except 401, which is the session itself: the links would only be sent to login, so they are not opened.
+    const before = deps.verify ? await readLiveOffers(ctx, deps) : null;
+    if (before && !before.ok && before.sessionDead) {
+      await end({ status: "failed", errorClass: "not_logged_in", error: ERROR_CLASSES.not_logged_in, note: before.reason }, []);
       return;
     }
 
@@ -593,7 +746,20 @@ export async function runCouponJob(job: Job<CouponJobData>, token: string | unde
       if (result.errorClass === "rate_limited") await sleep(5000);
       if (n < request.links.length - 1 && deps.linkPauseMs) await sleep(deps.linkPauseMs);
     }
-    await end(couponTaskOutcome(results), results);
+    const outcome = couponTaskOutcome(results);
+    // Compared only when a link was opened: with none there is nothing a change could be put down to.
+    let verification: ICouponVerification | null = null;
+    if (before && results.some((r) => r.outcome === "opened")) {
+      if (!before.ok) verification = notCompared(`before the links: ${before.reason}`);
+      else {
+        if (deps.verifyPauseMs) await sleep(deps.verifyPauseMs);
+        const after = await readLiveOffers(ctx, deps);
+        verification = after.ok ? compareOffers(before.offers, after.offers) : notCompared(`after the links: ${after.reason}`, before.offers.size);
+      }
+    }
+    const verified = verification ? verificationNote(verification) : "";
+    // The comparison's words take the place of "Link opened…" on a task whose links all opened; a task that failed keeps its reason.
+    await end(verified && outcome.status === "success" ? { ...outcome, note: verified } : outcome, results, verification);
   } finally {
     await ctx?.dispose().catch(() => undefined);
     await unlock();
@@ -668,6 +834,7 @@ export async function failUnclaimedCouponRequests(opts: { pickupMs?: number; que
         await Promise.all(emails.slice(i, i + 50).map(async (email) => (await queue.getJob(jobIdOf(requestId, email)).catch(() => null))?.remove().catch(() => undefined)));
       }
       await syncCounts(requestId, deps, { final: true, parked: WORKER_NOT_PICKED_UP });
+      await syncRequestTasksQuietly("coupons", requestId);
       out.failed++;
       console.warn(`[coupons] request ${requestId} failed: ${WORKER_NOT_PICKED_UP}`);
     } else {

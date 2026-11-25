@@ -76,13 +76,23 @@ export interface IInvoiceTask {
 export interface IOrderInvoiceRequest {
   userId: Types.ObjectId;
   platform: string;
-  /** "user" for the button; the nightly and delivered-check sources of the reference are kept for step 5. */
+  /**
+   * "user" for the button. The reference's others: "system-update" (queued when
+   * an update saw units arrive at Delivered), "system-cron" (one run of the
+   * 3-hourly sweep, recorded as a request by services/invoiceSweep.ts) and
+   * "system-retry" (Batch requests → Retry).
+   */
   source: string;
   createdBy: string;
   status: RequestStatus;
   /** A request-level sentence: who stopped it, or why nobody ran it. */
   message: string;
-  params: { order_ids_count: number; force: boolean };
+  /**
+   * What was asked. Beside the two the button sends: `follows` ("update" |
+   * "retry"), `retry_of` + `retry_statuses` (+ `error_code`) on a retry, and on
+   * a sweep run `sweep: true`, `capture_count`, `recapture_count`, `cap_per_phase`.
+   */
+  params: { order_ids_count: number; force: boolean } & Record<string, unknown>;
   tasks: IInvoiceTask[];
   counts: RequestCounts;
   /** Set when this request retries another one / follows another one (step 5). */
@@ -126,7 +136,8 @@ const OrderInvoiceRequestSchema = new Schema<IOrderInvoiceRequest>(
     createdBy: { type: String, default: "" },
     status: { type: String, enum: REQUEST_STATUSES, default: "queued" },
     message: { type: String, default: "" },
-    params: { type: new Schema({ order_ids_count: { type: Number, default: 0 }, force: { type: Boolean, default: false } }, { _id: false }), default: () => ({}) },
+    // Mixed since step 5: a retry and a sweep run record more than the button's two keys.
+    params: { type: Schema.Types.Mixed, default: () => ({ order_ids_count: 0, force: false }) },
     tasks: { type: [TaskSchema], default: [] },
     counts: { type: RequestCountsSchema, default: () => ({}) },
     retryOf: { type: String, default: "" },

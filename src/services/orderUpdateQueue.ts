@@ -8,18 +8,18 @@ import { OrderSyncSettings } from "../models/OrderSyncSettings.js";
 import { demoteCircuitFor, forgetDemoteCircuit, markSessionEligibleForRelogin, SessionDeadError } from "./sessionEligibility.js";
 import { OrderUpdateRequest, type IOrderUpdateRequest, type IUpdateAccount, type IUpdateSchedule, type UpdateSource } from "../models/OrderUpdateRequest.js";
 import { isScheduleName, SCHEDULE_LABELS, type ScheduleName } from "../models/ScheduleLease.js";
-import { getUpdateQueue, type UpdateJobData } from "../queue.js";
+import { getUpdateQueue, UPDATE_QUEUE, type UpdateJobData } from "../queue.js";
 import { lockAccount } from "./accountLock.js";
 import { blockFlipkartLogout, closeBrowser, confirmLoginLanding, flipkartLoginUrl, launchStealthContext, restoreFlipkartSession, sleep } from "./browser.js";
 import { openOrderApiSession, OrderApiSessionError } from "./orderApi.js";
-import { apiScrapeAndSave, scrapeAndSave, sessionExpiredMessage, type OrderAccount } from "./orderFetch.js";
+import { apiScrapeAndSave, orderDetailsUrl, scrapeAndSave, sessionExpiredMessage, type OrderAccount } from "./orderFetch.js";
 import { resolveOrderFetchMode } from "./orderSyncSettings.js";
 import { DEFAULT_UPDATE_STATUSES, stageOf } from "./orderLifecycle.js";
 import { resolveTargets, type UpdateTriggerInput } from "./orderUpdate.js";
-import { recordUnitChanges, snapshotUnit } from "./orderUnitEvents.js";
+import { recordUnitChanges, snapshotUnit, updateSourceLabel, type RecordOptions } from "./orderUnitEvents.js";
 import { NO_SAVED_COOKIES, resolveLoggedInSession } from "./sessionStore.js";
 import { noteDeliveredOrder, queueInvoicesAfterUpdate } from "./requestChains.js";
-import { noteLateDocumentsAfterRead } from "./invoiceRefetch.js";
+import { noteLateDocuments } from "./invoiceRefetch.js";
 import { clockStamp, clockTime, releaseLease, renewLease, slotStamp, supersededBy, supersededText, type ScheduleClaim, type ScheduleRunner, type ScheduleRunResult } from "./scheduleClock.js";
 import { retireLegacySchedulers } from "./scheduleSettings.js";
 // startRequests makes its requests through this module; both sides only call each other inside functions.
@@ -586,6 +586,73 @@ const updateJobDefaults: UpdateJobDeps = {
   clockLook: async () => undefined,
 };
 
+// ── missing sibling units (data-quality U8, C10) ───────────────────────────────
+
+/** The orders whose siblings one update job has looked at already: each order once per job. */
+export type SiblingMemo = Set<string>;
+
+export interface SiblingResult {
+  /** Units of the order that order_details did not hold. */
+  missing: number;
+  saved: number;
+  failed: number;
+}
+
+/**
+ * After an update read a unit over the API: the order's other units (`siblingIds`, the order view's own list —
+ * apiScrapeAndSave's `siblingUnitIds`) that order_details does not hold yet are read and saved, like fetch and order
+ * sync already do. 67 orders were stored partly (278 units) because the update path saved only the unit it was
+ * given. Once per order per job (`memo`); the units this request names for the account are left out (`skip`: the job
+ * reads them itself); one Order.find per order. A sibling's failure is logged and counted, never thrown: the unit
+ * that was read stays read. No recursion — the order view already lists every unit.
+ */
+export async function saveMissingSiblings(
+  api: APIRequestContext,
+  userId: string,
+  acct: OrderAccount,
+  card: { orderId: string; unitId: string },
+  siblingIds: string[],
+  memo: SiblingMemo,
+  opts: { skip?: Set<string>; read?: typeof apiScrapeAndSave; log?: (msg: string) => unknown } = {}
+): Promise<SiblingResult> {
+  const out: SiblingResult = { missing: 0, saved: 0, failed: 0 };
+  const orderId = String(card.orderId || "").toUpperCase();
+  if (!orderId || memo.has(orderId)) return out;
+  memo.add(orderId);
+  const wanted = [...new Set((siblingIds || []).map(String).filter(Boolean))].filter((id) => id !== card.unitId && !opts.skip?.has(id));
+  if (!wanted.length) return out;
+  const say = async (msg: string) => {
+    try {
+      await opts.log?.(msg);
+    } catch {
+      /* a log line never fails the unit */
+    }
+  };
+  let stored: Set<string>;
+  try {
+    stored = new Set((await Order.find({ userId, unit_id: { $in: wanted } }).select("unit_id").lean()).map((r) => String(r.unit_id)));
+  } catch (err) {
+    await say(`${orderId}: sibling units not looked up (${err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : err})`);
+    return out;
+  }
+  const read = opts.read || apiScrapeAndSave;
+  for (const unitId of wanted) {
+    if (stored.has(unitId)) continue;
+    out.missing++;
+    const itemId = unitId.replace(/000$/, "");
+    try {
+      const res = await read(api, userId, acct, { orderId, itemId, unitId, orderUrl: orderDetailsUrl(orderId, itemId, unitId), amount: "" }, { applyCalendar: false });
+      if (res?.skippedOld) out.failed++;
+      else out.saved++;
+    } catch (err) {
+      if (isDestroyedContext(err)) throw err;
+      out.failed++;
+      await say(`${orderId}/${unitId}: sibling unit not saved (${err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : err})`);
+    }
+  }
+  return out;
+}
+
 /**
  * One account of an update request.
  *
@@ -646,6 +713,13 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
   }
   const userId = String(request.userId);
   const log = (level: "info" | "warn" | "error", msg: string) => pushLog(requestId, level, `${me}: ${msg}`);
+  // Where this request's unit events come from (T10), and whether it is quiet — the forced refresh (U10): its events
+  // are written already processed (no alert) and it notes no late re-download.
+  const eventOpts = eventOptionsFor(request);
+  // Missing sibling units of the orders this account reads (U8): each order looked at once in this job.
+  const siblingMemo: SiblingMemo = new Set<string>();
+  const ownUnits = new Set(account.units.map((x) => x.unitId));
+  let siblingsSaved = 0;
   let launched: { browser: Browser; context: BrowserContext } | null = null;
   let chromeHeld = false; // true once this account has taken a slot from the Chrome gate
   // How this account ended, for the task log: the units it never got to end the same way.
@@ -794,10 +868,16 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
           // Stage changes (not a vocabulary swap between the API's "Approved" and the page's
           // "Order Confirmed"), new OTPs and address changes become order_unit_events rows
           // — the dashboard's alerts read those.
-          const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
+          const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId, eventOpts);
           if (changes.stageChanged && stageOf(after?.status_key) === "delivered") await noteDeliveredOrder(requestId, u.orderId);
-          // Late credit notes (data-quality SO-5): an invoiced unit that ended or was refunded → a re-download is noted on its bundle. Never fails the unit.
-          await noteLateDocumentsAfterRead(userId, u.unitId, { before: before?.status_key ?? null, after: after?.status_key }, `update ${requestId}`);
+          // Late credit notes (data-quality SO-5 / X6): the moments recordUnitChanges detected → a re-download noted on the bundle. Never fails the unit.
+          await noteLateDocuments(userId, { orderId: u.orderId, unitId: u.unitId }, changes.lateDocuments, `update ${requestId}`);
+          // The order's units this request does not name and order_details does not hold (U8): saved once per order. Never fails the unit.
+          if (api && !usedPage) {
+            const sib = await saveMissingSiblings(api, userId, acct, { orderId: u.orderId, unitId: u.unitId }, (result as { siblingUnitIds?: string[] }).siblingUnitIds || [], siblingMemo, { skip: ownUnits, read: deps.apiRead, log: (msg) => log("warn", msg) });
+            siblingsSaved += sib.saved;
+            if (sib.saved) await log("info", `${u.orderId}: ${sib.saved} sibling unit(s) saved${sib.failed ? `, ${sib.failed} failed` : ""}`);
+          }
           await bumpAccount(requestId, me, { done: 1, ...(changes.stageChanged ? { statusChanged: 1 } : {}), ...(changes.otpNew ? { otpNew: 1 } : {}) });
           read += 1;
           taskLog.mark(requestId, taskKey, { status: "success" });
@@ -868,9 +948,9 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
             const before = await snapshotUnit(userId, u.unitId);
             await deps.pageRead(await openPage(), userId, acct, card, { applyCalendar: false });
             const after = await snapshotUnit(userId, u.unitId);
-            const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId);
+            const changes = await recordUnitChanges(userId, u.unitId, before, after, requestId, eventOpts);
             if (changes.stageChanged && stageOf(after?.status_key) === "delivered") await noteDeliveredOrder(requestId, u.orderId);
-            await noteLateDocumentsAfterRead(userId, u.unitId, { before: before?.status_key ?? null, after: after?.status_key }, `update ${requestId}`);
+            await noteLateDocuments(userId, { orderId: u.orderId, unitId: u.unitId }, changes.lateDocuments, `update ${requestId}`);
             if (changes.otpNew || changes.stageChanged) {
               await bumpAccount(requestId, me, { ...(changes.stageChanged ? { statusChanged: 1 } : {}), ...(changes.otpNew ? { otpNew: 1 } : {}) });
             }
@@ -903,7 +983,7 @@ export async function runOrderUpdateJob(job: Job<UpdateJobData>, token: string |
         status: "done",
         via,
         finishedAt: new Date(),
-        message: `${final?.done ?? 0} refreshed${final?.failed ? `, ${final.failed} failed` : ""}${final?.statusChanged ? `, ${final.statusChanged} status changed` : ""}${final?.otpNew ? `, ${final.otpNew} new OTP` : ""} · ${via}`,
+        message: `${final?.done ?? 0} refreshed${final?.failed ? `, ${final.failed} failed` : ""}${final?.statusChanged ? `, ${final.statusChanged} status changed` : ""}${final?.otpNew ? `, ${final.otpNew} new OTP` : ""}${siblingsSaved ? ` +${siblingsSaved} sibling unit(s) saved` : ""} · ${via}`,
       });
     } finally {
       await api?.dispose().catch(() => undefined);
@@ -977,7 +1057,8 @@ export async function runUpdateSweep(kind: "active" | "ofd", claim: ScheduleClai
   const withLeft = (text: string) => [text, ...left].join(" · ");
   try {
     const keys = kind === "ofd" ? await ofdStatusKeys(userId) : [];
-    const input: UpdateTriggerInput = kind === "ofd" ? { orderStatus: keys, selectionMethod: "schedule_ofd" } : { selectionMethod: "schedule_active" };
+    // The active sweep also re-reads the cancelled units of the refund watch (orderLifecycle.ts refundWatchFilter, U12 + X5).
+    const input: UpdateTriggerInput = kind === "ofd" ? { orderStatus: keys, selectionMethod: "schedule_ofd" } : { selectionMethod: "schedule_active", withRefundWatch: true };
     const req = await createUpdateRequest(userId, input, {
       source,
       by: "schedule",
@@ -992,6 +1073,8 @@ export async function runUpdateSweep(kind: "active" | "ofd", claim: ScheduleClai
         email_ids_count: 0,
         order_ids_count: 0,
         order_email_pairs_count: 0,
+        // The refund watch rode along (active sweep only): its cancelled units are in this request too.
+        ...(kind === "active" ? { refund_watch: true } : {}),
         // Which schedule, which fixed time (India time) and which machine: Batch requests shows them as "Schedule".
         schedule_name: name,
         schedule_slot: slotStamp(claim.slotAt),
@@ -1100,8 +1183,59 @@ export async function reapStuckUpdates(): Promise<number> {
   }
 }
 
+/**
+ * The options every recordUnitChanges call of one request passes (both the API and the page path): quiet when the
+ * request says `params.quiet_events === true` (U10, the forced refresh), and its source and label (T10). Pure.
+ */
+export function eventOptionsFor(request: { source?: string | null; params?: unknown }): RecordOptions {
+  const params = (request.params || {}) as Record<string, unknown>;
+  return { quiet: params.quiet_events === true, requestSource: String(request.source || ""), sourceLabel: updateSourceLabel(request.source, params) };
+}
+
+// ── what this update worker's code honours (a Redis stamp beside the heartbeat) ──────────────────────────────────
+
+/**
+ * The request params this worker's code honours that an older worker would ignore. The forced refresh (U15) refuses
+ * to send a quiet request to a worker without `quiet_events`: an older worker would write its events unprocessed and
+ * the dashboard would raise the very address alerts quiet mode exists to prevent.
+ */
+export const UPDATE_WORKER_CAPABILITIES = ["quiet_events"] as const;
+const CAPS_EVERY_MS = 20_000;
+const CAPS_TTL_MS = 75_000;
+
+/** The Redis key the update worker stamps its capabilities on (this system's Redis, like the heartbeat). */
+export function updateCapabilitiesKey(queueName: string): string {
+  return `tradeflow:worker-caps:${queueName}`;
+}
+
+/** A stamp's value → its capability list (pure; an absent or unreadable stamp has none). */
+export function capabilitiesOf(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const caps = (JSON.parse(raw) as { caps?: unknown }).caps;
+    return Array.isArray(caps) ? caps.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Worker side (update role only, started with the reaper): stamp the capabilities until the process ends. */
+export function startUpdateCapabilityStamp(queueName: string): NodeJS.Timeout {
+  const stamp = () =>
+    void import("../lib/redis.js")
+      .then(({ getRedis }) =>
+        getRedis().set(updateCapabilitiesKey(queueName), JSON.stringify({ caps: UPDATE_WORKER_CAPABILITIES, pid: process.pid, at: new Date().toISOString() }), "PX", CAPS_TTL_MS)
+      )
+      .catch(() => undefined);
+  stamp();
+  const t = setInterval(stamp, CAPS_EVERY_MS);
+  t.unref();
+  return t;
+}
+
 /** Start the periodic update reaper (worker, update role only). Returns the timer. */
 export function startUpdateReaper() {
+  startUpdateCapabilityStamp(UPDATE_QUEUE);
   const t = setInterval(() => {
     void reapStuckUpdates().catch((e) => console.error("[update-reaper]", e instanceof Error ? e.message : e));
   }, UPDATE_REAP_EVERY_MS);

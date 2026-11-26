@@ -18,10 +18,28 @@
  *     this machine's is. On THROWAWAY collections with the real schemas (verify_us_<run>_…), dropped at the end: an
  *     open request in the real collections would be re-enqueued by a running worker on older code.
  *
+ * Sub-step 10 (saving, events and watches), on the same invented workspace:
+ *   · U6 Created By: invented tradeflowbatches / tradeflowjobs rows (createdBy "tester", a dry_run job) → cardFieldsFor
+ *     gives created_by, a save writes it; a batch without a creator writes none; the x-requested-by header's reading
+ *   · U7 the OTP event table (null → 111111, 111111 → 222222, 111111 → 111111)
+ *   · U8 siblings: a stubbed APIRequestContext serving a saved 7-unit answer (debug/order-traces; the addresses and
+ *     the customer's details replaced with invented ones, each unit's business / GST block and refund card removed,
+ *     the seller block removed, the order, unit and item ids invented — Flipkart's own timeline sentences are kept) —
+ *     an account holding 1 stored unit gets the other 6; a second call stores none; a sibling that fails is counted,
+ *     never thrown
+ *   · U9 the skipped-row cases through discoverUnit (order_index rows of the invented workspace) and the fetch invariant
+ *   · U10 quiet events: inserted processed (after.backfill), and after the dashboard's minute poll (the dashboard API
+ *     must be running — a control event of the invented workspace proves it drained) no alert exists for them;
+ *     Processed → Completed gives one refund_completed event; the event's source / request kind (T10)
+ *   · U12 + X5 the refund-watch selection table through resolveTargets (an invented logged_in platformids row with a
+ *     made-up cookie; never read here)
+ *
  * The sequence counter and the checkout-job lookup are replaced in this process only, so no real counter moves and no
- * checkout job is read or written.
+ * real checkout job is read or written (the Created By case reads its own invented rows).
  *
  *   npm run test:unit-save          UNIT_SAVE_TRACE_DIR=<dir> reads the traces from another checkout
+ *                                   UNIT_SAVE_NO_DASHBOARD=1 skips the 90-s wait for the dashboard (the quiet case
+ *                                   then reports SKIPPED and the run fails)
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -49,6 +67,61 @@ async function check(name: string, fn: () => void | Promise<void>) {
 
 const minutesAgo = (n: number) => new Date(Date.now() - n * 60_000);
 
+/**
+ * A saved 7-unit order answer (debug/order-traces), scrubbed: the addresses and the customer's details replaced with
+ * invented ones, every unit's business / GST block and refund card removed, the seller block removed. The caller swaps
+ * the order, unit and item ids for invented ones. Flipkart's timeline sentences stay (no personal field in them is read). Without a trace: an invented 7-unit answer in the same shape.
+ */
+function findSevenUnitAnswer(traceDir: string): { raw: unknown; orderId: string; unitIds: string[]; itemIds: string[]; source: string } {
+  type View = { orderMetaData?: { orderId?: string }; units?: Record<string, Record<string, unknown>>; addresses?: unknown; customerInfo?: unknown };
+  const viewOf = (raw: unknown): View | null => {
+    const slots = (raw as { RESPONSE?: { slots?: Array<{ widget?: { type?: string; data?: { ssResponse?: { orderView?: View } } } }> } })?.RESPONSE?.slots || [];
+    return slots.find((x) => x.widget?.type === "DUMMY_CARD_WIDGET")?.widget?.data?.ssResponse?.orderView || null;
+  };
+  const scrub = (raw: unknown) => {
+    const copy = JSON.parse(JSON.stringify(raw));
+    const v = viewOf(copy)!;
+    const invented = { name: "Verify Unit", phoneNumber: "0000000000", pinCode: "000000", city: "Nowhere", state: "Nowhere", addressLine1: "1 Verify Street", addressLine2: "" };
+    v.addresses = { SHIPPING: invented, BILLING: invented };
+    v.customerInfo = { businessName: "", gstNumber: "", phoneNumber: "0000000000", emailId: "unit-save@verify.invalid" };
+    delete (v as Record<string, unknown>).sellerDataBag;
+    for (const u of Object.values(v.units || {})) {
+      const meta = (u.metaData || {}) as Record<string, unknown>;
+      meta.b2BInfo = null;
+      u.metaData = meta;
+      delete u.actionInfoDataBag;
+    }
+    // Only the order view goes on (the other slots are not read by the mapper).
+    return { RESPONSE: { slots: [{ widget: { type: "DUMMY_CARD_WIDGET", data: { ssResponse: { orderView: v } } } }] } };
+  };
+  if (fs.existsSync(traceDir)) {
+    const when = (d: string) => d.replace(/^[a-z]+-/, "");
+    for (const r of fs.readdirSync(traceDir).filter((d) => /^(fetch|update)-/.test(d)).sort((a, b) => when(b).localeCompare(when(a)))) {
+      for (const f of fs.readdirSync(path.join(traceDir, r)).filter((x) => x.startsWith("unit-") && x.endsWith(".json")).sort()) {
+        let rec: { mode?: string; raw?: unknown };
+        try {
+          rec = JSON.parse(fs.readFileSync(path.join(traceDir, r, f), "utf8"));
+        } catch {
+          continue;
+        }
+        if (rec.mode !== "api" || !rec.raw) continue;
+        const v = viewOf(rec.raw);
+        const unitIds = Object.keys(v?.units || {});
+        if (unitIds.length !== 7 || !v?.orderMetaData?.orderId) continue;
+        const itemIds = [...new Set(Object.values(v.units || {}).map((x) => String(((x.metaData || {}) as Record<string, unknown>).itemId || "")).filter((x) => x.length >= 8))].sort((a, b) => b.length - a.length);
+        return { raw: scrub(rec.raw), orderId: String(v.orderMetaData.orderId), unitIds: unitIds.sort((a, b) => b.length - a.length), itemIds, source: `the trace ${r}` };
+      }
+    }
+  }
+  const orderId = "OD000000000000000000";
+  const unitIds = Array.from({ length: 7 }, (_, i) => `ITEMVERIFY0000${i}000`);
+  const units = Object.fromEntries(
+    unitIds.map((u) => [u, { metaData: { unitId: u, itemId: u.replace(/000$/, ""), title: "Verify Phone 5G", fsn: "VERIFYFSN0000001", quantity: 1, status: { key: "Delivered", text: "Delivered" } }, moneyDataBag: { amount: 12999 } }])
+  );
+  const view = { orderMetaData: { orderId, orderDate: Date.now() - 5 * 86_400_000 }, units, productDataBag: { VERIFYFSN0000001: { productBasicData: { title: "Verify Phone 5G", subTitle: "8 GB RAM" } } } };
+  return { raw: scrub({ RESPONSE: { slots: [{ widget: { type: "DUMMY_CARD_WIDGET", data: { ssResponse: { orderView: view } } } }] } }), orderId, unitIds, itemIds: [] as string[], source: "an invented answer (no trace found)" };
+}
+
 async function main() {
   // A workspace that does not exist: set before config is read, so nothing here can act as the real one.
   const workspace = new Types.ObjectId();
@@ -59,15 +132,21 @@ async function main() {
   const { OrderUnitEvent } = await import("../models/OrderUnitEvent.js");
   const { Counter } = await import("../models/Counter.js");
   const { CheckoutJob } = await import("../models/CheckoutJob.js");
+  const { CheckoutBatch } = await import("../models/CheckoutBatch.js");
+  const { PlatformId } = await import("../models/PlatformId.js");
   const { OrderUpdateRequest } = await import("../models/OrderUpdateRequest.js");
   const { CancelRequest } = await import("../models/CancelRequest.js");
   const { RescheduleRequest } = await import("../models/RescheduleRequest.js");
-  const { KEEP_WHEN_BLANK, UNIT_INSERT_DEFAULTS, saveMappedUnit, scrapeAndSave, unitSetFor } = await import("../services/orderFetch.js");
+  const { KEEP_WHEN_BLANK, UNIT_INSERT_DEFAULTS, saveMappedUnit, scrapeAndSave, unitSetFor, requeueSkippedOld, setFetchWindowForChecks, discoverUnitForChecks, checkFetchInvariantForChecks } = await import("../services/orderFetch.js");
   const { addressHash, mapApiUnitToOrder, orderViewFromPageFetch } = await import("../services/orderApi.js");
-  const { reapCandidatesFilter } = await import("../services/orderUpdateQueue.js");
+  const { reapCandidatesFilter, saveMissingSiblings, eventOptionsFor, capabilitiesOf, updateCapabilitiesKey, UPDATE_WORKER_CAPABILITIES } = await import("../services/orderUpdateQueue.js");
+  const { resolveTargets } = await import("../services/orderUpdate.js");
+  const { refundWatchFilter } = await import("../services/orderLifecycle.js");
+  const { cardFieldsFor, forgetBatchCreators } = await import("../services/orderLinks.js");
+  const { requestedByHeader } = await import("../routes/jobs.js");
   const { cancelReapCandidatesFilter } = await import("../services/orderCancel.js");
   const { rescheduleReapCandidatesFilter } = await import("../services/orderReschedule.js");
-  const { recordUnitChanges } = await import("../services/orderUnitEvents.js");
+  const { recordUnitChanges, snapshotUnit, updateSourceLabel } = await import("../services/orderUnitEvents.js");
   const { COMPARED_FIELDS, diffAgainstScraper } = await import("../services/orderApiTest.js");
   assert.equal(config.userId, String(workspace), "the made-up TRADE_FLOW_USER_ID is the one in use");
   // The other machine of the reaper case: "Mac-2", or "Mac" when this is Mac-2.
@@ -90,7 +169,11 @@ async function main() {
   const orderId = (n: number) => `OD99${stamp}${String(n).padStart(6, "0")}`;
   const COD_ORDER = orderId(40);
   const codJob = { result: { transactionAmount: "12999", paymentFee: "", paymentFeeDetails: "" }, request: { paymentMode: "cod", cards: [] } };
+  const realJobFindOne = CheckoutJob.findOne.bind(CheckoutJob);
+  const CREATED_ORDERS = new Set([orderId(60), orderId(61)]);
   (CheckoutJob as unknown as { findOne: unknown }).findOne = (filter: Record<string, unknown>) => {
+    // The Created By case reads its own invented job rows (userId = the invented workspace).
+    if (CREATED_ORDERS.has(String(filter?.["result.flipkartOrderId"] || ""))) return realJobFindOne(filter as never);
     const value = filter?.["result.flipkartOrderId"] === COD_ORDER ? codJob : null;
     const q = { sort: () => q, select: () => q, lean: async () => value };
     return q;
@@ -512,17 +595,374 @@ async function main() {
         assert.deepEqual(onSecondMac, [String(otherMac._id)], "the second Mac takes its own");
       });
     }
+
+    // ══ sub-step 10 ══════════════════════════════════════════════════════════════════════════════════════════════
+
+    console.log("\nU6 — Created By (orderLinks.ts cardFieldsFor ← the batch's createdBy; routes/jobs.ts x-requested-by)");
+    const BATCH_WITH = `verify-us-${run}-with`;
+    const BATCH_WITHOUT = `verify-us-${run}-without`;
+    await check("the x-requested-by header: a plain name, a percent-encoded one, blanks and control characters", () => {
+      assert.equal(requestedByHeader("tester"), "tester");
+      assert.equal(requestedByHeader(encodeURIComponent("Tëster Ünïcode")), "Tëster Ünïcode");
+      assert.equal(requestedByHeader("  "), "");
+      assert.equal(requestedByHeader(undefined), "");
+      assert.equal(requestedByHeader("a%ZZb"), "a%ZZb", "not a valid encoding: kept as sent");
+      assert.equal(requestedByHeader("x".repeat(300)).length, 120);
+      assert.equal(requestedByHeader("bad\u0007name"), "badname");
+    });
+    await check("an invented batch (createdBy 'tester') and its job: cardFieldsFor gives created_by 'tester', a save writes it on the unit; a batch without a creator gives none", async () => {
+      // A dry_run job and a completed batch: no worker, reaper or reconciler takes either. Both models key userId as a string.
+      await CheckoutBatch.collection.insertMany([
+        { batchId: BATCH_WITH, userId, systemId: "verify", batchStatus: "completed", createdBy: "tester", createdAt: new Date(), updatedAt: new Date() },
+        { batchId: BATCH_WITHOUT, userId, systemId: "verify", batchStatus: "completed", createdBy: "", createdAt: new Date(), updatedAt: new Date() },
+      ] as never[]);
+      await CheckoutJob.collection.insertMany([
+        { userId, batchId: BATCH_WITH, email: account.email, status: "dry_run", request: { paymentMode: "cod", cards: [] }, result: { flipkartOrderId: orderId(60) }, createdAt: new Date(), updatedAt: new Date() },
+        { userId, batchId: BATCH_WITHOUT, email: account.email, status: "dry_run", request: { paymentMode: "cod", cards: [] }, result: { flipkartOrderId: orderId(61) }, createdAt: new Date(), updatedAt: new Date() },
+      ] as never[]);
+      forgetBatchCreators();
+      const withCreator = await cardFieldsFor(userId, account.email, orderId(60));
+      assert.equal(withCreator.created_by, "tester");
+      assert.equal(withCreator.payment_mode, "cod", "the job's own columns are still there");
+      const without = await cardFieldsFor(userId, account.email, orderId(61));
+      assert.ok(!("created_by" in without), "no creator → no created_by key (a $set leaves the stored value)");
+      await saveMappedUnit(userId, account, mappedFor(60, { order_id: orderId(60) }), { applyCalendar: false });
+      await saveMappedUnit(userId, account, mappedFor(61, { order_id: orderId(61) }), { applyCalendar: false });
+      assert.equal((await row(60))!.created_by, "tester");
+      assert.ok(!(await row(61))!.created_by, "past orders stay blank");
+    });
+
+    console.log("\nU7 — the OTP event on every code change (the plan's table)");
+    {
+      const captured: Array<Record<string, unknown>> = [];
+      const realInsertMany = OrderUnitEvent.insertMany;
+      (OrderUnitEvent as unknown as { insertMany: unknown }).insertMany = async (docs: Array<Record<string, unknown>>) => (captured.push(...docs), docs);
+      try {
+        const u = ids(81);
+        const snap = (otp: string | null) => ({ orderId: u.orderId, email: account.email, productName: "Verify Phone", status_key: "ofd", delivery_otp: otp || "", shipping_address: null, shipping_address_hash: "", address_first_seen_at: null });
+        for (const [b, a, n] of [[null, "111111", 1], ["111111", "222222", 1], ["111111", "111111", 0]] as const) {
+          await check(`${b ?? "null"} → ${a}: ${n} otp_new`, async () => {
+            captured.length = 0;
+            const changes = await recordUnitChanges(userId, u.unitId, b === null ? snap(null) : snap(b), snap(a), "verify-request");
+            assert.equal(captured.filter((e) => e.type === "otp_new").length, n);
+            assert.equal(changes.otpNew, n === 1);
+          });
+        }
+      } finally {
+        (OrderUnitEvent as unknown as { insertMany: unknown }).insertMany = realInsertMany;
+      }
+    }
+
+    console.log("\nU10 + X6 — refund_completed and the one late-document detection (events captured here, none written)");
+    {
+      const captured: Array<Record<string, unknown>> = [];
+      const realInsertMany = OrderUnitEvent.insertMany;
+      (OrderUnitEvent as unknown as { insertMany: unknown }).insertMany = async (docs: Array<Record<string, unknown>>) => (captured.push(...docs), docs);
+      try {
+        const u = ids(82);
+        const late = (over: Record<string, unknown>) => ({ unit_id: u.unitId, order_id: u.orderId, status_key: "Cancelled", order_status_pre_cancellation: "Shipped", cancelled_date: minutesAgo(3000), payment_mode: "", tracking: [] as Array<{ status: string; stage: string; date: string }>, ...over });
+        const snap = (over: Record<string, unknown>, money: Record<string, unknown> = {}) => ({
+          orderId: u.orderId, email: account.email, productName: "Verify Phone", status_key: "Cancelled", delivery_otp: "", shipping_address: null, shipping_address_hash: "", address_first_seen_at: null,
+          refund_amount: null, refund_date: null, refund_kind: null, ...money, late: late(over),
+        });
+        const refundEvents = () => captured.filter((e) => e.type === "refund_completed");
+        await check("Processed → Completed: one refund_completed event (amount, date, kind), refundCompleted true, one 'refund' moment", async () => {
+          captured.length = 0;
+          const paid = new Date("2026-11-20T10:00:00+05:30");
+          const changes = await recordUnitChanges(userId, u.unitId, snap({ refund_status: "Processed" }), snap({ refund_status: "Completed" }, { refund_amount: "1999.00", refund_date: paid, refund_kind: "refund" }), "verify-request", { requestSource: "schedule", sourceLabel: "Update order details (6-hour sweep)" });
+          assert.equal(changes.refundCompleted, true);
+          assert.equal(refundEvents().length, 1);
+          assert.deepEqual(refundEvents()[0].after, { amount: "1999.00", date: paid, kind: "refund" });
+          assert.deepEqual(changes.lateDocuments.map((m) => m.reason), ["refund"], "the ending was seen before; the refund is the moment");
+          assert.deepEqual([refundEvents()[0].source, refundEvents()[0].requestSource, refundEvents()[0].sourceLabel, refundEvents()[0].processed], ["update", "schedule", "Update order details (6-hour sweep)", false]);
+        });
+        await check("Completed → Completed: nothing; Processed with a DONE Refund stage: not completed (the card's status wins); a DONE stage on a unit with no refund status: completed", async () => {
+          captured.length = 0;
+          const done = [{ status: "Refund", stage: "DONE", date: "2026-11-20T10:00:00+05:30" }];
+          let c = await recordUnitChanges(userId, u.unitId, snap({ refund_status: "Completed" }), snap({ refund_status: "Completed" }), "verify-request");
+          assert.deepEqual([c.refundCompleted, c.lateDocuments.length, refundEvents().length], [false, 0, 0]);
+          c = await recordUnitChanges(userId, u.unitId, snap({ refund_status: null }), snap({ refund_status: "Processed", tracking: done }), "verify-request");
+          assert.deepEqual([c.refundCompleted, c.lateDocuments.length, refundEvents().length], [false, 0, 0]);
+          c = await recordUnitChanges(userId, u.unitId, snap({ refund_status: null }), snap({ refund_status: null, tracking: done }), "verify-request");
+          assert.deepEqual([c.refundCompleted, c.lateDocuments.map((m) => m.reason), refundEvents().length], [true, ["refund"], 1]);
+        });
+        await check("Shipped → Cancelled (invoiced): one 'cancelled' moment, no refund event; cancelled before shipping: none", async () => {
+          captured.length = 0;
+          const shipped = { ...snap({ status_key: "Shipped" }), status_key: "Shipped" };
+          let c = await recordUnitChanges(userId, u.unitId, shipped, snap({}), "verify-request");
+          assert.deepEqual([c.stageChanged, c.lateDocuments.map((m) => m.reason), refundEvents().length], [true, ["cancelled"], 0]);
+          c = await recordUnitChanges(userId, u.unitId, { ...snap({ status_key: "Approved" }), status_key: "Approved" }, snap({ order_status_pre_cancellation: "Order Confirmed" }), "verify-request");
+          assert.deepEqual(c.lateDocuments, []);
+        });
+        await check("one condition for the event and the moment: a first read (no before) with the refund already Completed gives the event AND the 'refund' moment", async () => {
+          captured.length = 0;
+          const c = await recordUnitChanges(userId, u.unitId, null, snap({ refund_status: "Completed" }, { refund_amount: "10.00" }), "verify-request");
+          assert.equal(c.refundCompleted, true);
+          assert.equal(refundEvents().length, 1);
+          assert.ok(c.lateDocuments.some((m) => m.reason === "refund"));
+          captured.length = 0;
+          const d = await recordUnitChanges(userId, u.unitId, null, snap({ refund_status: "Processed" }), "verify-request");
+          assert.deepEqual([d.refundCompleted, d.lateDocuments.some((m) => m.reason === "refund"), refundEvents().length], [false, false, 0]);
+        });
+        await check("the page path's bare 'refund' marker is no status: with a DONE Refund stage the refund is completed (event + moment), without one it is not", async () => {
+          captured.length = 0;
+          const done = [{ status: "Refund Completed", stage: "DONE", date: "2026-11-20T10:00:00+05:30" }];
+          let c = await recordUnitChanges(userId, u.unitId, snap({ refund_status: null }), snap({ refund_status: "refund", tracking: done }), "verify-request");
+          assert.deepEqual([c.refundCompleted, c.lateDocuments.map((m) => m.reason), refundEvents().length], [true, ["refund"], 1]);
+          captured.length = 0;
+          c = await recordUnitChanges(userId, u.unitId, snap({ refund_status: null }), snap({ refund_status: "refund" }), "verify-request");
+          assert.deepEqual([c.refundCompleted, c.lateDocuments.length, refundEvents().length], [false, 0, 0]);
+          captured.length = 0;
+          c = await recordUnitChanges(userId, u.unitId, snap({ refund_status: "refund", tracking: done }), snap({ refund_status: "refund", tracking: done }), "verify-request");
+          assert.deepEqual([c.refundCompleted, c.lateDocuments.length], [false, 0], "completed already before: no second moment");
+        });
+        await check("quiet: every event inserted processed with after.backfill; the refund is still recorded; no late-document moment", async () => {
+          captured.length = 0;
+          const c = await recordUnitChanges(userId, u.unitId, { ...snap({ status_key: "Shipped", refund_status: null }), status_key: "Shipped" }, snap({ refund_status: "Completed" }), "verify-request", { quiet: true });
+          assert.deepEqual(c.lateDocuments, []);
+          assert.equal(c.refundCompleted, true);
+          assert.deepEqual(captured.map((e) => e.type).sort(), ["refund_completed", "stage_changed"]);
+          for (const e of captured) {
+            assert.equal(e.processed, true);
+            assert.ok(e.processedAt instanceof Date);
+            assert.equal((e.after as Record<string, unknown>).backfill, true);
+          }
+        });
+        await check("T10: the label follows the request — manual, the 6-hour sweep, out-for-delivery, after an order, retry, the forced refresh", () => {
+          assert.equal(updateSourceLabel("manual", {}), "Update order details");
+          assert.equal(updateSourceLabel("schedule", { schedule_name: "update_active" }), "Update order details (6-hour sweep)");
+          assert.equal(updateSourceLabel("schedule", { selection_method: "after_fetch" }), "Update order details (scheduled)");
+          assert.equal(updateSourceLabel("ofd", {}), "Update order details (out-for-delivery recheck)");
+          assert.equal(updateSourceLabel("system-order", {}), "Update order details (after an order)");
+          assert.equal(updateSourceLabel("system-retry", {}), "Update order details (retry)");
+          assert.equal(updateSourceLabel("manual", { purpose: "forced_refresh_2026" }), "Forced refresh");
+          assert.ok(!/Fetch account details/.test(updateSourceLabel("manual", {})), "an update is never labelled a fetch");
+        });
+        await check("the worker's event options per request (eventOptionsFor, both recordUnitChanges calls): quiet only on params.quiet_events === true, the source and label of the request", () => {
+          assert.deepEqual(eventOptionsFor({ source: "manual", params: { quiet_events: true, purpose: "forced_refresh_2026" } }), { quiet: true, requestSource: "manual", sourceLabel: "Forced refresh" });
+          assert.deepEqual(eventOptionsFor({ source: "schedule", params: { schedule_name: "update_active" } }), { quiet: false, requestSource: "schedule", sourceLabel: "Update order details (6-hour sweep)" });
+          assert.equal(eventOptionsFor({ source: "manual", params: { quiet_events: "true" } }).quiet, false, "only the boolean");
+          assert.equal(eventOptionsFor({ source: "manual" }).quiet, false);
+          const src = fs.readFileSync(path.join(repoRoot, "src/services/orderUpdateQueue.ts"), "utf8");
+          assert.match(src, /const eventOpts = eventOptionsFor\(request\);/);
+          assert.equal((src.match(/recordUnitChanges\(userId, u\.unitId, before, after, requestId, eventOpts\)/g) || []).length, 2, "both save paths pass them");
+        });
+        await check("the update worker's capability stamp says quiet_events (the forced refresh refuses a worker without it); an absent or unreadable stamp has none", () => {
+          assert.deepEqual([...UPDATE_WORKER_CAPABILITIES], ["quiet_events"]);
+          assert.equal(updateCapabilitiesKey("order-update"), "tradeflow:worker-caps:order-update");
+          assert.deepEqual(capabilitiesOf(JSON.stringify({ caps: UPDATE_WORKER_CAPABILITIES, pid: 1 })), ["quiet_events"]);
+          assert.deepEqual(capabilitiesOf(null), []);
+          assert.deepEqual(capabilitiesOf("not json"), []);
+          assert.deepEqual(capabilitiesOf(JSON.stringify({ host: "x", pid: 1 })), [], "the old heartbeat's shape");
+        });
+        await check("the event model takes refund_completed (insertMany would drop an unknown type) and the three source fields", () => {
+          const doc = new OrderUnitEvent({ userId: workspace, type: "refund_completed", at: new Date(), source: "update", requestSource: "manual", sourceLabel: "Update order details" });
+          assert.equal(doc.validateSync(), undefined);
+          assert.deepEqual([doc.source, doc.requestSource, doc.sourceLabel], ["update", "manual", "Update order details"]);
+        });
+      } finally {
+        (OrderUnitEvent as unknown as { insertMany: unknown }).insertMany = realInsertMany;
+      }
+    }
+
+    console.log("\nU10 — a quiet insert raises no alert after the dashboard's minute poll (the dashboard API's event drain)");
+    await check("quiet events of a unit with no address baseline and a changed address: processed at insert, no alert after the poll; a control event of the same workspace IS drained", async () => {
+      if (process.env.UNIT_SAVE_NO_DASHBOARD === "1") throw new Error("SKIPPED (UNIT_SAVE_NO_DASHBOARD=1) — run it with the dashboard API up");
+      const q = ids(83);
+      const addr = (line1: string): ShippingAddress => ({ ...ADDRESS, line1, text: `${ADDRESS.name}, ${line1}, Nowhere 000000` });
+      // A stored unit with an address hash and no baseline (as 12,302 scope units are), then a read that moves the address.
+      await insertStored(83, { shipping_address: addr("1 Verify Street"), shipping_address_hash: addressHash(addr("1 Verify Street")), address_first_seen_at: null, status_key: "Shipped" });
+      const before = await snapshotUnit(userId, q.unitId);
+      await Order.collection.updateOne({ userId: workspace, unit_id: q.unitId }, { $set: { status_key: "Cancelled", shipping_address: addr("2 Other Street"), shipping_address_hash: addressHash(addr("2 Other Street")) } });
+      const after = await snapshotUnit(userId, q.unitId);
+      const changes = await recordUnitChanges(userId, q.unitId, before, after, "verify-quiet", { quiet: true, requestSource: "manual", sourceLabel: "Forced refresh" });
+      assert.deepEqual(changes.events.sort(), ["address_changed", "address_seen", "stage_changed"]);
+      assert.ok((await row(83))!.address_first_seen_at, "the baseline is still written");
+      const quietRows = await OrderUnitEvent.find({ userId: workspace, unitId: q.unitId }).lean();
+      assert.equal(quietRows.length, 3);
+      assert.ok(quietRows.every((e) => e.processed === true), "inserted processed");
+      // The control: an event the dashboard must claim (an unreadable account of the invented workspace).
+      const control = await OrderUnitEvent.create({ userId: workspace, orderId: "", unitId: "", email: "control@verify.invalid", productName: "", type: "account_unreadable", at: new Date(), before: null, after: { reason: "verify control", flow: "verify" }, requestId: "verify-quiet", processed: false, processedAt: null });
+      const until = Date.now() + 90_000;
+      while (Date.now() < until && !(await OrderUnitEvent.exists({ _id: control._id, processed: true }))) await new Promise((r) => setTimeout(r, 2000));
+      assert.ok(await OrderUnitEvent.exists({ _id: control._id, processed: true }), "the control event was not drained within 90 s — is the dashboard API running?");
+      await new Promise((r) => setTimeout(r, 3000));
+      const alerts = mongoose.connection.collection("alerts");
+      assert.equal(await alerts.countDocuments({ userId: workspace, unitId: q.unitId }), 0, "no alert for the quiet unit");
+      assert.equal(await alerts.countDocuments({ userId: workspace, kind: { $in: ["order.address_change", "order.address_mismatch"] } }), 0, "no address alert in the invented workspace");
+      const stillQuiet = await OrderUnitEvent.find({ userId: workspace, unitId: q.unitId }).select("processedAt").lean();
+      assert.ok(stillQuiet.every((e) => new Date(e.processedAt!).getTime() <= new Date(quietRows[0].processedAt!).getTime() + 1000), "no quiet event was claimed again");
+      console.log(`        control drained; alerts in the invented workspace: ${await alerts.countDocuments({ userId: workspace })} (the control's own)`);
+    });
+
+    console.log("\nU8 — missing siblings through a stubbed order API (a saved 7-unit answer, scrubbed, ids invented)");
+    await (async () => {
+      const seven = findSevenUnitAnswer(traceDir);
+      const SIB_ORDER = orderId(70);
+      const SIB_ORDER_2 = orderId(71);
+      const body = (target: string) => {
+        const { raw, orderId: realOrder, unitIds } = seven;
+        let text = JSON.stringify(raw);
+        // Invented ids in place of the real ones (longest first: an item id is a unit id's prefix).
+        unitIds.forEach((u, i) => (text = text.split(u).join(`9${stamp}${String(i).padStart(2, "0")}${target === SIB_ORDER ? "7" : "8"}000`)));
+        // Then the order id (its digits can hold an item id), then the item ids (metaData.itemId; units of one item
+        // share it): what is left of them stands alone now.
+        text = text.split(realOrder).join(target);
+        seven.itemIds.forEach((item, j) => (text = text.split(item).join(`8${stamp}${String(j).padStart(2, "0")}${target === SIB_ORDER ? "7" : "8"}`)));
+        return text;
+      };
+      const sibIds = (target: string) => seven.unitIds.map((_, i) => `9${stamp}${String(i).padStart(2, "0")}${target === SIB_ORDER ? "7" : "8"}000`);
+      const calls: string[] = [];
+      const failing = new Set<string>();
+      const ctxFor = (target: string) =>
+        ({
+          post: async (url: string, opts: { data?: { requestContext?: { unitId?: string } } }) => {
+            const unitId = String(opts?.data?.requestContext?.unitId || "");
+            calls.push(unitId);
+            const known = sibIds(target).includes(unitId);
+            const status = failing.has(unitId) ? 500 : known ? 200 : 404;
+            return { status: () => status, ok: () => status === 200, url: () => url, text: async () => (status === 200 ? body(target) : "{}") };
+          },
+        }) as unknown as import("playwright").APIRequestContext;
+      console.log(`        the answer: ${seven.source} (${seven.unitIds.length} units)`);
+      await check("an account holding 1 stored unit of a 7-unit order: the other 6 are saved under the invented workspace; a second call (same job) stores none; a new job finds none missing", async () => {
+        const ids7 = sibIds(SIB_ORDER);
+        // The one stored unit, saved from the same answer.
+        const { orderViewFromPageFetch: view, mapApiUnitToOrder: map } = await import("../services/orderApi.js");
+        const v = view(JSON.parse(body(SIB_ORDER)))!;
+        await saveMappedUnit(userId, account, map(v, ids7[0]), { applyCalendar: false });
+        assert.equal(await Order.countDocuments({ userId: workspace, order_id: SIB_ORDER }), 1);
+        calls.length = 0;
+        const memo = new Set<string>();
+        const r1 = await saveMissingSiblings(ctxFor(SIB_ORDER), userId, account, { orderId: SIB_ORDER, unitId: ids7[0] }, ids7, memo);
+        assert.deepEqual(r1, { missing: 6, saved: 6, failed: 0 });
+        assert.equal(calls.length, 6, "one read per missing sibling");
+        assert.equal(await Order.countDocuments({ userId: workspace, order_id: SIB_ORDER }), 7);
+        const stored = await Order.find({ userId: workspace, order_id: SIB_ORDER }).select("unit_id platform_email").lean();
+        assert.deepEqual(stored.map((x) => x.unit_id).sort(), [...ids7].sort());
+        assert.ok(stored.every((x) => x.platform_email === account.email));
+        calls.length = 0;
+        assert.deepEqual(await saveMissingSiblings(ctxFor(SIB_ORDER), userId, account, { orderId: SIB_ORDER, unitId: ids7[1] }, ids7, memo), { missing: 0, saved: 0, failed: 0 }, "once per order per job");
+        assert.deepEqual(await saveMissingSiblings(ctxFor(SIB_ORDER), userId, account, { orderId: SIB_ORDER, unitId: ids7[1] }, ids7, new Set()), { missing: 0, saved: 0, failed: 0 }, "a new job: none missing");
+        assert.equal(calls.length, 0, "no read when nothing is missing");
+      });
+      await check("a sibling that fails (HTTP 500) is counted and logged, never thrown; the request's own units (skip) are not read", async () => {
+        const ids7 = sibIds(SIB_ORDER_2);
+        failing.add(ids7[2]);
+        const lines: string[] = [];
+        calls.length = 0;
+        const r = await saveMissingSiblings(ctxFor(SIB_ORDER_2), userId, account, { orderId: SIB_ORDER_2, unitId: ids7[0] }, ids7, new Set(), { skip: new Set([ids7[1]]), log: (m) => void lines.push(m) });
+        assert.deepEqual(r, { missing: 5, saved: 4, failed: 1 });
+        assert.ok(!calls.includes(ids7[1]), "the skipped unit is not read");
+        assert.equal(lines.length, 1);
+        assert.match(lines[0], /sibling unit not saved/);
+        assert.equal(await Order.countDocuments({ userId: workspace, order_id: SIB_ORDER_2 }), 4);
+      });
+      await check("the update worker calls it after an API read only, with the request's units skipped, and adds '+N sibling unit(s) saved' to the account's message", () => {
+        const src = fs.readFileSync(path.join(repoRoot, "src/services/orderUpdateQueue.ts"), "utf8");
+        assert.match(src, /if \(api && !usedPage\) \{\s*const sib = await saveMissingSiblings\(api, userId, acct, \{ orderId: u\.orderId, unitId: u\.unitId \}, \(result as \{ siblingUnitIds\?: string\[\] \}\)\.siblingUnitIds \|\| \[\], siblingMemo, \{ skip: ownUnits, read: deps\.apiRead/);
+        assert.match(src, /\+\$\{siblingsSaved\} sibling unit\(s\) saved/);
+      });
+    })();
+
+    console.log("\nU9 — a skipped_old index row inside the fetch window goes back to pending (discoverUnit)");
+    await check("requeueSkippedOld's table", () => {
+      const since = new Date("2026-10-01T00:00:00+05:30");
+      assert.equal(requeueSkippedOld("skipped_old", new Date("2026-10-05"), since, false), true);
+      assert.equal(requeueSkippedOld("skipped_old", new Date("2026-09-20"), since, false), false, "before the window");
+      assert.equal(requeueSkippedOld("skipped_old", new Date("2026-10-05"), since, true), false, "stored already");
+      assert.equal(requeueSkippedOld("skipped_old", null, since, false), false, "no list date");
+      assert.equal(requeueSkippedOld("scraped", new Date("2026-10-05"), since, false), false);
+      // Skipped by the enrich step on the detail's placed date: that date decides, not the list card's (a status date).
+      const placed = { lastError: "placed before 1 Oct 2026", placedDate: new Date("2026-08-20") };
+      assert.equal(requeueSkippedOld("skipped_old", new Date("2026-10-12"), since, false, placed), false, "'placed before' with an old placed date stays, whatever the list date");
+      assert.equal(requeueSkippedOld("skipped_old", new Date("2026-10-12"), since, false, { ...placed, placedDate: new Date("2026-10-03") }), true, "'placed before' with a placed date inside a wider window goes back");
+      assert.equal(requeueSkippedOld("skipped_old", new Date("2026-10-12"), since, false, { lastError: "list date before 1 Oct 2026", placedDate: null }), true, "'list date before' is judged on the list date");
+    });
+    await check("discoverUnit on invented order_index rows: inside the window and not stored → pending, counted new; before the window, and stored, stay skipped_old (duplicate); the invariant has 0 unaccounted", async () => {
+      const since = new Date(Date.now() - 60 * 86_400_000);
+      setFetchWindowForChecks(userId, since);
+      const inWindow = new Date(Date.now() - 10 * 86_400_000);
+      const old = new Date(Date.now() - 90 * 86_400_000);
+      const card = (n: number, at: Date) => ({ ...ids(n), orderUrl: urlOf(ids(n)), amount: "", orderDate: at });
+      const idx = (n: number, at: Date) => ({ userId: workspace, platformAccountId: account.id, platform_email: account.email, platform: "FLIPKART", order_id: ids(n).orderId, item_id: ids(n).itemId, unit_id: ids(n).unitId, order_url: urlOf(ids(n)), scrape_status: "skipped_old", list_hint: "", status_key: "", order_date: at, first_seen_at: new Date(), last_seen_at: new Date(), last_error: "list date before …" });
+      // 94: skipped by the enrich step (placed 90 days ago) while its list card shows a status date inside the window.
+      await OrderIndex.collection.insertMany([idx(91, inWindow), idx(92, old), idx(93, inWindow), { ...idx(94, old), last_error: "placed before …" }] as never[]);
+      await insertStored(93, { status_key: "Delivered" });
+      const kinds = [await discoverUnitForChecks(userId, account, card(91, inWindow)), await discoverUnitForChecks(userId, account, card(92, old)), await discoverUnitForChecks(userId, account, card(93, inWindow)), await discoverUnitForChecks(userId, account, card(94, inWindow))];
+      assert.deepEqual(kinds, ["new", "duplicate", "duplicate", "duplicate"]);
+      assert.equal((await OrderIndex.collection.findOne({ userId: workspace, unit_id: ids(94).unitId }))!.scrape_status, "skipped_old", "a 'placed before' row is not re-queued on a status date");
+      const st = async (n: number) => (await OrderIndex.collection.findOne({ userId: workspace, unit_id: ids(n).unitId }))!;
+      assert.deepEqual([(await st(91)).scrape_status, (await st(91)).last_error], ["pending", ""]);
+      assert.equal((await st(92)).scrape_status, "skipped_old");
+      assert.equal((await st(93)).scrape_status, "skipped_old");
+      // The enrich pass of the run takes 91 (pending); 92 was dropped by date at the list; 93 is known.
+      const inv = await checkFetchInvariantForChecks(userId, account, "api", [ids(91).unitId, ids(92).unitId, ids(93).unitId], [ids(92).unitId], [ids(91).unitId], { enriched: 1, mapped: 1, oldAtEnrich: 0, failed: 0 });
+      assert.deepEqual([inv.unaccounted, inv.pass], [0, true], inv.line);
+    });
+
+    console.log("\nU12 + X5 — the refund watch (orderLifecycle.ts refundWatchFilter) through resolveTargets");
+    await check("selected: Cancelled 2 days ago, not COD, no refund (also with the page's bare 'refund' marker); refund Processed 20 days ago; an invoiced bundled unit cancelled 20 days ago without a refund — not: COD, Completed, Delivered, cancelled 20 days ago with nothing open, a recent or bundled one refunded by its DONE stage (with no status or the bare marker), a bundled cash-on-delivery one", async () => {
+      const day = 86_400_000;
+      const ago = (d: number) => new Date(Date.now() - d * day);
+      const W = { recent: 101, processed: 102, bundled: 103, cod: 104, completed: 105, delivered: 106, oldPlain: 107, bundledRefunded: 108, bundledCod: 109, recentDone: 110, recentMarkerDone: 111, recentMarker: 112 };
+      const key = (n: number) => `raw/${userId}/${ids(n).orderId}.pdf`;
+      await insertStored(W.recent, { status_key: "Cancelled", cancelled_date: ago(2), refund_status: null, cash_on_delivery: false, payment_mode: "", invoice_s3_key: "" });
+      await insertStored(W.processed, { status_key: "Cancelled", cancelled_date: ago(20), refund_status: "Processed", cash_on_delivery: false, invoice_s3_key: "" });
+      await insertStored(W.bundled, { status_key: "Cancelled", cancelled_date: ago(20), refund_status: null, cash_on_delivery: false, order_status_pre_cancellation: "Shipped", invoice_s3_key: key(W.bundled), tracking: [] });
+      await insertStored(W.bundledCod, { status_key: "Cancelled", cancelled_date: ago(20), refund_status: null, cash_on_delivery: true, order_status_pre_cancellation: "Shipped", invoice_s3_key: key(W.bundledCod), tracking: [] });
+      await insertStored(W.cod, { status_key: "Cancelled", cancelled_date: ago(2), refund_status: null, cash_on_delivery: true, invoice_s3_key: "" });
+      await insertStored(W.completed, { status_key: "Cancelled", cancelled_date: ago(2), refund_status: "Completed", cash_on_delivery: false, invoice_s3_key: "" });
+      await insertStored(W.delivered, { status_key: "Delivered", cancelled_date: null, refund_status: null, invoice_s3_key: "" });
+      await insertStored(W.oldPlain, { status_key: "Cancelled", cancelled_date: ago(20), refund_status: null, cash_on_delivery: false, invoice_s3_key: "" });
+      await insertStored(W.bundledRefunded, { status_key: "Cancelled", cancelled_date: ago(20), refund_status: null, cash_on_delivery: false, order_status_pre_cancellation: "Shipped", invoice_s3_key: key(W.bundledRefunded), tracking: [{ status: "Refund", stage: "DONE", date: ago(5).toISOString(), detailed_steps: [] }] });
+      // "recent" follows the detection's rule too: a DONE Refund stage without a status (or with the page's bare marker) is refunded.
+      const doneStage = [{ status: "Refund Completed", stage: "DONE", date: ago(1).toISOString(), detailed_steps: [] }];
+      await insertStored(W.recentDone, { status_key: "Cancelled", cancelled_date: ago(2), refund_status: null, cash_on_delivery: false, invoice_s3_key: "", tracking: doneStage });
+      await insertStored(W.recentMarkerDone, { status_key: "Cancelled", cancelled_date: ago(2), refund_status: "refund", cash_on_delivery: false, invoice_s3_key: "", tracking: doneStage });
+      await insertStored(W.recentMarker, { status_key: "Cancelled", cancelled_date: ago(2), refund_status: "refund", cash_on_delivery: false, invoice_s3_key: "", tracking: [] });
+      // Every other invented unit of this run moves to another (not logged-in) e-mail: only the twelve above are asked about.
+      const asked = Object.values(W).map((n) => ids(n).unitId);
+      await Order.collection.updateMany({ userId: workspace, unit_id: { $nin: asked } }, { $set: { platform_email: "elsewhere@verify.invalid" } });
+      // The account, logged in with a made-up cookie (resolveTargets reads it; this check never does).
+      await PlatformId.collection.insertOne({ userId: workspace, platform: "FLIPKART", email: account.email, status: "logged_in", sessionSavedAt: new Date(), sessionCookies: [{ name: "verify", value: "invented", domain: ".verify.invalid", path: "/" }], createdAt: new Date(), updatedAt: new Date() } as never);
+      const units = (await resolveTargets(userId, { emails: [account.email], withRefundWatch: true })).map((t) => t.card.unitId).sort();
+      assert.deepEqual(units, [ids(W.recent).unitId, ids(W.processed).unitId, ids(W.bundled).unitId, ids(W.recentMarker).unitId].sort());
+      const without = await resolveTargets(userId, { emails: [account.email] });
+      assert.deepEqual(without.map((t) => t.card.unitId), [], "the active selection alone takes none of them (all are finished)");
+      assert.equal(refundWatchFilter().$or.length, 3, "one filter, three clauses");
+    });
+    await check("the 6-hour active sweep asks for the watch (and records refund_watch); the out-for-delivery recheck does not", () => {
+      const src = fs.readFileSync(path.join(repoRoot, "src/services/orderUpdateQueue.ts"), "utf8");
+      assert.match(src, /kind === "ofd" \? \{ orderStatus: keys, selectionMethod: "schedule_ofd" \} : \{ selectionMethod: "schedule_active", withRefundWatch: true \}/);
+      assert.match(src, /\.\.\.\(kind === "active" \? \{ refund_watch: true \} : \{\}\)/);
+    });
   } finally {
+    // Events first (the dashboard turns new ones into alerts), then the alerts it raised, then the rest.
+    const events = (await OrderUnitEvent.deleteMany({ userId: workspace })).deletedCount;
+    const db = mongoose.connection.db!;
     const removed = {
       units: (await Order.deleteMany({ userId: workspace })).deletedCount,
       index: (await OrderIndex.deleteMany({ userId: workspace })).deletedCount,
-      events: (await OrderUnitEvent.deleteMany({ userId: workspace })).deletedCount,
+      events: events + (await OrderUnitEvent.deleteMany({ userId: workspace })).deletedCount,
+      alerts: (await db.collection("alerts").deleteMany({ userId: workspace })).deletedCount,
+      jobs: (await CheckoutJob.collection.deleteMany({ userId: { $in: [userId, workspace] as unknown[] } } as never)).deletedCount,
+      batches: (await CheckoutBatch.collection.deleteMany({ userId: { $in: [userId, workspace] as unknown[] } } as never)).deletedCount,
+      platformids: (await PlatformId.collection.deleteMany({ userId: workspace })).deletedCount,
     };
     for (const name of throwaway) await mongoose.connection.db!.dropCollection(name).catch(() => undefined);
     const left =
-      (await Order.countDocuments({ userId: workspace })) + (await OrderIndex.countDocuments({ userId: workspace })) + (await OrderUnitEvent.countDocuments({ userId: workspace }));
+      (await Order.countDocuments({ userId: workspace })) +
+      (await OrderIndex.countDocuments({ userId: workspace })) +
+      (await OrderUnitEvent.countDocuments({ userId: workspace })) +
+      (await db.collection("alerts").countDocuments({ userId: workspace })) +
+      (await CheckoutJob.collection.countDocuments({ userId: { $in: [userId, workspace] as unknown[] } } as never)) +
+      (await CheckoutBatch.collection.countDocuments({ userId: { $in: [userId, workspace] as unknown[] } } as never)) +
+      (await PlatformId.collection.countDocuments({ userId: workspace }));
     const strays = (await mongoose.connection.db!.listCollections({ name: { $regex: `^verify_us_${run}_` } }).toArray()).length;
-    console.log(`\ncleanup: ${removed.units} unit(s), ${removed.index} index row(s), ${removed.events} event(s) of the invented workspace deleted — ${left} left; ${throwaway.length} throwaway collection(s) dropped (${strays} left)`);
+    console.log(
+      `\ncleanup: ${removed.units} unit(s), ${removed.index} index row(s), ${removed.events} event(s), ${removed.alerts} alert(s), ${removed.jobs} job(s), ${removed.batches} batch(es), ${removed.platformids} platformids row(s) of the invented workspace deleted — ${left} left; ${throwaway.length} throwaway collection(s) dropped (${strays} left)`
+    );
     if (left || strays) failures.push("cleanup");
     await mongoose.disconnect();
   }

@@ -1093,6 +1093,41 @@ export async function patchOrderIndex(
   );
 }
 
+/**
+ * U9 (data-quality sub-step 10): a known index row the fetch once skipped as older than its since-date goes back to
+ * pending when the list shows the unit again inside this run's window and order_details does not hold it. Without
+ * this an existing skipped_old row counted as a duplicate for ever: 4,401 units placed since 1 Oct (inside the 60-day
+ * window) were never stored although every nightly fetch listed them again. Pure: the stored check is the caller's.
+ */
+export function requeueSkippedOld(
+  indexStatus: string | null | undefined,
+  listDate: Date | null,
+  since: Date,
+  stored: boolean,
+  skipped: { lastError?: string | null; placedDate?: Date | string | null } = {}
+): boolean {
+  if (indexStatus !== "skipped_old" || stored) return false;
+  // A row the enrich step skipped ("placed before …") was judged on the detail's placed date, which the row keeps in
+  // order_date; its list date can be a status date ("Cancelled on Oct 12") that stays inside the window although the
+  // order is older — re-queued on that, it would be read and skipped again on every fetch. So the placed date decides.
+  const placedSkip = /^placed before/i.test(String(skipped.lastError || ""));
+  const raw = placedSkip ? skipped.placedDate ?? null : listDate;
+  const d = raw ? (raw instanceof Date ? raw : new Date(String(raw))) : null;
+  return Boolean(d && !Number.isNaN(d.getTime()) && d.getTime() >= since.getTime());
+}
+
+/** For checks: the fetch window a run would hold (discoverUnit reads it), without starting a run. */
+export function setFetchWindowForChecks(userId: string, since: Date): void {
+  const job = state(userId);
+  job.sinceCutoff = since;
+  job.sinceLabel = formatSinceLabel(since);
+}
+
+/** For checks: discoverUnit itself (the list → order_index step of a fetch). */
+export function discoverUnitForChecks(userId: string, account: OrderAccount, card: OrderUnitCard): Promise<"new" | "duplicate" | "seeded"> {
+  return discoverUnit(userId, account, card);
+}
+
 async function discoverUnit(
   userId: string,
   account: OrderAccount,
@@ -1111,10 +1146,17 @@ async function discoverUnit(
     unit_id: card.unitId,
   }).lean();
   if (existing) {
-    await OrderIndex.updateOne(
-      { _id: existing._id },
-      { $set: { last_seen_at: now, list_hint: card.status || existing.list_hint || "", order_url: card.orderUrl || existing.order_url } }
-    );
+    const seen = { last_seen_at: now, list_hint: card.status || existing.list_hint || "", order_url: card.orderUrl || existing.order_url };
+    // U9: skipped as old once, inside the window now, never stored → pending again; the enrich pass of this run takes it.
+    const skippedOn = { lastError: existing.last_error, placedDate: existing.order_date };
+    if (existing.scrape_status === "skipped_old" && requeueSkippedOld(existing.scrape_status, listDateSafe(card), jobSince(userId), false, skippedOn)) {
+      const stored = Boolean(await Order.exists({ userId, unit_id: card.unitId }));
+      if (requeueSkippedOld(existing.scrape_status, listDateSafe(card), jobSince(userId), stored, skippedOn)) {
+        await OrderIndex.updateOne({ _id: existing._id, scrape_status: "skipped_old" }, { $set: { ...seen, scrape_status: "pending", last_error: "" } });
+        return "new";
+      }
+    }
+    await OrderIndex.updateOne({ _id: existing._id }, { $set: seen });
     return "duplicate";
   }
 
@@ -1386,6 +1428,11 @@ export interface FetchInvariant {
 }
 
 const runInvariants = new Map<string, FetchInvariant[]>();
+
+/** For checks: the fetch invariant of one account (logs its line like a run does). */
+export function checkFetchInvariantForChecks(...args: Parameters<typeof checkFetchInvariant>): ReturnType<typeof checkFetchInvariant> {
+  return checkFetchInvariant(...args);
+}
 
 async function checkFetchInvariant(
   userId: string,

@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { Invoice, type IInvoiceRefetch, type RefetchReason, type RefetchResult } from "../models/Invoice.js";
 import { Order } from "../models/Order.js";
 import type { OrderDownloadResult, downloadInvoicesByOrderId } from "./invoiceOnDemand.js";
+import { isEndedStatus, lateDocumentMoments, REFETCH_UNIT_FIELDS, refetchStateOf, type RefetchMoment, type RefetchUnitState } from "./orderUnitEvents.js";
 
 /**
  * Late re-downloads — data-quality sub-step 12, SO-5 (owner decision 4).
@@ -28,8 +29,9 @@ import type { OrderDownloadResult, downloadInvoicesByOrderId } from "./invoiceOn
  *   INVOICE_REFETCH_REFUND_DELAY_H  192  the refund look, 8 days after the refund — the freight credit note
  *   INVOICE_REFETCH_COD_DELAY_H     192  cash on delivery (no refund follows): the cancellation look waits 8 days
  *
- * What is detected here is what the update worker sees today (the unit's state after a read); sub-step 10 brings
- * the one shared detection (X6, a `refund_completed` event, quiet runs) and calls the same noting function.
+ * The moments come from the ONE detection in orderUnitEvents.ts (sub-step 10, X6): the update worker's
+ * recordUnitChanges hands them over (`changes.lateDocuments`, none in a quiet run) and noteLateDocuments notes them;
+ * the first store of a bundle runs the same detection on its units (noteLateDocumentsForOrder).
  */
 
 const DAY_H = 24;
@@ -58,118 +60,19 @@ export function refetchDueAt(reason: RefetchReason, eventAt: Date, cod: boolean)
   return new Date(eventAt.getTime() + h * 3_600_000);
 }
 
-/** The unit fields the detection reads (order_details). */
-export interface RefetchUnitState {
-  unit_id: string;
-  order_id: string;
-  status_key: string;
-  refund_status?: string | null;
-  cancelled_date?: Date | string | null;
-  order_status_pre_cancellation?: string | null;
-  /** checkout jobs only (orderLinks.ts): "cod" / "prepaid". */
-  payment_mode?: string | null;
-  /** The order API's flag (orderApi.ts: Flipkart's payment mode reads "Cash On Delivery") — what fetched units carry. */
-  cash_on_delivery?: boolean | null;
-  /** Flipkart's own payment-mode text, as the order API answered it (api_extra.payment_mode). */
-  api_payment_mode?: string | null;
-  invoice_eligible?: boolean | null;
-  tracking?: Array<{ status?: string; stage?: string; date?: string | null }>;
-}
-
-export const REFETCH_UNIT_FIELDS =
-  "unit_id order_id status_key refund_status cancelled_date order_status_pre_cancellation payment_mode cash_on_delivery api_extra.payment_mode api_extra.invoice_eligible tracking.status tracking.stage tracking.date";
-
-/** A row as order_details holds it → the detection's shape. */
-export function refetchStateOf(row: Record<string, unknown>): RefetchUnitState {
-  const extra = (row.api_extra as Record<string, unknown> | undefined) || {};
-  return {
-    unit_id: String(row.unit_id || ""),
-    order_id: String(row.order_id || ""),
-    status_key: String(row.status_key || ""),
-    refund_status: (row.refund_status as string | null) ?? null,
-    cancelled_date: (row.cancelled_date as Date | null) ?? null,
-    order_status_pre_cancellation: (row.order_status_pre_cancellation as string | null) ?? null,
-    payment_mode: (row.payment_mode as string | null) ?? null,
-    cash_on_delivery: typeof row.cash_on_delivery === "boolean" ? row.cash_on_delivery : null,
-    api_payment_mode: typeof extra.payment_mode === "string" ? extra.payment_mode : null,
-    invoice_eligible: typeof extra.invoice_eligible === "boolean" ? extra.invoice_eligible : null,
-    tracking: Array.isArray(row.tracking) ? (row.tracking as RefetchUnitState["tracking"]) : [],
-  };
-}
-
-const ENDED_RE = /^(cancelled|canceled|returned)$/i;
-/** Shipped, out for delivery, delivery attempted / unsuccessful / rescheduled, delivered: Flipkart had invoiced it. */
-const INVOICED_BEFORE_RE = /ship|deliver|out for/i;
-
-/** Was the unit invoiced before it ended? A return was delivered; a cancellation counts after shipping, or when Flipkart's own answer said the invoice was eligible. The 7 bundles whose cancelled units ended before shipping have no credit note to fetch. */
-export function unitWasInvoiced(u: RefetchUnitState): boolean {
-  if (/^returned$/i.test(u.status_key)) return true;
-  if (u.invoice_eligible === true) return true;
-  return INVOICED_BEFORE_RE.test(String(u.order_status_pre_cancellation || ""));
-}
-
-const COD_TEXT_RE = /^(cod|cash)/i;
-/**
- * Is the unit cash on delivery? The order API's flag `cash_on_delivery` (what every fetched unit carries — measured
- * 2026-11-26: 799 bundled units true, while top-level payment_mode reads "cod" on 6, checkout jobs only), then
- * Flipkart's own text (api_extra.payment_mode "Cash On Delivery"), then a checkout job's payment_mode.
- */
-export function isCashOnDelivery(u: Pick<RefetchUnitState, "payment_mode" | "cash_on_delivery" | "api_payment_mode"> | string | null | undefined): boolean {
-  if (u === null || u === undefined || typeof u === "string") return COD_TEXT_RE.test(String(u || "").trim());
-  if (u.cash_on_delivery === true) return true;
-  if (/cash on delivery/i.test(String(u.api_payment_mode || ""))) return true;
-  return COD_TEXT_RE.test(String(u.payment_mode || "").trim());
-}
-
-const asDate = (v: unknown): Date | null => {
-  if (!v) return null;
-  const d = v instanceof Date ? v : new Date(String(v));
-  return Number.isNaN(d.getTime()) ? null : d;
-};
-
-/**
- * When the refund completed, or null: refund_status reads "complet…" (the mapper of sub-step 9), or a DONE Refund
- * stage is on the tracking (what is stored today: 3,215 DONE Refund stages). Flipkart dates some DONE stages
- * ahead (the expected credit day) — a date after `now` is taken as now.
- */
-export function refundCompletedAt(u: RefetchUnitState, now = new Date()): Date | null {
-  const stage = (u.tracking || []).find((t) => /refund/i.test(String(t?.status || "")) && String(t?.stage || "").toUpperCase() === "DONE");
-  const completed = /complet/i.test(String(u.refund_status || ""));
-  if (!stage && !completed) return null;
-  const at = asDate(stage?.date) || now;
-  return at.getTime() > now.getTime() ? now : at;
-}
-
-export interface RefetchMoment {
-  reason: RefetchReason;
-  event_at: Date;
-  cod: boolean;
-}
-
-/**
- * The late-document moments a unit's state shows (pure). `before` is the unit as it was stored before the read —
- * given, an ending only counts when the unit was not ended already (the update worker's transition); null, the
- * state alone decides (the first store of a bundle, a unit read the first time). The noting refuses a second
- * (unit, reason) either way, and an entry a later download already covers closes without a call.
- *   - "cancelled" / "returned": the unit is Cancelled / Returned now (not at "Cancellation requested");
- *   - "refund": the refund completed (refundCompletedAt);
- *   - nothing for a unit that was never invoiced (cancelled before shipping).
- */
-export function refetchEventsOf(before: Pick<RefetchUnitState, "status_key"> | null, after: RefetchUnitState, now = new Date()): RefetchMoment[] {
-  if (!ENDED_RE.test(after.status_key.trim())) return [];
-  if (!unitWasInvoiced(after)) return [];
-  const cod = isCashOnDelivery(after);
-  const out: RefetchMoment[] = [];
-  const endedBefore = before ? ENDED_RE.test(String(before.status_key || "").trim()) : false;
-  if (!endedBefore) {
-    const reason: RefetchReason = /^returned$/i.test(after.status_key.trim()) ? "returned" : "cancelled";
-    const at = asDate(after.cancelled_date);
-    out.push({ reason, event_at: at && at.getTime() <= now.getTime() ? at : now, cod });
-  }
-  const refundAt = refundCompletedAt(after, now);
-  if (refundAt) out.push({ reason: "refund", event_at: refundAt, cod });
-  return out;
-}
+// The detection itself — the late-document moments a unit shows, and the helpers it is made of — lives in
+// orderUnitEvents.ts (data-quality X6: ONE detection, which recordUnitChanges runs on every read of the update worker
+// and which the first store of a bundle runs below). Re-exported here under the names this module has always had.
+export {
+  REFETCH_UNIT_FIELDS,
+  isCashOnDelivery,
+  lateDocumentMoments as refetchEventsOf,
+  refetchStateOf,
+  refundCompletedAt,
+  unitWasInvoiced,
+  type RefetchMoment,
+  type RefetchUnitState,
+} from "./orderUnitEvents.js";
 
 const oid = (id: unknown) => (id instanceof Types.ObjectId ? id : new Types.ObjectId(String(id)));
 const firstLine = (err: unknown) => (err instanceof Error ? err.message : String(err)).split("\n")[0].slice(0, 200);
@@ -202,35 +105,30 @@ export async function noteInvoiceRefetch(input: { userId: unknown; orderId: stri
 }
 
 /** Note every moment of one unit state; never throws (a unit's read must not fail on this). Returns the reasons noted. */
-async function noteState(userId: unknown, before: Pick<RefetchUnitState, "status_key"> | null, state: RefetchUnitState, by: string, now: Date): Promise<RefetchReason[]> {
-  const noted: RefetchReason[] = [];
-  for (const moment of refetchEventsOf(before, state, now)) {
-    if (await noteInvoiceRefetch({ userId, orderId: state.order_id, unitId: state.unit_id, moment, by, now })) noted.push(moment.reason);
-  }
-  return noted;
+async function noteState(userId: unknown, before: Partial<RefetchUnitState> | null, state: RefetchUnitState, by: string, now: Date): Promise<RefetchReason[]> {
+  return noteLateDocuments(userId, { orderId: state.order_id, unitId: state.unit_id }, lateDocumentMoments(before, state, now), by, now);
 }
 
 /**
- * (update worker) After a unit was read: note its late-document moments. Costs nothing for a unit that is not
- * Cancelled / Returned now (one read of the unit otherwise). Never throws.
+ * (update worker) Note the late-document moments recordUnitChanges detected on a read (`changes.lateDocuments`, the one
+ * detection — a quiet run hands over none). Costs nothing when there is none. Never throws. Returns the reasons noted.
  */
-export async function noteLateDocumentsAfterRead(
+export async function noteLateDocuments(
   userId: unknown,
-  unitId: string,
-  statuses: { before?: string | null; after?: string | null },
+  unit: { orderId: string; unitId: string },
+  moments: RefetchMoment[],
   by: string,
   now = new Date()
 ): Promise<RefetchReason[]> {
-  if (!ENDED_RE.test(String(statuses.after || "").trim())) return [];
-  try {
-    const row = await Order.findOne({ userId: oid(userId), unit_id: unitId }).select(REFETCH_UNIT_FIELDS).lean();
-    if (!row) return [];
-    const before = statuses.before === undefined ? null : { status_key: String(statuses.before || "") };
-    return await noteState(userId, before, refetchStateOf(row as Record<string, unknown>), by, now);
-  } catch (err) {
-    console.warn(`[invoice-refetch] ${unitId}: late re-download not noted — ${firstLine(err)}`);
-    return [];
+  const noted: RefetchReason[] = [];
+  for (const moment of moments) {
+    try {
+      if (await noteInvoiceRefetch({ userId, orderId: unit.orderId, unitId: unit.unitId, moment, by, now })) noted.push(moment.reason);
+    } catch (err) {
+      console.warn(`[invoice-refetch] ${unit.unitId}: late re-download (${moment.reason}) not noted — ${firstLine(err)}`);
+    }
   }
+  return noted;
 }
 
 /**
@@ -239,7 +137,7 @@ export async function noteLateDocumentsAfterRead(
  */
 export async function noteLateDocumentsForOrder(userId: unknown, orderId: string, by: string, now = new Date()): Promise<RefetchReason[]> {
   try {
-    const rows = await Order.find({ userId: oid(userId), order_id: orderId, status_key: ENDED_RE }).select(REFETCH_UNIT_FIELDS).lean();
+    const rows = (await Order.find({ userId: oid(userId), order_id: orderId, status_key: /^(cancelled|canceled|returned)$/i }).select(REFETCH_UNIT_FIELDS).lean()).filter((r) => isEndedStatus(r.status_key));
     const noted: RefetchReason[] = [];
     for (const row of rows) noted.push(...(await noteState(userId, null, refetchStateOf(row as Record<string, unknown>), by, now)));
     return noted;

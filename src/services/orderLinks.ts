@@ -1,3 +1,4 @@
+import { CheckoutBatch } from "../models/CheckoutBatch.js";
 import { CheckoutJob } from "../models/CheckoutJob.js";
 import type { JobResultSnapshot } from "../types.js";
 import { jobClassFor } from "./jobClass.js";
@@ -69,6 +70,30 @@ export interface OrderCardFields {
   payment_fee: string;
   payment_fee_details: string;
   cash_on_delivery: boolean;
+  /** Who started the batch that placed the order (CheckoutBatch.createdBy, the dashboard's x-requested-by) — U6. */
+  created_by: string;
+}
+
+/** createdBy per batchId, kept 10 minutes: a 1,000-unit update of one batch's orders reads its batch once. */
+const BATCH_CREATOR_TTL_MS = 10 * 60 * 1000;
+const batchCreators = new Map<string, { value: string; at: number }>();
+
+/** The batch's createdBy ("" when the batch has none or is not found), cached per batchId for 10 minutes. */
+export async function batchCreatorOf(batchId: unknown, now = Date.now()): Promise<string> {
+  const id = String(batchId || "").trim();
+  if (!id) return "";
+  const hit = batchCreators.get(id);
+  if (hit && now - hit.at < BATCH_CREATOR_TTL_MS) return hit.value;
+  const row = await CheckoutBatch.findOne({ batchId: id }).select("createdBy").lean();
+  const value = String(row?.createdBy || "").trim();
+  batchCreators.set(id, { value, at: now });
+  if (batchCreators.size > 2000) for (const [k, v] of batchCreators) if (now - v.at >= BATCH_CREATOR_TTL_MS) batchCreators.delete(k);
+  return value;
+}
+
+/** For checks: forget the cached creators. */
+export function forgetBatchCreators(): void {
+  batchCreators.clear();
 }
 
 /**
@@ -82,6 +107,10 @@ export interface OrderCardFields {
  * order page is the other source of it, and a card job has nothing to add there.
  * Spread after the fetched fields, so a COD order reads as COD before Flipkart's
  * page or API says so.
+ *
+ * created_by (U6): the name of whoever started the job's batch, only when the
+ * batch has one — the dashboard sends it since 2026-11-26, so past orders keep
+ * "" (nothing is invented). A failed batch read leaves it out.
  */
 export async function cardFieldsFor(userId: string, email: string, orderId: string): Promise<Partial<OrderCardFields>> {
   const id = String(orderId || "").toUpperCase();
@@ -90,10 +119,12 @@ export async function cardFieldsFor(userId: string, email: string, orderId: stri
     .sort({ completedAt: -1 })
     .select(
       "result.cardName result.parentCardLast4 result.childCardLast4 result.cardLast4 " +
-        "result.transactionAmount result.paymentFee result.paymentFeeDetails request.cards request.paymentMode"
+        "result.transactionAmount result.paymentFee result.paymentFeeDetails request.cards request.paymentMode batchId"
     )
     .lean();
   if (!job) return {};
+  const createdBy = await batchCreatorOf((job as { batchId?: unknown }).batchId).catch(() => "");
+  const creator = createdBy ? { created_by: createdBy } : {};
   const r = (job.result || {}) as Partial<JobResultSnapshot>;
   // A job with an order id was paid, so it is one or the other; without an
   // authType jobClassFor never answers "otp-phone".
@@ -108,7 +139,7 @@ export async function cardFieldsFor(userId: string, email: string, orderId: stri
   if (mode === "cod") {
     // No card, so no card columns — written empty rather than left out, the
     // same as a card job whose numbers did not match.
-    return { card_name: "", parent_card_number: "", card_number: "", is_bae_order: true, ...payment };
+    return { card_name: "", parent_card_number: "", card_number: "", is_bae_order: true, ...payment, ...creator };
   }
   const cards = job.request?.cards || [];
   const last4 = (v: unknown) => String(v || "").replace(/\D/g, "").slice(-4);
@@ -122,5 +153,6 @@ export async function cardFieldsFor(userId: string, email: string, orderId: stri
     card_number: String(byChild?.cardNumberMasked || (childLast4 ? `XXXXXXXXXXXX${childLast4}` : "")),
     is_bae_order: true,
     ...payment,
+    ...creator,
   };
 }

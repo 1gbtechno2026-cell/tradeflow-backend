@@ -14,7 +14,7 @@ import {
   restoreFlipkartSession,
   sleep,
 } from "./browser.js";
-import { inProgressUpdateFilter, terminalStatusFilter } from "./orderLifecycle.js";
+import { inProgressUpdateFilter, refundWatchFilter, terminalStatusFilter } from "./orderLifecycle.js";
 import { assertIdleForUpdate, markUpdateRunning } from "./orderSyncLock.js";
 import {
   apiScrapeAndSave,
@@ -71,6 +71,11 @@ export interface UpdateTriggerInput {
    * 6 h / 2 h schedules do not and keep the rule they always had.
    */
   withReturned?: boolean;
+  /**
+   * With no status named: also take the cancelled units of the refund watch (orderLifecycle.ts refundWatchFilter,
+   * data-quality U12 + X5). Only the 6-hour active sweep asks for it (runUpdateSweep "active").
+   */
+  withRefundWatch?: boolean;
 }
 
 export type UpdateTarget = {
@@ -284,7 +289,10 @@ export async function resolveTargets(userId: string, input: UpdateTriggerInput):
   const conditions = input.statusConditions || [];
   if (conditions.length) query.$or = [...(statuses.length ? [{ status_key: { $in: statuses } }] : []), ...conditions];
   else if (statuses.length) query.status_key = { $in: statuses };
-  else Object.assign(query, input.withReturned ? inProgressUpdateFilter() : terminalStatusFilter());
+  else {
+    const unfinished = input.withReturned ? inProgressUpdateFilter() : terminalStatusFilter();
+    query.$or = input.withRefundWatch ? [...unfinished.$or, ...refundWatchFilter().$or] : unfinished.$or;
+  }
 
   // Only what a target is made of: a status like Delivered matches thousands of units.
   const units = await Order.find(query).select("platform_email order_id item_id unit_id order_url").lean();

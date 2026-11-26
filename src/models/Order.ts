@@ -107,6 +107,9 @@ export interface IOrder {
   /** Where card_name / card_number came from: "checkout" (our job), "flipkart_refund" (Flipkart's refund sentence,
    *  orders no job of ours placed — decision 6), "" unknown / none. */
   card_source: string;
+  /** Who started the checkout batch that placed this order (data-quality U6): the dashboard user's name, sent as
+   *  x-requested-by and kept on the batch (CheckoutBatch.createdBy). From 2026-11 on; past orders stay "". */
+  created_by: string;
   cancelled_date: Date | null;
   cancelled_from_bae: boolean;
   cancelled_by_user: boolean;
@@ -237,6 +240,7 @@ const OrderSchema = new Schema<IOrder>(
     refund_date: { type: Date, default: null },
     refund_kind: { type: String, default: null },
     card_source: { type: String, default: "" },
+    created_by: { type: String, default: "" },
     cancelled_date: { type: Date, default: null },
     cancelled_from_bae: { type: Boolean, default: false },
     cancelled_by_user: { type: Boolean, default: false },

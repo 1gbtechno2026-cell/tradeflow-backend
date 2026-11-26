@@ -108,16 +108,21 @@ dated the day of a cancellation, and a freight credit note (with a new freight i
   shipped / out for delivery / delivery attempted, unsuccessful, rescheduled / delivered, or Flipkart's
   `invoice_eligible`. *cancelled* / *returned* when the unit turns Cancelled / Returned (not at "Cancellation
   requested"), at `cancelled_date`; *refund* when the refund completed — `refund_status` /complet/ (sub-step 9's
-  mapper) or a DONE Refund stage on the tracking (what is stored today), at the stage's date (a date ahead of now
-  counts as now; Flipkart dates some DONE stages ahead).
-- **Who notes.** The update worker after every unit it reads (`orderUpdateQueue.ts`, phase 1 and the page
-  phase, next to `noteDeliveredOrder`; costs nothing for a unit that is not Cancelled / Returned, one read
-  otherwise; never fails the unit) — the transition the update sees today. The store helper at a bundle's first
-  capture (`registerInvoice` reports `captured`), for units that ended before the bundle existed. Sub-step 10
-  brings the shared detection (X6: a `refund_completed` event, quiet runs that note nothing — the forced refresh)
-  and the refund watch (X5) that makes the 6-hourly sweep read cancelled units at all; both call
-  `noteLateDocumentsAfterRead` / `noteInvoiceRefetch`. Until then a refund on a Cancelled unit is seen when an
-  update reads that unit (by order id, CSV, status).
+  mapper) when the unit carries a refund status, else a DONE Refund stage on the tracking (what is stored today), at
+  the stage's date (a date ahead of now counts as now; Flipkart dates some DONE stages ahead). Since sub-step 10 the
+  status wins over the stage (15 traced cancelled units show a DONE Refund stage while the card still reads
+  "Processed"), and the refund counts as a moment only when it was not completed before the read (a unit stored
+  without a refund status counts as not completed, so its first refund-card read is the moment). The page path's bare
+  marker `refund_status: "refund"` counts as no status, so its DONE stage decides (`refundStatusOf`).
+- **Who detects, who notes (sub-step 10, X6).** ONE detection, `lateDocumentMoments` in `orderUnitEvents.ts`
+  (re-exported here as `refetchEventsOf`). The update worker's `recordUnitChanges` runs it on the before / after
+  snapshots of every unit it reads and hands the moments over as `changes.lateDocuments` (none in a quiet run — the
+  forced refresh); `orderUpdateQueue.ts` (phase 1 and the page phase, next to `noteDeliveredOrder`) passes them to
+  `noteLateDocuments`, which only notes (`noteInvoiceRefetch`; never fails the unit; costs nothing when there is no
+  moment). The store helper at a bundle's first capture (`registerInvoice` reports `captured`) runs the same
+  detection on the order's ended units (`noteLateDocumentsForOrder`), for units that ended before the bundle
+  existed. The refund watch (X5, `orderLifecycle.ts refundWatchFilter`) makes the 6-hourly sweep read cancelled units
+  at all; `noteLateDocumentsAfterRead` (a second read of the unit with only its statuses) is gone.
 - **The delays** are owner question 4, still open; the plan's recommendation is the default, each an `.env`
   setting (`.env.example`): `INVOICE_REFETCH_CANCEL_DELAY_H=24` (the cancellation / return look, 1 day),
   `INVOICE_REFETCH_REFUND_DELAY_H=192` (the refund look, 8 days), `INVOICE_REFETCH_COD_DELAY_H=192` (cash on
@@ -277,6 +282,6 @@ defaults whatever a Mac's `.env` sets.
 `npm run test:invoice-batch` now also asserts that the batch stores with path `batch`, its request id and no
 `skipIfUnchanged`, and that a store failure of our own carrying `ECONNRESET` ends `internal_error`.
 
-Not covered by a check: the update worker's two call sites of `noteLateDocumentsAfterRead` inside
-`runOrderUpdateJob` (the function itself is checked directly), and the spec's `schedule_active` selection case,
-which belongs to sub-step 10's X5 refund watch.
+The update worker's path is checked as the worker runs it (`snapshotUnit` → `recordUnitChanges` →
+`noteLateDocuments`, a quiet read noting nothing) in `test:invoice-refetch`; the `schedule_active` selection (the
+refund watch, X5) in `test:unit-save` (sub-step 10, `docs/unit-saving-events.md`).

@@ -18,6 +18,25 @@ import { containsRegex, listParam, paginationMeta, parseDateRange, parsePaginati
 import type { AuthType } from "../paymentStrategies/types.js";
 import type { AddressDetails, JobRequestSnapshot, JobResultSnapshot } from "../types.js";
 
+/**
+ * The batch's creator from the dashboard's `x-requested-by` header (data-quality U6): the signed-in user's name. The
+ * dashboard percent-encodes it (a header carries Latin-1 only); a plain name passes as it is. Trimmed, at most 120
+ * characters; "" when absent.
+ */
+export function requestedByHeader(raw: unknown): string {
+  const text = String(Array.isArray(raw) ? raw[0] ?? "" : raw ?? "").trim();
+  if (!text) return "";
+  let name = text;
+  if (/%[0-9a-f]{2}/i.test(text)) {
+    try {
+      name = decodeURIComponent(text);
+    } catch {
+      name = text;
+    }
+  }
+  return name.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 120);
+}
+
 export const jobsRouter = Router();
 
 function publicJob(job: {
@@ -264,7 +283,7 @@ jobsRouter.post("/", async (req, res) => {
         totalAttempts: effectiveAttempts,
         productUrl: data.productUrl,
         paymentMode: data.paymentMode || "",
-        createdBy: String(req.header("x-requested-by") || ""),
+        createdBy: requestedByHeader(req.header("x-requested-by")),
       });
     }
 

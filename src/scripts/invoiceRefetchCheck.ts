@@ -84,6 +84,8 @@ async function main() {
   const capture = await import("../services/invoiceCapture.js");
   const originals = await import("../services/invoiceOriginals.js");
   const refetch = await import("../services/invoiceRefetch.js");
+  const events = await import("../services/orderUnitEvents.js");
+  const { OrderUnitEvent } = await import("../models/OrderUnitEvent.js");
   const sweep = await import("../services/invoiceSweep.js");
   const backfill = await import("./invoiceOriginalsBackfill.js");
   type DownloadFn = NonNullable<Parameters<typeof sweep.runInvoiceSweep>[1]>["download"];
@@ -216,17 +218,35 @@ async function main() {
       assert.equal(await refetch.noteInvoiceRefetch({ userId: wsNote, orderId: order(99), unitId: "U1", moment, by: "verify" }), false);
     });
 
-    await check("the update worker's call (noteLateDocumentsAfterRead): an unended unit costs no read and notes nothing; Shipped → Cancelled notes once; a repeat read notes nothing; a later DONE Refund stage notes 'refund'", async () => {
+    await check("the update worker's path (snapshotUnit → recordUnitChanges, the ONE detection → noteLateDocuments): an unended unit notes nothing; Shipped → Cancelled notes once; a repeat read notes nothing; a later DONE Refund stage notes 'refund'; a quiet read (the forced refresh) notes nothing", async () => {
       const o = order(2);
       await insertInvoice(wsNote, o);
-      const [u] = await insertUnits(wsNote, o, [{ status_key: "Cancelled", order_status_pre_cancellation: "Shipped", cancelled_date: ago(3 * H), payment_mode: "", invoice_s3_key: capture.rawInvoiceKey(String(wsNote), o) }]);
-      assert.deepEqual(await refetch.noteLateDocumentsAfterRead(wsNote, `${o}-nothing`, { before: "Approved", after: "Shipped" }, "verify"), []);
-      assert.deepEqual(await refetch.noteLateDocumentsAfterRead(wsNote, u, { before: "Shipped", after: "Cancelled" }, "update verify"), ["cancelled"]);
-      assert.deepEqual(await refetch.noteLateDocumentsAfterRead(wsNote, u, { before: "Cancelled", after: "Cancelled" }, "update verify"), []);
-      await Order.collection.updateOne({ userId: wsNote, unit_id: u }, { $set: { tracking: [{ status: "Refund", stage: "DONE", date: ago(H).toISOString(), detailed_steps: [] }] } });
-      assert.deepEqual(await refetch.noteLateDocumentsAfterRead(wsNote, u, { before: "Cancelled", after: "Cancelled" }, "update verify"), ["refund"]);
+      const [u] = await insertUnits(wsNote, o, [{ status_key: "Shipped", order_status_pre_cancellation: null, cancelled_date: null, payment_mode: "", invoice_s3_key: capture.rawInvoiceKey(String(wsNote), o) }]);
+      // The worker's own sequence: a snapshot, the save (here a direct write), a snapshot, recordUnitChanges, the noting.
+      const read = async (set: Record<string, unknown>, quiet = false) => {
+        const before = await events.snapshotUnit(wsNote, u);
+        await Order.collection.updateOne({ userId: wsNote, unit_id: u }, { $set: set });
+        const after = await events.snapshotUnit(wsNote, u);
+        const changes = await events.recordUnitChanges(wsNote, u, before, after, "verify-request", { quiet });
+        return refetch.noteLateDocuments(wsNote, { orderId: o, unitId: u }, changes.lateDocuments, "update verify");
+      };
+      assert.deepEqual(await read({ status_key: "Shipped" }), [], "not ended: nothing");
+      assert.deepEqual(await read({ status_key: "Cancelled", order_status_pre_cancellation: "Shipped", cancelled_date: ago(3 * H) }), ["cancelled"]);
+      assert.deepEqual(await read({}), [], "read again: nothing new");
+      assert.deepEqual(await read({ tracking: [{ status: "Refund", stage: "DONE", date: ago(H).toISOString(), detailed_steps: [] }] }), ["refund"]);
       const row = await rowOf(wsNote, o);
       assert.deepEqual(row!.refetch!.map((e) => `${e.reason}:${e.by}`), ["cancelled:update verify", "refund:update verify"]);
+      // Quiet: another invented unit of another order, cancelled and refunded in one quiet read — no entry.
+      const q = order(5);
+      await insertInvoice(wsNote, q);
+      const [qu] = await insertUnits(wsNote, q, [{ status_key: "Shipped", payment_mode: "", invoice_s3_key: capture.rawInvoiceKey(String(wsNote), q) }]);
+      const before = await events.snapshotUnit(wsNote, qu);
+      await Order.collection.updateOne({ userId: wsNote, unit_id: qu }, { $set: { status_key: "Cancelled", order_status_pre_cancellation: "Shipped", cancelled_date: ago(3 * H), refund_status: "Completed" } });
+      const changes = await events.recordUnitChanges(wsNote, qu, before, await events.snapshotUnit(wsNote, qu), "verify-request", { quiet: true });
+      assert.deepEqual(changes.lateDocuments, [], "a quiet read hands over no moment");
+      assert.equal(changes.refundCompleted, true, "the refund is still recorded (quietly)");
+      assert.deepEqual(await refetch.noteLateDocuments(wsNote, { orderId: q, unitId: qu }, changes.lateDocuments, "update verify"), []);
+      assert.equal((await rowOf(wsNote, q))!.refetch, undefined, "no entry on the quiet unit's bundle");
     });
 
     await check("a cash-on-delivery unit as the order API stores it (cash_on_delivery true, no top-level payment_mode, api_extra.payment_mode 'Cash On Delivery') is noted cod:true, due 8 days after the cancellation — not the prepaid 1 day", async () => {
@@ -234,7 +254,8 @@ async function main() {
       await insertInvoice(wsNote, o);
       const cancelledAt = ago(3 * H);
       const [u] = await insertUnits(wsNote, o, [{ status_key: "Cancelled", order_status_pre_cancellation: "Shipped", cancelled_date: cancelledAt, cash_on_delivery: true, api_extra: { payment_mode: "Cash On Delivery" }, invoice_s3_key: capture.rawInvoiceKey(String(wsNote), o) }]);
-      assert.deepEqual(await refetch.noteLateDocumentsAfterRead(wsNote, u, { before: "Shipped", after: "Cancelled" }, "update verify"), ["cancelled"]);
+      const moments = refetch.refetchEventsOf({ status_key: "Shipped" }, refetch.refetchStateOf((await Order.collection.findOne({ userId: wsNote, unit_id: u })) as Record<string, unknown>));
+      assert.deepEqual(await refetch.noteLateDocuments(wsNote, { orderId: o, unitId: u }, moments, "update verify"), ["cancelled"]);
       const e = (await rowOf(wsNote, o))!.refetch![0];
       assert.equal(e.cod, true);
       assert.equal(new Date(e.due_at as Date).getTime(), cancelledAt.getTime() + 192 * H);
@@ -500,6 +521,7 @@ async function main() {
       removed += (await InvoiceDownload.collection.deleteMany({ userId: ws })).deletedCount;
       removed += (await Order.collection.deleteMany({ userId: ws })).deletedCount;
       removed += (await OrderInvoiceRequest.collection.deleteMany({ userId: ws })).deletedCount;
+      removed += (await OrderUnitEvent.collection.deleteMany({ userId: ws })).deletedCount;
     }
     let left = 0;
     for (const ws of workspaces) {
@@ -507,10 +529,11 @@ async function main() {
       left += await InvoiceDownload.collection.countDocuments({ userId: ws });
       left += await Order.collection.countDocuments({ userId: ws });
       left += await OrderInvoiceRequest.collection.countDocuments({ userId: ws });
+      left += await OrderUnitEvent.collection.countDocuments({ userId: ws });
     }
     left += await Invoice.collection.countDocuments({ order_id: { $regex: `^ODREFETCH${tag}` } });
     left += await Order.collection.countDocuments({ order_id: { $regex: `^ODREFETCH${tag}` } });
-    console.log(`\ncleanup: ${removed} invented row(s) deleted (invoices, invoice_downloads, order_details, order_invoice_requests of ${workspaces.length} invented workspaces) — ${left} left; in-memory S3 held ${s3.objects.size} object(s), real S3 untouched`);
+    console.log(`\ncleanup: ${removed} invented row(s) deleted (invoices, invoice_downloads, order_details, order_invoice_requests, order_unit_events of ${workspaces.length} invented workspaces) — ${left} left; in-memory S3 held ${s3.objects.size} object(s), real S3 untouched`);
     if (left) failures.push("cleanup left rows behind");
     await mongoose.disconnect();
   }

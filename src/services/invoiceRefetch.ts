@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { Invoice, type IInvoiceRefetch, type RefetchReason, type RefetchResult } from "../models/Invoice.js";
 import { Order } from "../models/Order.js";
 import type { OrderDownloadResult, downloadInvoicesByOrderId } from "./invoiceOnDemand.js";
+import { getInvoiceSettings, invoiceSettingsFromEnv, type EffectiveInvoiceSettings } from "./invoiceSettings.js";
 import { isEndedStatus, lateDocumentMoments, REFETCH_UNIT_FIELDS, refetchStateOf, type RefetchMoment, type RefetchUnitState } from "./orderUnitEvents.js";
 
 /**
@@ -24,38 +25,32 @@ import { isEndedStatus, lateDocumentMoments, REFETCH_UNIT_FIELDS, refetchStateOf
  *          processed bundle are not re-uploaded); a success closes every due entry of the order, a failure counts
  *          an attempt and the entry gives up at 3. `settled` is left as it is.
  *
- * The delays are owner question 4, still open — the plan's recommendation is the default, each an .env setting:
- *   INVOICE_REFETCH_CANCEL_DELAY_H  24   the cancellation (or return) look, 1 day after it — product / fee credit notes
- *   INVOICE_REFETCH_REFUND_DELAY_H  192  the refund look, 8 days after the refund — the freight credit note
- *   INVOICE_REFETCH_COD_DELAY_H     192  cash on delivery (no refund follows): the cancellation look waits 8 days
+ * The delays — the plan's recommendation is the default — are invoice settings (Settings → Invoice settings, the
+ * `invoice_settings` document; a field not saved there follows the .env, then the default; services/invoiceSettings.ts):
+ *   refetchCancelDelayH  INVOICE_REFETCH_CANCEL_DELAY_H  24   the cancellation (or return) look, 1 day after it — product / fee credit notes
+ *   refetchRefundDelayH  INVOICE_REFETCH_REFUND_DELAY_H  192  the refund look, 8 days after the refund — the freight credit note
+ *   refetchCodDelayH     INVOICE_REFETCH_COD_DELAY_H     192  cash on delivery (no refund follows): the cancellation look waits 8 days
+ * An entry's due_at is fixed when it is noted: a changed delay applies to entries noted after the change.
  *
  * The moments come from the ONE detection in orderUnitEvents.ts (sub-step 10, X6): the update worker's
  * recordUnitChanges hands them over (`changes.lateDocuments`, none in a quiet run) and noteLateDocuments notes them;
  * the first store of a bundle runs the same detection on its units (noteLateDocumentsForOrder).
  */
 
-const DAY_H = 24;
 const CLAIM_MS = 20 * 60_000;
 export const REFETCH_MAX_ATTEMPTS = 3;
 
-const hours = (name: string, fallback: number) => {
-  const raw = String(process.env[name] ?? "").trim();
-  const n = raw === "" ? NaN : Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : fallback;
-};
-
-/** The three delays, read at call time (hours). */
-export function refetchDelaysH(): { cancel: number; refund: number; cod: number } {
-  return {
-    cancel: hours("INVOICE_REFETCH_CANCEL_DELAY_H", 1 * DAY_H),
-    refund: hours("INVOICE_REFETCH_REFUND_DELAY_H", 8 * DAY_H),
-    cod: hours("INVOICE_REFETCH_COD_DELAY_H", 8 * DAY_H),
-  };
+/**
+ * The three delays (hours), from the invoice settings (services/invoiceSettings.ts: Settings → Invoice settings, else
+ * the .env, else 24 / 192 / 192). Without `settings`: the .env and the defaults, read at call time.
+ */
+export function refetchDelaysH(settings: EffectiveInvoiceSettings = invoiceSettingsFromEnv()): { cancel: number; refund: number; cod: number } {
+  return { cancel: settings.refetchCancelDelayH, refund: settings.refetchRefundDelayH, cod: settings.refetchCodDelayH };
 }
 
 /** due_at of an entry: the event plus the reason's delay (a cash-on-delivery cancellation / return waits the COD delay). */
-export function refetchDueAt(reason: RefetchReason, eventAt: Date, cod: boolean): Date {
-  const d = refetchDelaysH();
+export function refetchDueAt(reason: RefetchReason, eventAt: Date, cod: boolean, settings?: EffectiveInvoiceSettings): Date {
+  const d = refetchDelaysH(settings);
   const h = reason === "refund" ? d.refund : cod ? d.cod : d.cancel;
   return new Date(eventAt.getTime() + h * 3_600_000);
 }
@@ -84,11 +79,12 @@ const firstLine = (err: unknown) => (err instanceof Error ? err.message : String
  */
 export async function noteInvoiceRefetch(input: { userId: unknown; orderId: string; unitId: string; moment: RefetchMoment; by: string; now?: Date }): Promise<boolean> {
   const now = input.now || new Date();
+  const settings = (await getInvoiceSettings(input.userId)).effective;
   const entry: IInvoiceRefetch = {
     unit_id: input.unitId,
     reason: input.moment.reason,
     event_at: input.moment.event_at,
-    due_at: refetchDueAt(input.moment.reason, input.moment.event_at, input.moment.cod),
+    due_at: refetchDueAt(input.moment.reason, input.moment.event_at, input.moment.cod, settings),
     noted_at: now,
     by: input.by,
     cod: input.moment.cod,

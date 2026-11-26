@@ -10,6 +10,7 @@ import { rescheduleConcurrency, runRescheduleJob, startRescheduleReaper } from "
 import { runOrderSyncJob, sweepOrderSyncs } from "./services/orderSync.js";
 import { resolveUpdateWindows, retireUpdateSchedulers, runOrderUpdateJob, startUpdateReaper, updateSweepRunner } from "./services/orderUpdateQueue.js";
 import { invoiceSweepRunner, runSweepJob, type SweepJobData } from "./services/invoiceSweep.js";
+import { seedInvoiceSettingsAtStart } from "./services/invoiceSettings.js";
 import { closeInterruptedSweepRequests } from "./services/invoiceSweepRequest.js";
 import { CHAIN_AFTER_ORDER, CHAIN_DELIVERED_CHECK, CHAIN_INVOICE_SWEEP } from "./services/requestChains.js";
 import { INVOICE_BATCH_CONCURRENCY, runInvoiceBatchJob, startInvoiceRequestReaper } from "./services/invoiceRequests.js";
@@ -108,6 +109,8 @@ async function main() {
   // The schedules' switches and clocks: written once per workspace, by whichever of the API and the worker starts
   // first; nothing that exists is touched (services/scheduleSettings.ts).
   await seedSchedulesAtStart(config.userId);
+  // The invoice settings' document, likewise written once if missing (services/invoiceSettings.ts).
+  await seedInvoiceSettingsAtStart(config.userId);
 
   // Egress. In worker-lease mode a process binds one proxy for its life and,
   // in `required` mode, must not take a job without one. In session-lease

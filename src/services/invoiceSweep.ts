@@ -7,6 +7,7 @@ import { OrderJobRun } from "../models/OrderJobRun.js";
 import { config } from "../config.js";
 import { getInvoiceQueue, type InvoiceJobData } from "../queue.js";
 import { invoiceSettleMs, invoiceStoreEnabled, settledByDelivery, type SettleUnit } from "./invoiceCapture.js";
+import { getInvoiceSettings, invoiceSettingsFromEnv, type EffectiveInvoiceSettings } from "./invoiceSettings.js";
 import { downloadInvoicesByOrderId, type OrderDownloadResult } from "./invoiceOnDemand.js";
 import { stopInvoiceRequest } from "./invoiceRequests.js";
 import { startRun, progressRun, finishRun } from "./orderJobRuns.js";
@@ -37,8 +38,8 @@ import { clockProcessUp, retireLegacySchedulers } from "./scheduleSettings.js";
  * (force on) to sweep the late Protect-Promise / GT parts — files equal to the
  * processed bundle's originals are not uploaded again (skipIfUnchanged) — then
  * settled by the same rule; one still on its way is looked at again a window
- * later (settleRecaptured), and settled anyway INVOICE_RECAPTURE_GIVE_UP_DAYS
- * (default 30) after its row was made.
+ * later (settleRecaptured), and settled anyway recaptureGiveUpDays (default 30)
+ * after its row was made.
  *
  * Phase 3 — REFETCH (data-quality SO-5, services/invoiceRefetch.ts): an order
  * whose `invoices` row holds a late re-download that is due (a unit cancelled,
@@ -51,9 +52,13 @@ import { clockProcessUp, retireLegacySchedulers } from "./scheduleSettings.js";
  * within 24 h, and never after 3 such failures (invoice_capture_failures /
  * invoice_capture_failed_at on its units). Our own failures (S3, Mongo — the
  * result's `ours`) and "no session" are not counted; a later capture of the
- * order clears its memory. INVOICE_CAPTURE_CANCELLED=1 (off by
- * default — owner question 5) widens phase 1 to orders cancelled after shipping
- * with no bundle, once the last cancellation is 15 days old.
+ * order clears its memory. The invoice setting captureCancelledAfterShipping
+ * (seeded ON, owner decision 2026-11-26; INVOICE_CAPTURE_CANCELLED=1 before it)
+ * widens phase 1 to orders cancelled after shipping with no bundle, once the
+ * last cancellation is 15 days old.
+ *
+ * The windows and the switch are invoice settings (services/invoiceSettings.ts:
+ * Settings → Invoice settings, else .env, else the default), read once per sweep.
  *
  * All phases reuse the proven downloadInvoicesByOrderId (resolve account →
  * session → zip-aware download → S3 → pipeline re-extract). Each phase is capped
@@ -63,22 +68,29 @@ import { clockProcessUp, retireLegacySchedulers } from "./scheduleSettings.js";
  * are excluded from phase 2 (a one-time migration settles the backfill).
  */
 
-const SETTLE_AFTER_MS = invoiceSettleMs();
 /**
- * INVOICE_RECAPTURE_GIVE_UP_DAYS (default 30), read at call time: a bundle still not final this long after its row
- * was made is settled anyway, so an order stuck "on its way" is not re-downloaded every window for ever.
+ * The invoice settings (services/invoiceSettings.ts — Settings → Invoice settings, else the .env, else the default) are
+ * read ONCE at the top of each sweep (runInvoiceSweep) and passed down, so a saved change applies from the next sweep,
+ * with no worker restart. The sync helpers below take them as an argument; without one they read the .env and the
+ * defaults at call time (as before).
  */
-export function recaptureGiveUpMs(): number {
-  const days = Number(process.env.INVOICE_RECAPTURE_GIVE_UP_DAYS);
-  return (Number.isFinite(days) && days > 0 ? days : 30) * 86_400_000;
+
+/**
+ * The invoice setting `recaptureGiveUpDays` (else INVOICE_RECAPTURE_GIVE_UP_DAYS, else 30): a bundle still not final
+ * this long after its row was made is settled anyway, so an order stuck "on its way" is not re-downloaded every window
+ * for ever.
+ */
+export function recaptureGiveUpMs(settings: EffectiveInvoiceSettings = invoiceSettingsFromEnv()): number {
+  return settings.recaptureGiveUpDays * 86_400_000;
 }
 
 /**
  * After a successful re-capture: settle each order whose units pass the delivery rule (settledByDelivery), or whose
  * row is older than recaptureGiveUpMs(); the rest get captured_at = now, so phase 2 looks again one window later.
- * Returns how many were settled.
+ * Returns how many were settled. `settings`: the sweep's; without, the workspace's are read.
  */
-export async function settleRecaptured(userId: string, orderIds: string[], now = new Date()): Promise<number> {
+export async function settleRecaptured(userId: string, orderIds: string[], now = new Date(), settings?: EffectiveInvoiceSettings): Promise<number> {
+  const s = settings || (await getInvoiceSettings(userId)).effective;
   const units = await Order.find({ userId, order_id: { $in: orderIds } }).select("order_id status_key actual_delivery_date cancelled_date").lean();
   const byOrder = new Map<string, SettleUnit[]>();
   for (const u of units) {
@@ -87,9 +99,10 @@ export async function settleRecaptured(userId: string, orderIds: string[], now =
     byOrder.set(String(u.order_id), list);
   }
   const rows = await Invoice.find({ userId, order_id: { $in: orderIds } }).select("order_id createdAt").lean();
-  const giveUpMs = recaptureGiveUpMs();
+  const giveUpMs = recaptureGiveUpMs(s);
+  const settleMs = invoiceSettleMs(s);
   const old = new Set(rows.filter((r) => r.createdAt && now.getTime() - new Date(r.createdAt).getTime() > giveUpMs).map((r) => String(r.order_id)));
-  const final = orderIds.filter((o) => old.has(o) || settledByDelivery(byOrder.get(o) || [], now, SETTLE_AFTER_MS));
+  const final = orderIds.filter((o) => old.has(o) || settledByDelivery(byOrder.get(o) || [], now, settleMs));
   const open = orderIds.filter((o) => !final.includes(o));
   let settled = 0;
   if (final.length) settled = (await Invoice.updateMany({ userId, order_id: { $in: final } }, { $set: { settled: true, captured_at: now } })).modifiedCount || final.length;
@@ -106,9 +119,13 @@ export interface InvoiceSweepResult {
 
 // ── phase 1's selection (SO-6) ───────────────────────────────────────────────
 
-/** SO-6 switch, read at call time: 1 = phase 1 also captures orders cancelled after shipping. Default 0 (owner question 5). */
-export function captureCancelledEnabled(): boolean {
-  return String(process.env.INVOICE_CAPTURE_CANCELLED ?? "0").trim() === "1";
+/**
+ * SO-6 switch — the invoice setting `captureCancelledAfterShipping` ("Download invoices of orders cancelled after
+ * shipping", seeded ON — owner decision 2026-11-26; else INVOICE_CAPTURE_CANCELLED=1, else off): phase 1 also captures
+ * orders cancelled after shipping. Without `settings`: the .env and the default, read at call time.
+ */
+export function captureCancelledEnabled(settings: EffectiveInvoiceSettings = invoiceSettingsFromEnv()): boolean {
+  return settings.captureCancelledAfterShipping;
 }
 /** Every credit note measured arrived within 14 days of the cancellation: one download at 15 days is final. */
 export const CAPTURE_CANCELLED_AFTER_DAYS = 15;
@@ -128,7 +145,7 @@ async function captureHeldBack(userId: string, now: Date): Promise<string[]> {
 }
 
 /**
- * SO-6 (only with INVOICE_CAPTURE_CANCELLED=1): orders with no bundle whose units ended after shipping — Cancelled
+ * SO-6 (only with captureCancelledAfterShipping on): orders with no bundle whose units ended after shipping — Cancelled
  * with a pre-cancellation status of shipped / out for delivery / delivery attempted…, or Flipkart's
  * invoice_eligible, or Returned — every unit finished, and the last cancellation at least 15 days old.
  */
@@ -156,12 +173,15 @@ export async function cancelledAfterShippingOrders(userId: string, now: Date, ex
   return seeds.filter((o) => !out.has(o));
 }
 
-/** Phase 1's orders: delivered with no bundle (as always), plus SO-6's when switched on — minus the failure memory's. */
+/**
+ * Phase 1's orders: delivered with no bundle (as always), plus SO-6's when switched on — minus the failure memory's.
+ * `captureCancelled`: the sweep's setting; without, the workspace's invoice settings are read.
+ */
 export async function captureCandidates(userId: string, opts: { now?: Date; cap: number; captureCancelled?: boolean }): Promise<{ orderIds: string[]; delivered: number; cancelled: number; heldBack: number }> {
   const now = opts.now || new Date();
   const held = await captureHeldBack(userId, now);
   const delivered = (await Order.distinct("order_id", { userId, status_key: /deliver/i, ...noKey, ...(held.length ? { order_id: { $nin: held } } : {}) })) as string[];
-  const cancelled = (opts.captureCancelled ?? captureCancelledEnabled()) ? await cancelledAfterShippingOrders(userId, now, [...held, ...delivered]) : [];
+  const cancelled = (opts.captureCancelled ?? captureCancelledEnabled((await getInvoiceSettings(userId)).effective)) ? await cancelledAfterShippingOrders(userId, now, [...held, ...delivered]) : [];
   const orderIds = [...delivered, ...cancelled].slice(0, opts.cap);
   return { orderIds, delivered: delivered.length, cancelled: cancelled.length, heldBack: held.length };
 }
@@ -220,8 +240,12 @@ export async function runInvoiceSweep(
     return out;
   }
 
+  // The invoice settings, once per sweep: a change saved in the dashboard applies from the next sweep.
+  const settings = (await getInvoiceSettings(userId)).effective;
+  const settleMs = invoiceSettleMs(settings);
+
   // Phase 1 — capture delivered orders with no invoice yet (and, switched on, orders cancelled after shipping).
-  const missing = (await captureCandidates(userId, { now, cap })).orderIds;
+  const missing = (await captureCandidates(userId, { now, cap, captureCancelled: captureCancelledEnabled(settings) })).orderIds;
   out.phase1.candidates = missing.length;
   if (missing.length && !opts.cancelled?.()) {
     await opts.onPhase?.("capture", missing);
@@ -236,9 +260,9 @@ export async function runInvoiceSweep(
     // captured_at and settled are registerInvoice's now (T2): set on the first capture, settled by the delivery rule.
   }
 
-  // Phase 2 — re-capture once, SETTLE_AFTER_MS after capture #1, then settle.
+  // Phase 2 — re-capture once, the settle window after capture #1, then settle.
   const due = (
-    await Invoice.find({ userId, settled: false, captured_at: { $ne: null, $lte: new Date(now.getTime() - SETTLE_AFTER_MS) } })
+    await Invoice.find({ userId, settled: false, captured_at: { $ne: null, $lte: new Date(now.getTime() - settleMs) } })
       .select("order_id")
       .limit(cap)
       .lean()
@@ -254,7 +278,7 @@ export async function runInvoiceSweep(
     // Settle by the delivery rule (T2): an order delivered more than the window ago is final; one still on its way
     // (fetched before delivery) is looked at again one window later, and settled anyway recaptureGiveUpMs() after
     // its row was made. Failures are left for the next sweep.
-    if (ok.length) out.phase2.settled = await settleRecaptured(userId, ok, now);
+    if (ok.length) out.phase2.settled = await settleRecaptured(userId, ok, now, settings);
   }
 
   // Phase 3 — late re-downloads that are due (SO-5). `settled` is left as it is.

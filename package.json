@@ -40,6 +40,7 @@
     "test:invoice-batch": "tsx src/scripts/invoiceBatchCheck.ts",
     "test:invoice-originals": "tsx src/scripts/invoiceOriginalsCheck.ts",
     "test:invoice-refetch": "tsx src/scripts/invoiceRefetchCheck.ts",
+    "test:invoice-settings": "tsx src/scripts/invoiceSettingsCheck.ts",
     "test:coupons": "tsx src/scripts/couponRunnerCheck.ts",
     "test:request-log": "tsx src/scripts/requestLogCheck.ts",
     "test:request-actions": "tsx src/scripts/requestActionsCheck.ts",

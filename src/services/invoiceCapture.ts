@@ -17,6 +17,7 @@ import { evalOnPage } from "../lib/evalOnPage.js";
 import { sleep } from "./browser.js";
 import { isTerminalStatus, stageOf } from "./orderLifecycle.js";
 import { stampInvoiceUnits, storeInvoiceDownload, type StoredInvoice } from "./invoiceOriginals.js";
+import { getInvoiceSettings, invoiceSettingsFromEnv, type EffectiveInvoiceSettings } from "./invoiceSettings.js";
 
 /**
  * Invoice capture: open a delivered unit's order page, press Flipkart's
@@ -296,9 +297,13 @@ export async function putInvoice(key: string, body: Buffer, opts: { downloadId?:
   return { size: body.length, etag: String(res.ETag || "").replace(/"/g, "") };
 }
 
-/** INVOICE_SETTLE_HOURS (default 48): how long after the last delivery an order's invoice bundle is final. */
-export function invoiceSettleMs(): number {
-  return Math.max(1, Number(process.env.INVOICE_SETTLE_HOURS || 48)) * 3_600_000;
+/**
+ * How long after the last delivery an order's invoice bundle is final: the invoice setting `settleHours` (Settings →
+ * Invoice settings, else INVOICE_SETTLE_HOURS, else 48 h; services/invoiceSettings.ts). Without `settings`: the .env
+ * and the default, read at call time.
+ */
+export function invoiceSettleMs(settings: EffectiveInvoiceSettings = invoiceSettingsFromEnv()): number {
+  return Math.max(1, settings.settleHours) * 3_600_000;
 }
 
 /** The fields of a unit the delivery rule reads. */
@@ -311,7 +316,7 @@ export interface SettleUnit {
 /**
  * The delivery rule (T2 / C11): an order's bundle is final — `settled` — when every unit of the order is finished
  * (Delivered, Cancelled, Returned, Refunded, Failed) and the last of its deliveries (a cancelled unit: its
- * cancellation) is older than INVOICE_SETTLE_HOURS. A unit still on its way, or a delivered unit whose delivery time
+ * cancellation) is older than the settle window (invoiceSettleMs). A unit still on its way, or a delivered unit whose delivery time
  * is not known, keeps the bundle open: the sweep's phase 2 then looks at it again. An order with no unit is not
  * settled.
  */
@@ -335,7 +340,7 @@ export function settledByDelivery(units: readonly SettleUnit[], now = new Date()
 /** The delivery rule on the order's stored units. */
 export async function orderSettledByDelivery(userId: string, orderId: string, now = new Date()): Promise<boolean> {
   const units = await Order.find({ userId, order_id: orderId }).select("status_key actual_delivery_date cancelled_date").lean();
-  return settledByDelivery(units as SettleUnit[], now);
+  return settledByDelivery(units as SettleUnit[], now, invoiceSettleMs((await getInvoiceSettings(userId)).effective));
 }
 
 /**

@@ -7,6 +7,7 @@ import { testRouter } from "./routes/test.js";
 import { orderFetchRouter } from "./routes/orderFetch.js";
 import { startFetchScheduleClock } from "./services/orderFetchSchedule.js";
 import { seedSchedulesAtStart } from "./services/scheduleSettings.js";
+import { seedInvoiceSettingsAtStart } from "./services/invoiceSettings.js";
 import { closeInterruptedFetchRuns } from "./services/orderJobRuns.js";
 import { startInvoiceRequestWatchdog } from "./services/invoiceRequests.js";
 import { startCouponRequestWatchdog } from "./services/couponRequests.js";
@@ -113,6 +114,9 @@ async function main() {
   // The schedules' switches and clocks (Settings → Scheduled fetch): what this workspace does not have yet is written
   // once, here or at the worker's start, whichever comes first — a switch somebody set is never touched.
   await seedSchedulesAtStart(config.userId);
+  // Invoice settings (Settings → Invoice settings): the workspace's document, written once if missing — with
+  // "Download invoices of orders cancelled after shipping" ON; never touched again. The worker does the same at its start.
+  await seedInvoiceSettingsAtStart(config.userId);
   // A fetch lives in this process: a fetch row an earlier process of this machine left open is closed — before the
   // clock below looks, so a nightly fetch that died with that process reads "failed" and may be started once more.
   await closeInterruptedFetchRuns(hostName(), process.pid)

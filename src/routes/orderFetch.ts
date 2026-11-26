@@ -17,6 +17,7 @@ import { proxyModeStatus, setProxyMode } from "../services/proxyMode.js";
 import { finishRun, listRuns, startRun, syncPanel } from "../services/orderJobRuns.js";
 import { fetchScheduleStatus, runScheduledFetch, setFetchSinceDays, setScheduledInvoices } from "../services/orderFetchSchedule.js";
 import { changeSchedule, eligibleHere, scheduleOverview, scheduleStatuses } from "../services/scheduleSettings.js";
+import { invoiceSettingsView, setInvoiceSettings } from "../services/invoiceSettings.js";
 import { Types } from "mongoose";
 import { liveProbes } from "../services/requestLogLive.js";
 import { retryBatch, stopBatch } from "../services/syncActions.js";
@@ -245,6 +246,34 @@ orderFetchRouter.put("/schedules/:name", async (req, res) => {
     res.json(await changeSchedule(userIdFrom(req), req.params.name, req.body));
   } catch (err) {
     sendError(res, err, "Could not save the schedule");
+  }
+});
+
+/**
+ * Invoice settings (Settings → Invoice settings in the dashboard; services/invoiceSettings.ts). One document per
+ * workspace; a field it does not hold follows the .env, then the default.
+ *   GET /invoice-settings?userId= → { userId, settings (the document's fields only), effective (all six, what applies
+ *       now), sources ({ field: "db" | "env" | "default" }), history (newest first, ≤ 50: { field, from, to, by, at }),
+ *       changedBy, changedAt, limits ({ field: { type, default, min?, max?, unit? } }) }
+ *   PUT /invoice-settings { userId, by, ...fields } → the same as GET, after the save. 400 for an unknown field, a value
+ *       out of its range (whole numbers; booleans true / false), or nothing to save — before anything is written.
+ * A save reaches the worker within 30 s (its cache), with no restart.
+ */
+orderFetchRouter.get("/invoice-settings", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim() || workspaceUserId();
+    res.json(await invoiceSettingsView(userId));
+  } catch (err) {
+    sendError(res, err, "Could not read the invoice settings", 500);
+  }
+});
+
+orderFetchRouter.put("/invoice-settings", async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? { ...req.body, userId: userIdFrom(req) } : req.body;
+    res.json(await setInvoiceSettings(body));
+  } catch (err) {
+    sendError(res, err, "Could not save the invoice settings", 500);
   }
 });
 

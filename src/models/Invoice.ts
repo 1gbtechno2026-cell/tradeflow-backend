@@ -87,7 +87,7 @@ export interface IInvoiceRefetch {
   reason: RefetchReason;
   /** The moment on Flipkart's side: the cancellation, the return, or the refund. */
   event_at: Date;
-  /** event_at + the reason's delay (INVOICE_REFETCH_*_DELAY_H). */
+  /** event_at + the reason's delay, as it applied when the entry was noted: the workspace's invoice setting (Settings → Invoice settings, `invoice_settings`), else INVOICE_REFETCH_*_DELAY_H, else the default. */
   due_at: Date;
   noted_at: Date;
   /** Who noted it: "update <request id>", "store <path>", … */
